@@ -135,6 +135,25 @@ Les étapes 1 et 2 sont ce qui rend la phase mesurable. Elles passent avant tout
 même raison que la file d'envoi passait avant l'interface à la phase 3 : c'est la partie qu'on ne
 peut pas ajouter après coup sans se mentir.
 
+## Tâches de fin de phase
+
+À faire **une fois toutes les étapes ci-dessus remplies**, pas avant.
+
+- **Reprendre le dessin de la coquille**, avec Claude Design. L'interface a été construite par
+  ajouts successifs — une fenêtre de rédaction, un panneau de file, un panneau de brouillons, un
+  éditeur de signature, une page de paramètres, une vue source — chacun ajouté le jour où il
+  devenait nécessaire et dessiné pour marcher, pas pour tenir ensemble. Le résultat fonctionne et
+  n'a jamais été regardé comme un tout.
+
+  **Pourquoi à la fin et pas maintenant** : la recherche sémantique change ce que l'écran
+  principal doit montrer — une liste de résultats classés par pertinence n'est pas une liste de
+  messages classés par date. Redessiner avant de savoir ce qu'il y a à dessiner ferait le travail
+  deux fois.
+
+  Ce qui ne bouge pas à cette occasion : le critère 1 de la phase 2 — la coquille démarre sous
+  225 ms — et le critère 5 de la phase 3 — moins de 16,7 ms par image. Un dessin plus soigné qui
+  coûterait une image par frappe serait une régression, quoi qu'il donne en capture d'écran.
+
 ## Les pièges connus, avant d'écrire une ligne
 
 **Un modèle anglophone sur un corpus français.** Les modèles les plus cités sont entraînés sur de
@@ -283,3 +302,54 @@ Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targe
 `cargo test --workspace` — **1 337 tests verts**, soit 3 de plus : l'apostrophe remplacée par une
 espace et non par rien, la typographique traitée comme la droite, et le contrôle qui protège le
 refus de `subject:(`.
+
+### 2026-09-15 (suite) — le modèle choisi par 400 octets, et le critère qu'il crève
+
+L'étape 3 commence par le choix du modèle. Deux familles possibles en Rust sans Python :
+
+- **un vrai transformeur** — `candle` plus `candle-transformers`, qui sait faire du BERT, avec un
+  modèle multilingue type `multilingual-e5-small` ;
+- **des embeddings statiques** — `model2vec-rs`, qui distille un transformeur en une **table de
+  vecteurs par token** : à l'inférence, il n'y a plus de réseau, seulement une moyenne pondérée
+  de lignes.
+
+La règle du projet dit de commencer par le moins cher qui pourrait marcher, et `model2vec-rs`
+porte en plus un argument qu'aucune alternative n'a : une variante `local-only` **sans client HTTP
+compilé dedans**. « Zéro requête réseau » y devient vrai par construction, comme pour `mailcal`.
+
+Le seul modèle multilingue publié est `potion-multilingual-128M`. Avant de télécharger ses 530 Mo,
+la forme du tenseur se lit dans l'en-tête du fichier `safetensors`, que la première requête de
+plage rend :
+
+```
+{"embeddings":{"dtype":"F32","shape":[500353,256],"data_offsets":[0,512361472]}}
+```
+
+**500 353 tokens × 256 dimensions en `f32`, soit 488 Mio de table.** Le critère 5 en accorde 500
+pour *toute* la passe. Et le chemin de chargement du crate est pire que ça : `from_pretrained`
+fait un `fs::read` du fichier entier — 488 Mio de `Vec<u8>` — puis construit un `Vec<f32>` de
+488 Mio, donc une **crête de l'ordre de 950 Mio**. Le crate n'a pas de chemin qui garde la table
+en `f32` sans la matérialiser : `from_borrowed` demande un `&'static [f32]`, et même une table
+rangée en `i8` est convertie en `f32` au chargement.
+
+Le critère 5 est donc crevé **avant qu'un seul vecteur ait été calculé**. Trois remarques.
+
+**Le coût évité.** Quatre cents octets lus ont remplacé un téléchargement de 530 Mo et une
+mesure. C'est la question la moins chère posée en premier, comme la passe d'index à vide du
+2026-09-11 — et la réponse est la même : la mesure la plus rentable est celle qu'on n'a pas eu
+besoin de faire.
+
+**Le seuil était hérité, et il a été écrit sans savoir.** Les 500 Mo viennent du critère 2 de la
+phase 2, où ils mesuraient le démon pendant une moisson. Ils ont été recopiés dans cette phase le
+matin même, avant de savoir ce que pèse un modèle local. Ce n'est pas une raison pour le
+déplacer — c'est une raison pour le dire.
+
+**Le levier existe, et il est propre.** La table a 500 353 lignes parce que le vocabulaire est
+celui de `bge-m3` ; un corpus de courrier français et anglais n'en emploie qu'une fraction.
+`model2vec-rs` porte un `token_mapping` fait pour ça. Ne garder que les lignes que le corpus
+utilise est une transformation **locale**, faite à l'installation, et son argument de justesse
+tient en une phrase : un token qu'aucun message ne contient ne peut faire remonter aucun message.
+
+Ce qui reste à trancher, et qui n'est pas une question technique : **tailler le vocabulaire** —
+du travail en plus, un modèle plus petit et un chargement plus rapide — ou **assumer le seuil** et
+le réécrire en distinguant ce que pèse le modèle de ce que coûte la passe.
