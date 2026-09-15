@@ -268,6 +268,12 @@ le cas dérivé qui ne rentrait pas dans le moule des deux autres — trois leç
    dedans. Ouvrir en lecture seule explicitement.
    Chemin : `C:\Users\<vous>\AppData\Roaming\Thunderbird\Profiles\<profil>`
 
+   Le chemin réel, les cinq comptes du corpus et les noms de serveurs vivent **hors du
+   dépôt** depuis sa publication le 2026-09-15 : les journaux de phase les nomment
+   `compte-a`, `contact@perso.invalid`, `mail.perso.invalid`. Une mesure nouvelle se
+   pseudonymise de la même façon avant d'être écrite dans `docs/`, sinon la publication
+   rouvre ce qui a été refermé.
+
 2. **Rust partout.** Y compris l'outillage, les scripts de bench et les utilitaires.
    Pas de Python ni de shell script sauf contrainte de runtime impossible à contourner,
    et dans ce cas, dire explicitement laquelle.
