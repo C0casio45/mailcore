@@ -104,14 +104,14 @@ fn verdict(number: u8, label: &str, measured: &str, threshold: &str, passed: boo
 }
 
 /// Échantillonne la mémoire résidente du processus dans un fil dédié.
-struct RssSampler {
+pub(crate) struct RssSampler {
     peak: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl RssSampler {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let peak = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -138,7 +138,7 @@ impl RssSampler {
         }
     }
 
-    fn stop(mut self) -> u64 {
+    pub(crate) fn stop(mut self) -> u64 {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             // Un fil d'échantillonnage qui s'est arrêté tout seul ne doit pas faire échouer

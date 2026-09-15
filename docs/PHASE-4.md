@@ -353,3 +353,90 @@ tient en une phrase : un token qu'aucun message ne contient ne peut faire remont
 Ce qui reste à trancher, et qui n'est pas une question technique : **tailler le vocabulaire** —
 du travail en plus, un modèle plus petit et un chargement plus rapide — ou **assumer le seuil** et
 le réécrire en distinguant ce que pèse le modèle de ce que coûte la passe.
+
+### 2026-09-15 (suite) — le vocabulaire taillé, et le coupable qui n'était pas le bon
+
+Le levier décidé plus haut : ne garder de la table que les lignes que le corpus emploie.
+`cargo xtask model-trim` le fait, sur le store réel :
+
+```
+Messages parcourus 5063
+Tokens employés    34853
+Vocabulaire        34853 gardés sur 500353   (7.0 %)
+Table avant        488.6 Mio
+Table après        35.9 Mio   dont 1.9 Mio de carte
+Rapport            13.6 ×
+```
+
+**Sept pour cent.** Un corpus de courrier français et anglais n'emploie qu'une fraction d'un
+vocabulaire fait pour cent langues, et l'ordre de grandeur n'était pas garanti d'avance.
+
+#### La carte doit couvrir ce qu'on jette
+
+`model2vec-rs::pool_ids` lit `mapping[token]` et, **à défaut, se rabat sur le numéro du token
+comme index de ligne**. Sur une table de 34 854 lignes, un token numéroté 480 000 — parfaitement
+légal, il suffit d'une langue absente du corpus — sortirait de la table et ferait paniquer
+`ndarray`. La carte porte donc les 500 353 entrées, y compris les 465 500 qu'on jette, qui
+pointent vers une **ligne nulle** placée en tête. Deux mébioctets, qui ne se discutent pas.
+
+Un token écarté dilue alors légèrement la moyenne du message où il apparaît, au lieu de la
+fausser ou de planter — et c'est le comportement qu'on veut pour un mot qui n'existe dans aucun
+message : il ne dit rien, il ne doit rien peser.
+
+#### La vérification qui n'est pas optionnelle
+
+Une carte fausse d'un cran donne un modèle qui **marche** — il charge, il encode, il rend des
+vecteurs de la bonne taille — et dont chaque vecteur est faux. Rien ne le signalerait : ni le
+chargement, ni la recherche, qui rendrait des résultats médiocres qu'on mettrait sur le compte du
+modèle. `cargo xtask model-check` encode les mêmes messages avec les deux modèles et compare :
+
+```
+Messages comparés  200
+Écart maximal      0e0
+Verdict            identique — la carte est juste
+```
+
+Zéro exact, pas un epsilon. Le seuil était pourtant fixé à 1e-6, parce qu'une addition de
+flottants n'est pas associative et que la ligne nulle décale les adresses — mais l'ordre de
+parcours étant le même des deux côtés, l'égalité est bit à bit.
+
+#### Et le relevé qui désigne un autre coupable
+
+`cargo xtask model-bench`, trois exécutions, la première jetée, sur le modèle taillé :
+
+| | |
+|---|---|
+| encodage | **0,161 ms par message**, soit **6 200 messages/s** |
+| dispersion | 0,161 / 0,163 / 0,161 ms — le relevé le plus stable du projet |
+| RSS crête | **655 Mio** |
+
+Le débit règle le critère 3 sans discussion : les 73 658 messages du corpus tiennent en une
+douzaine de secondes d'encodage. Mais **655 Mio pour une table de 36**, c'est un chiffre qui
+n'a pas de sens, et un relevé unique aurait fait conclure que le modèle taillé coûte quinze fois
+sa taille.
+
+La décomposition par palier, que le critère 5 exigeait déjà — « la mesure dit **où** elle va » :
+
+| palier | RSS | ajouté |
+|---|---:|---:|
+| au démarrage | 8,7 Mio | |
+| store et index tantivy | 11,5 Mio | +2,8 |
+| lignes du corpus en RAM | 15,3 Mio | +3,7 |
+| **tokeniseur seul** | **502,0 Mio** | **+486,8** |
+| table d'embeddings par-dessus | 546,5 Mio | +44,5 |
+
+**Le coupable est le tokeniseur, pas la table.** Charger les 500 353 entrées de `bge-m3` avec le
+crate `tokenizers` coûte 487 Mio — vingt-sept fois le poids du `tokenizer.json` qui les décrit.
+La table, une fois taillée, ne pèse plus que 44 Mio à côté.
+
+Autrement dit : **la taille a marché, et elle a réglé la plus petite des deux moitiés.** On a
+retiré 452 Mio d'un problème qui en faisait 975, et les 487 restants sont ailleurs.
+
+Ce que ça vaut quand même : la table taillée est un gain acquis — moins d'installation, moins de
+chargement, et un modèle qui reste identique au bit près. Ce que ça ne règle pas : le critère 5,
+qui reste crevé par un composant qu'on n'avait pas regardé.
+
+La leçon est la même que celle du 2026-09-10, sur un autre objet : **un chiffre qui n'a pas de
+sens accuse la mesure avant d'accuser ce qu'elle mesure** — et ici c'était vrai deux fois, parce
+que la première décomposition accusait encore le mauvais composant tant que le tokeniseur n'était
+pas mesuré seul.

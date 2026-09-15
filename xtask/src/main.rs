@@ -20,6 +20,7 @@ mod corpus;
 mod followup;
 mod inspect;
 mod measure;
+mod model;
 mod profile;
 mod recall;
 mod replies;
@@ -225,6 +226,63 @@ enum Command {
         /// Racine du store à lire.
         #[arg(long, default_value = "measurements/store")]
         store: Utf8PathBuf,
+    },
+
+    /// Taille le vocabulaire d'un modèle d'embeddings sur ce que le corpus emploie.
+    ///
+    /// Le modèle multilingue porte 500 353 tokens pour cent langues ; un corpus de courrier en
+    /// emploie une fraction. Ne garder que les lignes utiles est ce qui rend le critère 5
+    /// atteignable — voir `docs/PHASE-4.md`.
+    ///
+    /// Ne touche ni au store ni au modèle d'origine : elle lit les deux et écrit ailleurs.
+    ModelTrim {
+        /// Racine du store dont le vocabulaire sert de référence.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le modèle d'origine : `config.json`, `tokenizer.json`, `model.safetensors`.
+        #[arg(long)]
+        model: Utf8PathBuf,
+        /// Où écrire le modèle taillé.
+        #[arg(long)]
+        out: Utf8PathBuf,
+    },
+
+    /// Vérifie qu'un modèle taillé rend les mêmes vecteurs que celui dont il vient.
+    ///
+    /// Une carte d'index fausse d'un cran donne un modèle qui charge, encode, et rend des
+    /// vecteurs entièrement faux sans que rien ne le signale.
+    ModelCheck {
+        /// Racine du store d'où viennent les messages comparés.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le modèle d'origine.
+        #[arg(long)]
+        model: Utf8PathBuf,
+        /// Le modèle taillé.
+        #[arg(long)]
+        trimmed: Utf8PathBuf,
+        /// Combien de messages comparer.
+        #[arg(long, default_value_t = 200)]
+        count: usize,
+    },
+
+    /// Mesure ce que coûte la vectorisation : débit par message, et mémoire résidente.
+    ///
+    /// **Ne compile pas.** Construire d'abord, laisser la machine retomber au repos, puis
+    /// mesurer — et jeter la première des trois exécutions.
+    ModelBench {
+        /// Racine du store d'où viennent les messages.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le modèle à mesurer.
+        #[arg(long)]
+        model: Utf8PathBuf,
+        /// Combien de messages encoder.
+        #[arg(long, default_value_t = 1000)]
+        count: usize,
+        /// Combien de messages par lot remis au modèle.
+        #[arg(long, default_value_t = 256)]
+        batch: usize,
     },
 
     /// Mesure le critère 1 de la phase 4 : le rappel sur un jeu de requêtes à réponse connue.
@@ -445,6 +503,19 @@ fn main() -> Result<()> {
         Command::MeasureSecrets { store, account } => secrets::audit(&store, account),
         Command::MeasureApi { store, repeats } => api::measure(&store, repeats),
         Command::CorpusScripts { store } => corpus::scripts(&store),
+        Command::ModelTrim { store, model, out } => model::trim(&store, &model, &out),
+        Command::ModelCheck {
+            store,
+            model,
+            trimmed,
+            count,
+        } => model::check(&store, &model, &trimmed, count),
+        Command::ModelBench {
+            store,
+            model,
+            count,
+            batch,
+        } => model::bench(&store, &model, count, batch),
         Command::MeasureRecall {
             store,
             queries,
