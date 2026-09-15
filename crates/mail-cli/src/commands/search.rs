@@ -38,8 +38,14 @@ pub fn run(store_root: Option<&Utf8PathBuf>, query: &str, limit: usize) -> Resul
             );
             continue;
         };
+        // **L'identifiant en premier, parce qu'une autre commande le réclame.** `mail source
+        // --id` documente « l'identifiant tel que `mail search` le rend » — et cette liste ne
+        // le rendait nulle part, sauf sur la ligne d'un message introuvable. Deux commandes se
+        // citaient sans se parler, et la seule façon d'obtenir un identifiant était de le
+        // deviner à partir du nombre de messages indexés.
         println!(
-            "  {:>6.2}  {}  {:<32.32}  {}",
+            "  #{:<6} {:>6.2}  {}  {:<32.32}  {}",
+            hit.id.0,
             hit.score,
             crate::human::date(item.date),
             item.from_name.as_deref().unwrap_or(&item.from_addr),
