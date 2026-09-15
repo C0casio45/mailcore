@@ -1,0 +1,23 @@
+[package]
+name        = "mailimport"
+description = "Import streamé des mbox Thunderbird vers le store. Lecture seule sur le profil."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[dependencies]
+mailcore.workspace    = true
+memchr.workspace      = true
+mail-parser.workspace = true
+camino.workspace      = true
+thiserror.workspace   = true
+tracing.workspace     = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

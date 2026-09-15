@@ -1,0 +1,32 @@
+[package]
+name        = "mailcore"
+description = "Coeur de mailcore : modèle, store adressé par contenu, index, API de requête."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# Aucune dépendance à un toolkit UI, à un client réseau ou à un runtime async.
+# C'est la règle qui rend tout le reste remplaçable — voir docs/ARCHITECTURE.md.
+[dependencies]
+blake3.workspace      = true
+zstd.workspace        = true
+rusqlite.workspace    = true
+tantivy.workspace     = true
+mail-parser.workspace = true
+mailhtml.workspace    = true
+# La lecture d'une invitation `text/calendar`. Le parcours MIME est ici — c'est mailcore qui a
+# `mail-parser` — et la lecture du fichier est là-bas.
+mailcal.workspace     = true
+tempfile.workspace    = true
+camino.workspace      = true
+directories.workspace = true
+thiserror.workspace   = true
+tracing.workspace     = true
+serde.workspace       = true
+serde_json.workspace  = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name        = "mailcal"
+description = "Lecture d'une invitation text/calendar (RFC 5545). Aucune requête réseau, aucune base de fuseaux."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# **Aucune dépendance, et c'est une propriété du crate.** Il lit des octets écrits par un
+# inconnu et n'a rien pour parler à qui que ce soit : ni client HTTP, ni base de fuseaux
+# téléchargée. Le critère 6 demande zéro requête réseau ; ici, il n'y a pas de chemin par lequel
+# une requête pourrait sortir.
+[dependencies]
+
+[lints]
+workspace = true
