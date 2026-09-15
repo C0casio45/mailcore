@@ -440,3 +440,72 @@ La leçon est la même que celle du 2026-09-10, sur un autre objet : **un chiffr
 sens accuse la mesure avant d'accuser ce qu'elle mesure** — et ici c'était vrai deux fois, parce
 que la première décomposition accusait encore le mauvais composant tant que le tokeniseur n'était
 pas mesuré seul.
+
+### 2026-09-15 (suite) — le tokeniseur taillé, et le critère 5 qui passe de 655 à 100 Mio
+
+La décomposition précédente avait désigné le tokeniseur : 487 Mio à lui seul, contre 44 pour la
+table. Le même levier s'y applique, et il y est plus fort.
+
+#### Renuméroter fait disparaître la carte
+
+Le premier jet gardait la numérotation d'origine et rattrapait avec une carte de 500 353 entrées.
+Tailler **aussi** le tokeniseur change la donne : un token qu'il ne connaît plus ne peut plus être
+produit, donc il n'y a plus rien à rattraper. Les identifiants deviennent `0..n`, la table est
+dans cet ordre, et la correspondance est l'identité. Plus de carte, plus de ligne nulle.
+
+Ce qui rend la renumérotation sûre côté **segmentation**, et l'argument vaut d'être écrit :
+Unigram choisit le découpage de score maximal parmi les morceaux disponibles. Les morceaux
+retirés sont exactement ceux qu'aucun message n'a produits, donc le chemin optimal d'un texte du
+corpus est toujours là — et retirer des options ne peut pas rendre meilleur un chemin qui ne
+l'était pas. Pour un texte **neuf**, le découpage peut changer : c'est la contrepartie assumée,
+et `model-check` est ce qui la met à l'épreuve.
+
+#### Le token qu'on croyait garder et qu'on jetait
+
+La première exécution s'est arrêtée sur `un token ajouté a été écarté`. La collecte cherchait les
+tokens spéciaux dans la **différence** entre les deux vocabulaires du tokeniseur, celui avec les
+tokens ajoutés et celui sans. Cette différence est **vide** : `[PAD]` et `[UNK]` sont déclarés en
+tokens ajoutés *et* présents dans le vocabulaire du modèle. N'apparaissant dans aucun message,
+ils étaient écartés — et un tokeniseur sans son token inconnu ne tokenise plus rien.
+
+Ils se lisent maintenant là où ils sont écrits : `added_tokens[].id` et `model.unk_id`, dans le
+fichier. Une astuce d'API remplacée par la lecture de la déclaration.
+
+#### Le relevé
+
+```
+Vocabulaire        34 854 gardés sur 500 353   (7,0 %)
+Table avant        488,6 Mio      Table après        34,0 Mio
+Tokeniseur avant    17,8 Mio      Tokeniseur après    1,4 Mio
+```
+
+Et l'équivalence, sur 300 messages réels, avec une segmentation qui aurait pu bouger :
+
+```
+Écart maximal      0e0
+Verdict            identique — la carte est juste
+```
+
+Ce que ça donne au chargement, trois exécutions, première jetée :
+
+| | avant la taille | après |
+|---|---:|---:|
+| tokeniseur seul | 486,8 Mio | **22,0 Mio** |
+| modèle chargé | 546,5 Mio | **71,8 Mio** |
+| **RSS crête** | **655,6 Mio** | **99,9 Mio** |
+| chargement | 1,17 s | **49 à 59 ms** |
+| par message | 0,161 ms | 0,171 à 0,177 ms |
+
+**Le critère 5 passe de crevé à tenu avec cinq fois de marge** : 100 Mio contre 500. Et le
+chargement est vingt fois plus rapide, ce qui compte pour le critère 7 — une coquille qui met une
+seconde de plus à démarrer parce qu'un modèle se charge ne serait pas acceptable.
+
+Une honnêteté sur le débit : il est **légèrement moins bon** après la taille, 0,171–0,177 ms
+contre 0,161–0,163 avant, soit 8 % de plus. L'écart est constant sur les trois exécutions, donc
+ce n'est probablement pas du bruit — et il n'est pas expliqué : retirer la carte devrait retirer
+un accès indirect, pas en ajouter. Le dire vaut mieux que de ne relever que ce qui arrange. À 5
+700 messages/s, le corpus entier reste à une quinzaine de secondes d'encodage.
+
+Ce que l'étape 3 laisse pour la suite : le modèle est choisi, mesuré, et tient dans le budget.
+Reste à écrire le magasin de vecteurs — étape 4 — dont la taille est déjà connue, puisqu'elle ne
+dépend que du nombre de messages et de la dimension : **73 658 × 256 × 4 octets, soit 72 Mio**.

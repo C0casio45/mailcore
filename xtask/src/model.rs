@@ -45,9 +45,6 @@ use camino::Utf8PathBuf;
 use mailcore::{Mailbox, Store};
 use safetensors::tensor::{Dtype, TensorView};
 
-/// La ligne nulle, en tête de la table taillée.
-const NULL_ROW: usize = 0;
-
 /// Taille le vocabulaire du modèle sur ce que le corpus emploie réellement.
 ///
 /// # Errors
@@ -55,7 +52,11 @@ const NULL_ROW: usize = 0;
 /// Si le store, le modèle ou le tokeniseur sont illisibles, ou si la table n'a pas la forme
 /// attendue.
 pub fn trim(store_root: &Utf8PathBuf, model: &Utf8PathBuf, out: &Utf8PathBuf) -> Result<()> {
-    let tokenizer = tokenizers::Tokenizer::from_file(model.join("tokenizer.json").as_str())
+    // Lu une fois, servi deux fois : au tokeniseur qui parcourt le corpus, et à la réécriture du
+    // vocabulaire. Le relire ferait dix-huit mébioctets de plus pour le même contenu.
+    let raw_tokenizer = std::fs::read_to_string(model.join("tokenizer.json").as_str())
+        .with_context(|| format!("lecture de {model}/tokenizer.json"))?;
+    let tokenizer = tokenizers::Tokenizer::from_bytes(raw_tokenizer.as_bytes())
         .map_err(|source| anyhow::anyhow!("tokeniseur illisible : {source}"))?;
 
     println!("Modèle d'origine   {model}");
@@ -98,19 +99,30 @@ pub fn trim(store_root: &Utf8PathBuf, model: &Utf8PathBuf, out: &Utf8PathBuf) ->
         scanned += 1;
     }
 
-    // Les tokens **ajoutés** — `<s>`, `</s>`, `<unk>`, `<pad>` et ce que le modèle a déclaré en
-    // plus — ne viennent pas forcément d'un message du corpus. Les jeter les enverrait sur la
-    // ligne nulle au premier texte qui en produit un, ce qui diluerait chaque message plutôt que
-    // de planter : un défaut silencieux, donc le pire.
+    // **Les tokens spéciaux se lisent là où ils sont écrits.**
     //
-    // La différence entre les deux vocabulaires est la façon stable de les nommer ; il n'existe
-    // pas d'accesseur public qui les rende directement.
-    let with_added = tokenizer.get_vocab(true);
-    let without_added = tokenizer.get_vocab(false);
-    for (token, id) in &with_added {
-        if !without_added.contains_key(token) {
-            used.insert(*id);
+    // Le premier jet les cherchait dans la différence entre les deux vocabulaires du tokeniseur,
+    // celui avec les tokens ajoutés et celui sans. Cette différence est **vide** ici : `[PAD]` et
+    // `[UNK]` sont déclarés en tokens ajoutés *et* présents dans le vocabulaire du modèle. Ils
+    // n'apparaissent dans aucun message, donc ils étaient écartés — et un tokeniseur sans son
+    // token inconnu ne tokenise plus rien.
+    let mut document: serde_json::Value =
+        serde_json::from_str(&raw_tokenizer).context("analyse de tokenizer.json")?;
+    if let Some(added) = document
+        .get("added_tokens")
+        .and_then(serde_json::Value::as_array)
+    {
+        for token in added {
+            if let Some(id) = token.get("id").and_then(serde_json::Value::as_u64) {
+                used.insert(u32::try_from(id).unwrap_or(u32::MAX));
+            }
         }
+    }
+    if let Some(unk) = document
+        .pointer("/model/unk_id")
+        .and_then(serde_json::Value::as_u64)
+    {
+        used.insert(u32::try_from(unk).unwrap_or(u32::MAX));
     }
 
     let scan = started.elapsed();
@@ -154,39 +166,94 @@ pub fn trim(store_root: &Utf8PathBuf, model: &Utf8PathBuf, out: &Utf8PathBuf) ->
         .collect();
     kept.sort_unstable();
 
+    // **Les identifiants sont renumérotés, et c'est ce qui fait disparaître la carte.**
+    //
+    // Le premier jet gardait le vocabulaire d'origine et sa numérotation, avec une carte de
+    // 500 353 entrées pour rattraper. Tailler *aussi* le tokeniseur change la donne : un token
+    // qu'il ne connaît plus ne peut plus être produit, donc il n'y a plus rien à rattraper. Les
+    // identifiants deviennent `0..n`, la table est dans cet ordre, et la correspondance est
+    // l'identité.
+    //
+    // Ce qui rend la renumérotation sûre côté segmentation : Unigram choisit le découpage de
+    // score maximal parmi les morceaux disponibles. Les morceaux retirés sont exactement ceux
+    // qu'aucun message n'a produits, donc le chemin optimal d'un texte du corpus est toujours
+    // là — retirer des options ne peut pas rendre meilleur un chemin qui ne l'était pas.
+    // Pour un texte **neuf**, le découpage peut changer : c'est la contrepartie, et
+    // `model-check` est ce qui la met à l'épreuve.
+    let mut new_of = vec![u32::MAX; vocabulary];
+    for (rank, id) in kept.iter().enumerate() {
+        new_of[*id as usize] = u32::try_from(rank).context("vocabulaire trop grand pour un u32")?;
+    }
+
     let raw = embeddings.data();
     let stride = dimensions * std::mem::size_of::<f32>();
-    let mut table: Vec<u8> = Vec::with_capacity((kept.len() + 1) * stride);
-    // La ligne nulle d'abord : c'est là que pointera tout ce qu'on jette.
-    table.extend(std::iter::repeat_n(0_u8, stride));
+    let mut table: Vec<u8> = Vec::with_capacity(kept.len() * stride);
     for id in &kept {
         let at = *id as usize * stride;
         table.extend_from_slice(&raw[at..at + stride]);
     }
 
-    let mut mapping = vec![NULL_ROW as i32; vocabulary];
-    for (rank, id) in kept.iter().enumerate() {
-        // `+ 1` : la ligne 0 est la ligne nulle.
-        mapping[*id as usize] = i32::try_from(rank + 1).context("table trop grande pour un i32")?;
+    // --- Le tokeniseur, taillé de la même main --------------------------------------------------
+
+    let entries = document
+        .pointer_mut("/model/vocab")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("`model.vocab` absent ou mal formé")?;
+    anyhow::ensure!(
+        entries.len() == vocabulary,
+        "le tokeniseur annonce {} entrées, la table {vocabulary} : ils ne vont pas ensemble",
+        entries.len()
+    );
+    let trimmed_vocabulary: Vec<serde_json::Value> = kept
+        .iter()
+        .map(|id| entries[*id as usize].clone())
+        .collect();
+    *entries = trimmed_vocabulary;
+
+    // `unk_id` désigne le morceau rendu quand rien ne correspond. Le laisser pointer sur
+    // l'ancienne numérotation donnerait un tokeniseur qui rend un mot au hasard à la place de
+    // l'inconnu — et il faut le garder coûte que coûte, ce que la collecte a déjà assuré.
+    if let Some(unk) = document
+        .pointer("/model/unk_id")
+        .and_then(serde_json::Value::as_u64)
+    {
+        let renumbered = new_of
+            .get(usize::try_from(unk).unwrap_or(usize::MAX))
+            .copied()
+            .filter(|it| *it != u32::MAX)
+            .context("le token inconnu a été écarté : le tokeniseur serait cassé")?;
+        document["model"]["unk_id"] = serde_json::json!(renumbered);
     }
-    let mapping_bytes: Vec<u8> = mapping.iter().flat_map(|it| it.to_le_bytes()).collect();
+
+    // Les tokens ajoutés portent leur propre identifiant, en double de celui du vocabulaire.
+    // Les deux doivent dire la même chose, sinon le tokeniseur en rend un et la table en lit un
+    // autre.
+    if let Some(added) = document
+        .get_mut("added_tokens")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for token in added.iter_mut() {
+            let old = token
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .context("token ajouté sans identifiant")?;
+            let renumbered = new_of
+                .get(usize::try_from(old).unwrap_or(usize::MAX))
+                .copied()
+                .filter(|it| *it != u32::MAX)
+                .context("un token ajouté a été écarté : il devait être gardé")?;
+            token["id"] = serde_json::json!(renumbered);
+        }
+    }
 
     // --- Écriture ------------------------------------------------------------------------------
 
     std::fs::create_dir_all(out.as_str()).with_context(|| format!("création de {out}"))?;
-    let kept_rows = kept.len() + 1;
-    let views = vec![
-        (
-            "embeddings".to_owned(),
-            TensorView::new(Dtype::F32, vec![kept_rows, dimensions], &table)
-                .context("vue de la table taillée")?,
-        ),
-        (
-            "mapping".to_owned(),
-            TensorView::new(Dtype::I32, vec![vocabulary], &mapping_bytes)
-                .context("vue de la carte")?,
-        ),
-    ];
+    let views = vec![(
+        "embeddings".to_owned(),
+        TensorView::new(Dtype::F32, vec![kept.len(), dimensions], &table)
+            .context("vue de la table taillée")?,
+    )];
     safetensors::serialize_to_file(
         views,
         None,
@@ -194,17 +261,21 @@ pub fn trim(store_root: &Utf8PathBuf, model: &Utf8PathBuf, out: &Utf8PathBuf) ->
     )
     .context("écriture du modèle taillé")?;
 
-    // Le tokeniseur et la configuration sont recopiés tels quels : c'est **le même** modèle, avec
-    // moins de lignes. En changer un ferait un modèle différent qui prétendrait être celui-là.
-    for name in ["tokenizer.json", "config.json"] {
-        std::fs::copy(model.join(name).as_str(), out.join(name).as_str())
-            .with_context(|| format!("copie de {name}"))?;
-    }
+    let written = serde_json::to_string(&document).context("sérialisation du tokeniseur")?;
+    std::fs::write(out.join("tokenizer.json").as_str(), &written)
+        .context("écriture du tokeniseur taillé")?;
+
+    // La configuration est recopiée telle quelle : elle ne parle ni de vocabulaire ni d'index.
+    std::fs::copy(
+        model.join("config.json").as_str(),
+        out.join("config.json").as_str(),
+    )
+    .context("copie de config.json")?;
 
     // --- Le relevé -----------------------------------------------------------------------------
 
     let before = vocabulary * stride;
-    let after = kept_rows * stride + mapping_bytes.len();
+    let after = kept.len() * stride;
     println!("Modèle taillé      {out}");
     println!(
         "Vocabulaire        {} gardés sur {vocabulary}   ({:.1} %)",
@@ -212,11 +283,9 @@ pub fn trim(store_root: &Utf8PathBuf, model: &Utf8PathBuf, out: &Utf8PathBuf) ->
         percent(kept.len(), vocabulary)
     );
     println!("Table avant        {}", mib(before));
-    println!(
-        "Table après        {}   dont {} de carte",
-        mib(after),
-        mib(mapping_bytes.len())
-    );
+    println!("Table après        {}", mib(after));
+    println!("Tokeniseur avant   {}", mib(raw_tokenizer.len()));
+    println!("Tokeniseur après   {}", mib(written.len()));
     println!("Rapport            {:.1} ×", ratio(before, after));
     Ok(())
 }
