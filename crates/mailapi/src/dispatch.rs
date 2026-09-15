@@ -86,6 +86,20 @@ pub mod method {
     /// situations il regarde pour choisir l'étiquette — et un client qui se tromperait
     /// enverrait deux fois. Deux méthodes, et le store refuse l'état qui n'est pas le sien.
     pub const OUTBOX_RETRY: &str = "outbox.retry";
+    /// Retire un envoi **qui n'est pas encore parti**. **Décision de l'utilisateur**, servie par
+    /// le transport.
+    ///
+    /// ## Pourquoi c'est une troisième méthode et pas une variante des deux autres
+    ///
+    /// Même raisonnement que ci-dessus, appliqué au bout opposé de la file. `outbox.retry` et
+    /// `outbox.decide` sortent d'états où quelque chose s'est déjà passé sur le fil ;
+    /// `outbox.cancel` ne sort que de `queued`, où rien n'a commencé. Les trois refusent l'état
+    /// des autres, et c'est le store qui refuse — pas le client qui choisit bien.
+    ///
+    /// Elle rend `false` plutôt qu'une erreur quand la ligne est déjà partie : ce n'est pas une
+    /// faute du client, c'est une course qu'il a perdue, et l'interface doit pouvoir le dire
+    /// sans traiter un cas normal comme une panne.
+    pub const OUTBOX_CANCEL: &str = "outbox.cancel";
     /// Les octets RFC 5322 **que nous avons composés**, rendus lisibles.
     ///
     /// ## Pourquoi elle est servie par le répartiteur, contrairement à ses voisines
@@ -146,6 +160,7 @@ pub mod method {
         OUTBOX_LIST,
         OUTBOX_DECIDE,
         OUTBOX_RETRY,
+        OUTBOX_CANCEL,
         OUTBOX_SOURCE,
         DRAFTS_LIST,
         DRAFTS_SAVE,
@@ -172,6 +187,7 @@ pub mod method {
         OUTBOX_LIST,
         OUTBOX_DECIDE,
         OUTBOX_RETRY,
+        OUTBOX_CANCEL,
         // Marquer lu écrit dans le store **et** met une poussée en attente pour le serveur :
         // ce n'est pas une lecture, donc pas le répartiteur.
         MESSAGES_MARK_READ,
@@ -319,6 +335,13 @@ pub struct DecideParams {
     /// Pas de défaut : les deux sont irréversibles dans un sens différent, et un repli
     /// choisirait à la place de l'utilisateur.
     pub decision: String,
+}
+
+/// Paramètres de `outbox.cancel`, servis par le transport.
+#[derive(Debug, Deserialize)]
+pub struct CancelParams {
+    /// La ligne de file **encore en attente**, telle que `outbox.list` la rend.
+    pub id: i64,
 }
 
 /// Paramètres de `outbox.retry`, servis par le transport.

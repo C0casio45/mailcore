@@ -183,6 +183,19 @@ pub struct Shell {
     /// Le dernier message à montrer à l'utilisateur — erreur d'appel, bilan de tâche.
     status: Option<String>,
 
+    /// La ligne de file que la bannière propose encore d'annuler.
+    ///
+    /// ## Pourquoi le bouton est **dans** la bannière
+    ///
+    /// C'est le seul endroit où l'utilisateur regarde à cet instant : il vient de cliquer
+    /// « Envoyer », la confirmation apparaît, et c'est en la lisant qu'il réalise qu'il s'est
+    /// trompé de destinataire. Un bouton rangé dans le panneau de la file demanderait de
+    /// chercher, et la fenêtre de rétractation se compte en secondes.
+    ///
+    /// Vidé en même temps que `status` : une bannière fermée ne laisse pas un bouton orphelin,
+    /// et le panneau de la file reste le chemin de celui qui a fermé trop vite.
+    cancellable: Option<i64>,
+
     /// La panne de transport en cours, s'il y en a une.
     ///
     /// **Critère 9** : ce qui est déjà chargé reste consultable, et l'état dégradé est visible
@@ -458,6 +471,7 @@ impl Shell {
             jobs_polled: None,
             show_import: false,
             status: None,
+            cancellable: None,
             offline: None,
             rows_announced: false,
             bench_state: BenchState::default(),
@@ -892,13 +906,41 @@ impl Shell {
                         self.worker.ask(Request::DeleteDraft { id });
                     }
                     self.compose = None;
-                    self.status = Some(format!(
-                        "Message en file d'envoi ({} destinataire(s), {} octets). Il partira \n                         même si vous fermez la fenêtre.",
-                        queued.recipients.len(),
-                        queued.size
-                    ));
+                    // **Le délai vient du service, jamais d'une constante d'ici.** Écrire
+                    // « 10 secondes » dans la phrase ferait mentir l'interface le jour où le
+                    // maintien change, et un client distant peut parler à un démon d'une autre
+                    // version que la sienne.
+                    self.status = Some(if queued.hold > 0 {
+                        format!(
+                            "Message en file d'envoi ({} destinataire(s), {} octets). Il partira \
+                             dans {} s, même si vous fermez la fenêtre.",
+                            queued.recipients.len(),
+                            queued.size,
+                            queued.hold
+                        )
+                    } else {
+                        format!(
+                            "Message en file d'envoi ({} destinataire(s), {} octets). Il partira \
+                             même si vous fermez la fenêtre.",
+                            queued.recipients.len(),
+                            queued.size
+                        )
+                    });
+                    self.cancellable = (queued.hold > 0).then_some(queued.id);
                     self.worker.ask(Request::Outbox);
                     self.worker.ask(Request::Drafts);
+                }
+                Reply::Cancelled(cancelled) => {
+                    // Les deux phrases disent ce qui s'est passé, pas ce qui était demandé. Un
+                    // « trop tard » est un cas normal de la fenêtre de rétractation : le
+                    // facteur avait déjà la ligne, et le message est parti pour de bon.
+                    self.status = Some(if cancelled {
+                        "Envoi annulé : le message ne partira pas.".to_owned()
+                    } else {
+                        "Trop tard : le message était déjà en cours de remise.".to_owned()
+                    });
+                    self.cancellable = None;
+                    self.worker.ask(Request::Outbox);
                 }
                 Reply::Started => {
                     // La tâche est en file. Forcer la relève tout de suite plutôt que d'attendre
@@ -1285,8 +1327,24 @@ impl Shell {
         if let Some(status) = self.status.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(ui.visuals().error_fg_color, status);
+                if let Some(id) = self.cancellable
+                    && ui
+                        .button("Annuler l'envoi")
+                        .on_hover_text(
+                            "Retire le message de la file. Ne marche que tant que le facteur \
+                             ne l'a pas pris.",
+                        )
+                        .clicked()
+                {
+                    // La bannière ne décide de rien : elle demande, et c'est le store qui
+                    // tranche. Le bouton disparaît tout de suite pour qu'un second clic ne
+                    // parte pas pendant que le premier voyage.
+                    self.cancellable = None;
+                    self.worker.ask(Request::Cancel { id });
+                }
                 if ui.small_button("×").clicked() {
                     self.status = None;
+                    self.cancellable = None;
                 }
             });
         }

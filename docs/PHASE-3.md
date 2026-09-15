@@ -70,6 +70,15 @@ Dehors, et c'est délibéré :
 « envoyer dans 5 s avec annulation » qui part quand l'application se ferme. Le clic est le
 consentement.
 
+*Précisé le 2026-09-15, après qu'un utilisateur a demandé pourquoi il n'y avait pas d'annulation.*
+Ce que cette phrase refuse est **un envoi qui part à un moment que personne n'a choisi** — le
+défaut d'un client où fermer la fenêtre vide la file. Ce n'est pas le nôtre : le facteur est dans
+le démon, et fermer la fenêtre ne déclenche rien. Une **fenêtre de rétractation** de dix secondes
+avant que le facteur ne prenne la ligne ne contredit donc pas ce principe : le clic reste le
+consentement, il n'est pas redemandé, et rien n'attend un événement. Elle le complète, parce
+qu'annoncer « il partira » sans offrir aucun geste était la seule irréversibilité du projet qu'on
+n'avait pas choisie. Voir `Store::cancel_outgoing` et `mailsmtp::queue::HOLD`.
+
 **Rien de ce qu'on ajoute au message n'est invisible à l'utilisateur.** Pas d'en-tête
 `X-Mailer` bavard, pas d'identifiant de suivi, pas de pixel. Ce que le message porte doit être
 lisible dans une fenêtre « source du message » qu'on écrira. — **écrite le 2026-09-11**
@@ -2916,29 +2925,92 @@ La leçon dépasse le critère : **« nous n'avons pas pu le provoquer en vrai �
 se produire en vrai » sont deux réserves très différentes**, et la seconde se démontre au lieu de
 s'attendre.
 
-#### Ce que l'usage a trouvé, et qui reste ouvert
+#### Une question d'usage, et l'objection qui ne couvrait pas son cas
 
-**Rien n'annule un message en file.** La bannière de la coquille dit « Il partira même si vous
-fermez la fenêtre » — c'est vrai, c'est la règle 3, et c'est une information qu'on ne peut pas
-deviner. Mais il n'existe **aucune** annulation : ni `cancel` ni `discard` dans
-`mailcore::store::outbox`, ni dans l'API, ni dans la CLI. Les seules sorties d'une ligne sont
-« renvoyer » (un refus) et « trancher » (un doute). La phrase annonce donc une irréversibilité
-sans offrir le geste — la leçon du 2026-09-10 prise à l'envers.
+« C'est quoi l'utilité de ça ? Mettre un message comme Apple avec la possibilité d'annuler
+l'envoi aurait plus de sens, non ? » — devant la bannière « Il partira même si vous fermez la
+fenêtre ».
 
-Et l'objection écrite contre le modèle Apple ne couvre pas le cas qu'elle croyait couvrir : elle
-vise « un envoi différé **qui part quand l'application se ferme** », c'est-à-dire un client où
-fermer vide la file. Ici le facteur est dans le démon, pas dans la fenêtre. Le coût technique est
-par ailleurs presque nul : `Store::deliverable` porte **déjà** une porte temporelle,
-`retry_after IS NULL OR retry_after <= ?1`, et un `retry_after = maintenant + délai` posé à la
-mise en file la réutilise sans toucher à `state` — donc sans toucher à la règle du critère 2.
-L'annulation, elle, devra refuser tout sauf `queued` sans tentative, comme `retry_outgoing` et
-`resolve_doubt` refusent chacun l'état de l'autre.
+La bannière était juste et nécessaire : elle annonce la conséquence de la règle 3, qu'on ne peut
+pas deviner puisque dans Thunderbird ou Outlook, fermer pendant l'envoi *peut* l'interrompre. Ce
+qui manquait est ailleurs : **il n'existait aucune annulation**. Ni `cancel` ni `discard` dans
+`mailcore::store::outbox`, ni dans l'API, ni dans la CLI. Les seules sorties d'une ligne étaient
+« renvoyer » (un refus) et « trancher » (un doute). La phrase annonçait donc une irréversibilité
+sans offrir le geste — la leçon du 2026-09-10 prise exactement à l'envers.
+
+**Et l'objection écrite ne couvrait pas le cas qu'elle croyait viser.** `docs/PHASE-3.md`
+refusait « un envoi différé, pas de "envoyer dans 5 s avec annulation" **qui part quand
+l'application se ferme** ». Le défaut visé est celui d'un client où fermer vide la file. Ici le
+facteur est dans le démon : fermer la fenêtre ne déclenche rien et n'annule rien. Une phrase
+écrite contre un mécanisme précis avait été relue comme un principe général, et personne ne l'a
+revue jusqu'à ce qu'un utilisateur regarde l'écran.
+
+#### Le maintien réutilise la porte qui existe, et c'est ce qui le rend sûr
+
+`Store::deliverable` portait **déjà** une porte temporelle — `retry_after IS NULL OR retry_after
+<= ?1` — pour le recul entre deux tentatives. Un maintien à la mise en file est la même question
+posée plus tôt : « pas avant cet instant ». Il s'écrit donc dans la même colonne et passe par la
+même porte.
+
+Ce qu'il ne touche pas est ce qui compte : **`state`**. La règle du critère 2 — `committing` ne
+se remet jamais — vit sur l'état, pas sur le temps. Un maintien ne peut donc pas la relâcher,
+quelle que soit sa durée, et `the_sql_filter_and_the_rust_predicate_agree` continue de porter sur
+exactement ce qu'il portait.
+
+**Le maintien est un paramètre de `stage`, pas une constante globale**, parce que les deux
+appelants n'ont pas le même besoin :
+
+- `outbox.send` passe `HOLD` — dix secondes — parce que **rien n'ouvre de connexion là** : c'est
+  le facteur qui remettra, en passant par `deliverable`, donc la porte s'applique ;
+- `mail send` passe `0`, parce que la commande **remet elle-même**, sur la ligne nommée, sans
+  passer par `deliverable`. Un maintien n'y retarderait rien — il annoncerait un délai qui
+  n'existe pas.
+
+Et le délai remonte **au client** dans `dto::Queued`. Une interface qui écrirait « 10 secondes »
+dans sa phrase mentirait le jour où la constante change, et un client distant parle à un démon
+qui n'a pas forcément sa version.
+
+#### L'annulation refuse par le `WHERE`, pas après une lecture
+
+`Store::cancel_outgoing` est la symétrique de `forget_outgoing` : celle-là ne retire que des
+lignes **finies**, celle-ci que des lignes **pas commencées**. Entre les deux, `sending` et
+`committing` ne sortent par aucune des deux, et c'est exactement le point : ce sont les états où
+personne ne sait ce que le serveur a vu.
+
+Le refus est dans la requête :
+
+```sql
+DELETE FROM outbox WHERE id = ?1 AND state = ?2   -- ?2 = 'queued'
+```
+
+et pas dans un `if` après lecture. Le facteur peut prendre la ligne entre les deux : `deliver_one`
+écrit `sending` **avant** d'ouvrir l'enveloppe, donc lire puis effacer laisserait une fenêtre où
+l'annulation retirerait un message déjà sur le fil. C'est la même discipline que la clause de
+`deliverable` — la règle qui protège un message vit dans le `WHERE`.
+
+Deux conséquences visibles :
+
+- **`false` n'est pas une erreur.** La ligne était déjà partie : le client a perdu une course, ce
+  qui est un cas normal d'une fenêtre de rétractation. L'interface dit « Trop tard : le message
+  était déjà en cours de remise » au lieu d'afficher une panne ;
+- **une tentative déjà comptée n'empêche pas d'annuler.** `queued` avec `attempts > 0` est une
+  ligne qu'un refus passager a fait reculer ; le serveur a refusé *avant* le corps — sinon l'état
+  serait `committing` — donc il n'a rien pris. Refuser ici obligerait à attendre l'épuisement des
+  six tentatives pour se débarrasser d'un message dont on ne veut plus.
+
+Le bouton est **dans la bannière**, et pas seulement dans le panneau de la file : c'est le seul
+endroit où l'utilisateur regarde à cet instant, et une fenêtre de rétractation qui demande de
+chercher n'en est pas une. Le panneau reste le chemin de celui qui a fermé trop vite.
+
+#### Ce qui reste ouvert
 
 **`mail search` n'affiche aucun identifiant**, alors que `mail source --id` documente
 « l'identifiant tel que `mail search` le rend ». Deux commandes qui se citent l'une l'autre sans
 se parler.
 
 Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace` — **1 326 tests verts** en local, et la CI complète au vert sur **Linux
-et Windows**, ce qui est la première fois que ce chiffre veut dire quelque chose ailleurs que sur
-une machine.
+`cargo test --workspace` — **1 334 tests verts**, soit 8 de plus : l'annulation refusée sur les
+quatre états qui ne sont pas `queued` et la ligne conservée à chaque fois, l'annulation acceptée
+après un refus passager, le maintien qui tient le facteur à l'écart jusqu'à la seconde près, et
+son contrôle négatif. Et la CI complète au vert sur **Linux et Windows**, ce qui est la première
+fois que ce chiffre veut dire quelque chose ailleurs que sur une machine.

@@ -409,7 +409,7 @@ fn exercise_smtp(store: &Store, accounts: &[mailcore::Account]) -> Result<(usize
             "sonde du critère 7",
             "Ce message n'est jamais envoyé.\r\n",
         );
-        let (id, _) = mailsmtp::queue::stage(store, account.id, &draft, now())
+        let (id, _) = mailsmtp::queue::stage(store, account.id, &draft, now(), 0)
             .with_context(|| format!("mise en file pour le compte #{}", account.id.0))?;
         let job = store
             .outgoing(id)?

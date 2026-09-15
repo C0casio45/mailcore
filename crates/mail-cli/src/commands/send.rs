@@ -134,7 +134,11 @@ pub fn run(root: Option<&Utf8PathBuf>, it: &Message) -> Result<()> {
 
     // **Une seule fonction assemble et met en file**, partagée avec `outbox.send` : deux copies
     // divergeaient déjà le jour où l'assemblage est devenu streamé.
-    let (id, size) = mailsmtp::queue::stage(&store, account.id, &draft, now)
+    // **Sans maintien, parce que cette commande remet elle-même** : la connexion s'ouvre trois
+    // lignes plus bas, sur la ligne nommée, sans passer par `Store::deliverable`. Une fenêtre
+    // de rétractation n'y retarderait rien — elle annoncerait un délai qui n'existe pas. Celui
+    // qui veut la fenêtre passe par la coquille ou par `outbox.send`, dont le facteur remet.
+    let (id, size) = mailsmtp::queue::stage(&store, account.id, &draft, now, 0)
         .context("mise en file du message")?;
     println!("Message #{} en file ({}).", id.0, human::bytes(size));
 
@@ -620,6 +624,41 @@ pub fn forget(root: Option<&Utf8PathBuf>, id: i64) -> Result<()> {
         );
     }
     println!("#{id} retiré de la file.");
+    println!("Son contenu devient un blob orphelin — `mail doctor` le compte.");
+    Ok(())
+}
+
+/// Annule une ligne **qui n'est pas encore partie**.
+///
+/// ## Ce qu'elle refuse, et pourquoi
+///
+/// Tout ce qui n'est pas `queued`. C'est la symétrique exacte de [`forget`], qui ne retire que
+/// des lignes finies : entre les deux, `sending` et `committing` ne sortent par aucune des deux,
+/// parce que ce sont les états où personne ne sait ce que le serveur a vu.
+///
+/// ## Le message d'échec nomme l'état, et il a une raison de le faire
+///
+/// « Trop tard » sans rien d'autre laisserait croire à un bogue. L'état dit lequel des trois cas
+/// on regarde : parti pour de bon, en cours, ou douteux — et le troisième renvoie vers la
+/// décision, qui est un geste différent.
+///
+/// # Errors
+///
+/// Si le store est illisible, ou si la ligne n'est plus annulable.
+pub fn cancel(root: Option<&Utf8PathBuf>, id: i64) -> Result<()> {
+    let store = open(root)?;
+    let target = mailcore::OutboxId(id);
+    if !store.cancel_outgoing(target)? {
+        let state = store.outgoing(target)?.map_or_else(
+            || "inexistant".to_owned(),
+            |it| it.state.as_str().to_owned(),
+        );
+        bail!(
+            "le message #{id} est à l'état « {state} » : l'annulation ne retire que ce qui \
+             n'est pas encore parti. `mail outbox` pour voir la file."
+        );
+    }
+    println!("#{id} annulé : il ne partira pas.");
     println!("Son contenu devient un blob orphelin — `mail doctor` le compte.");
     Ok(())
 }

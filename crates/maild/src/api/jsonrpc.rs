@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use mailapi::dispatch::WaitParams;
 use mailapi::jsonrpc::{self, Error, Request, Response};
 use mailcore::Mailbox;
+use mailsmtp::queue::HOLD;
 use serde_json::{Value, json};
 
 /// Délai d'attente par défaut de `store.wait`, en millisecondes.
@@ -163,6 +164,7 @@ impl Api {
             m::OUTBOX_SEND => self.outbox_send(params).await,
             m::OUTBOX_DECIDE => self.outbox_decide(params).await,
             m::OUTBOX_RETRY => self.outbox_retry(params).await,
+            m::OUTBOX_CANCEL => self.outbox_cancel(params).await,
             m::MESSAGES_MARK_READ => self.mark_read(params).await,
             m::MESSAGES_STAGE_PART => self.stage_part(params).await,
             other => Err(Error::method_not_found(other)),
@@ -688,20 +690,25 @@ impl Api {
                 // **Une seule fonction assemble et met en file**, partagée avec `mail send`.
                 // Elle écrit en flux : un message avec 25 Mo de pièces jointes ne passe jamais
                 // en entier par la mémoire du démon — critère 3 de `docs/PHASE-3.md`.
-                let (id, size) = mailsmtp::queue::stage(mailbox.store(), account.id, &draft, now)
-                    .map_err(|source| {
-                    // `Unsendable` couvre deux cas très différents : un brouillon
-                    // invalide, qui est une erreur du client, et un magasin illisible,
-                    // qui est une panne du démon. Le premier doit dire quoi corriger,
-                    // le second ne doit rien dire de l'intérieur.
-                    tracing::warn!(%source, "mise en file impossible");
-                    Error::invalid_params(source.to_string())
-                })?;
+                // **Avec maintien, parce que c'est le facteur qui remettra** : rien n'ouvre de
+                // connexion ici. La ligne attend `HOLD` secondes dans la file, pendant
+                // lesquelles `outbox.cancel` peut encore la retirer — et le client l'annonce.
+                let (id, size) =
+                    mailsmtp::queue::stage(mailbox.store(), account.id, &draft, now, HOLD)
+                        .map_err(|source| {
+                            // `Unsendable` couvre deux cas très différents : un brouillon
+                            // invalide, qui est une erreur du client, et un magasin illisible,
+                            // qui est une panne du démon. Le premier doit dire quoi corriger,
+                            // le second ne doit rien dire de l'intérieur.
+                            tracing::warn!(%source, "mise en file impossible");
+                            Error::invalid_params(source.to_string())
+                        })?;
 
                 Ok(mailapi::dto::Queued {
                     id: id.0,
                     size,
                     recipients,
+                    hold: HOLD,
                 })
             })
             .await?;
@@ -830,6 +837,35 @@ impl Api {
             postman.nudge();
         }
         encode(&json!({ "queued": queued }))
+    }
+
+    /// Retire un envoi que le facteur n'a pas encore pris.
+    ///
+    /// Elle ne réveille **pas** le facteur, contrairement à ses voisines : il n'y a rien de
+    /// nouveau à remettre, et le réveiller ne ferait qu'ouvrir une connexion pour rien.
+    async fn outbox_cancel(&self, params: Value) -> Result<Value, Error> {
+        let params: mailapi::dispatch::CancelParams =
+            serde_json::from_value(params).map_err(Error::invalid_params)?;
+
+        let cancelled = self
+            .read(move |mailbox| {
+                mailbox
+                    .store()
+                    .cancel_outgoing(mailcore::OutboxId(params.id))
+                    .map_err(|source| {
+                        tracing::warn!(%source, "annulation non écrite");
+                        Error::new(
+                            jsonrpc::INTERNAL_ERROR,
+                            "l'annulation n'a pas pu être écrite",
+                        )
+                    })
+            })
+            .await?;
+
+        // **`false` n'est pas une erreur.** La ligne était déjà partie : le client a perdu une
+        // course, ce qui est un cas normal d'une fenêtre de rétractation, et l'interface doit
+        // pouvoir dire « trop tard » plutôt qu'afficher une panne.
+        encode(&json!({ "cancelled": cancelled }))
     }
 }
 
@@ -2207,6 +2243,7 @@ mod tests {
                 &["jean@ailleurs.fr".to_owned()],
                 raw.len() as u64,
                 1_000,
+                None,
             )
             .unwrap();
         // Ce qu'écrit `mailsmtp::queue::settle` sur un quota épuisé : la phrase sans promesse
@@ -2260,6 +2297,7 @@ mod tests {
                 &["jean@ailleurs.fr".to_owned()],
                 raw.len() as u64,
                 1_000,
+                None,
             )
             .unwrap();
         store

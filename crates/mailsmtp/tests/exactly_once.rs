@@ -309,6 +309,7 @@ fn queued(dir: &camino::Utf8Path) -> (Store, mailcore::OutboxId) {
             // La taille réelle du message : c'est elle qui part dans `SIZE=`.
             raw.len() as u64,
             1_000,
+            None,
         )
         .unwrap();
     (store, id)
@@ -500,6 +501,7 @@ fn the_message_the_server_received_is_the_one_that_was_queued() {
             &["jean@ailleurs.fr".to_owned()],
             raw.len() as u64,
             1_000,
+            None,
         )
         .unwrap();
     drop(store);

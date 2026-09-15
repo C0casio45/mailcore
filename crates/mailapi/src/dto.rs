@@ -598,6 +598,16 @@ pub struct Queued {
     /// Rendus pour que le client puisse **vérifier** ce qu'il a demandé : une adresse mal
     /// analysée est refusée, mais une adresse tombée d'une liste ne se verrait pas autrement.
     pub recipients: Vec<String>,
+    /// Combien de secondes la ligne attend avant que le facteur puisse la prendre.
+    ///
+    /// C'est la fenêtre pendant laquelle `outbox.cancel` marchera encore. Elle est **rendue**
+    /// plutôt que connue du client : un client qui écrirait « 10 secondes » dans sa phrase
+    /// mentirait le jour où le délai change, et un client qui ne sait pas combien de temps il
+    /// lui reste ne peut pas proposer l'annulation honnêtement.
+    ///
+    /// `0` veut dire que la ligne est remettable tout de suite.
+    #[serde(default)]
+    pub hold: i64,
 }
 
 /// Une proposition de complétion d'un destinataire.

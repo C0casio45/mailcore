@@ -68,6 +68,18 @@ const BACKOFF_CAP: i64 = 7_200;
 /// suite ne refuse plus passagèrement, quoi que dise son code.
 const MAX_ATTEMPTS: u32 = 6;
 
+/// La fenêtre de rétractation d'un envoi cliqué, en secondes.
+///
+/// Dix secondes. Le nombre vient de ce qu'il doit couvrir : le temps de lire la confirmation et
+/// de réaliser qu'on s'est trompé de destinataire, ou qu'on a oublié la pièce jointe. Plus
+/// court, l'annulation n'est pas atteignable ; plus long, l'envoi cesse d'être un envoi et
+/// l'utilisateur se met à douter que son message soit parti.
+///
+/// Ce n'est **pas** un envoi différé : rien n'attend un événement, et fermer la fenêtre ne
+/// change rien — `docs/PHASE-3.md` refusait « un envoi qui part quand l'application se ferme »,
+/// et le facteur du démon rend cette objection sans objet.
+pub const HOLD: i64 = 10;
+
 /// Ce que la file a besoin de savoir faire pour remettre un message.
 ///
 /// ## Pourquoi un trait et pas la fonction de connexion
@@ -377,6 +389,21 @@ fn message_for_user(failure: &Error, frontier_error: Option<&str>, retrying: boo
 /// savoir qu'aucun autre brouillon ne l'utilise, ce qui suppose des brouillons persistés — ils
 /// n'existent pas encore.
 ///
+/// ## `hold` est la fenêtre pendant laquelle l'utilisateur peut encore se rétracter
+///
+/// Un clic est le consentement, et il le reste : le message part, sans qu'on redemande. Mais
+/// entre le clic et le départ, un délai coûte zéro à qui ne s'en sert pas et sauve celui qui
+/// s'est trompé de destinataire. Ce n'est pas un envoi différé — rien n'attend un événement,
+/// et fermer la fenêtre ne change rien, puisque c'est le facteur du démon qui remet.
+///
+/// Le délai s'écrit en `retry_after` et passe donc par la porte qui existe déjà : il ne touche
+/// pas `state`, donc il ne touche pas la règle du critère 2. Voir [`Store::enqueue`].
+///
+/// **`0` veut dire tout de suite**, et c'est ce que passe un appelant qui remet lui-même juste
+/// après : `mail send` ouvre la connexion dans la foulée, sans passer par
+/// [`Store::deliverable`], donc un maintien n'y retarderait rien — il ne ferait que mentir sur
+/// ce qui va se produire.
+///
 /// # Errors
 ///
 /// [`Error::Unsendable`] si le brouillon n'est pas envoyable ou si une pièce jointe est absente
@@ -386,6 +413,7 @@ pub fn stage(
     account: mailcore::AccountId,
     draft: &crate::compose::Draft,
     now: i64,
+    hold: i64,
 ) -> Result<(mailcore::OutboxId, u64)> {
     let recipients: Vec<String> = draft
         .envelope_recipients()
@@ -423,12 +451,21 @@ pub fn stage(
             reason: format!("le message n'a pas pu être rangé : {source}"),
         })?
         .hash;
+    let not_before = (hold > 0).then(|| now.saturating_add(hold));
     let id = store
-        .enqueue(account, blob, draft.from.addr(), &recipients, size, now)
+        .enqueue(
+            account,
+            blob,
+            draft.from.addr(),
+            &recipients,
+            size,
+            now,
+            not_before,
+        )
         .map_err(|source| Error::Unsendable {
             reason: format!("mise en file impossible : {source}"),
         })?;
-    tracing::info!(job = id.0, size, "message mis en file");
+    tracing::info!(job = id.0, size, hold, "message mis en file");
     Ok((id, size))
 }
 
@@ -487,6 +524,7 @@ mod tests {
                 // La taille : les tests de la file ne la lisent pas, mais `SIZE` en dépend.
                 42,
                 1_000,
+                None,
             )
             .unwrap();
         store.outgoing(id).unwrap().unwrap()
@@ -818,5 +856,49 @@ mod tests {
     fn an_id_that_does_not_exist_is_not_a_panic() {
         let (_dir, store, _account, _blob) = fixture();
         assert!(store.outgoing(OutboxId(4_242)).unwrap().is_none());
+    }
+
+    #[test]
+    fn staging_with_a_hold_keeps_the_postman_away_for_exactly_that_long() {
+        // Le câblage : `hold` en secondes chez l'appelant devient un instant dans le store, et
+        // c'est la porte de `deliverable` qui l'applique. Sans ce test, une inversion de signe
+        // ou un `hold` ignoré ne se verrait qu'à l'usage — et « à l'usage », ici, veut dire
+        // « le message est déjà parti ».
+        let (_dir, store, account, _blob) = fixture();
+        let draft = crate::compose::Draft::new(
+            crate::compose::Address::parse("marie@exemple.fr", None).unwrap(),
+            vec![crate::compose::Address::parse("jean@ailleurs.fr", None).unwrap()],
+            "bonjour",
+            "un corps",
+        );
+
+        let (id, _) = stage(&store, account, &draft, 1_000, HOLD).unwrap();
+
+        assert!(
+            store.deliverable(1_000 + HOLD - 1, 10).unwrap().is_empty(),
+            "une seconde avant la fin du maintien, le facteur ne doit rien voir"
+        );
+        let ready = store.deliverable(1_000 + HOLD, 10).unwrap();
+        assert_eq!(ready.len(), 1, "à l'échéance, la ligne devient remettable");
+        assert_eq!(ready[0].id, id);
+    }
+
+    #[test]
+    fn staging_without_a_hold_is_deliverable_at_once() {
+        // Le contrôle négatif : `mail send` remet lui-même dans la foulée et passe `0`. Si le
+        // maintien s'appliquait quand même, la commande ouvrirait une connexion pour une ligne
+        // que la file considère comme pas encore due.
+        let (_dir, store, account, _blob) = fixture();
+        let draft = crate::compose::Draft::new(
+            crate::compose::Address::parse("marie@exemple.fr", None).unwrap(),
+            vec![crate::compose::Address::parse("jean@ailleurs.fr", None).unwrap()],
+            "bonjour",
+            "un corps",
+        );
+
+        let (id, _) = stage(&store, account, &draft, 1_000, 0).unwrap();
+        let ready = store.deliverable(1_000, 10).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id);
     }
 }

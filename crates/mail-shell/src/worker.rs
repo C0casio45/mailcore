@@ -129,6 +129,10 @@ pub enum Request {
     /// Distinct de `Decide` : un envoi échoué a été refusé, donc le serveur n'a rien pris,
     /// donc le renvoi ne peut pas faire de doublon. Voir `outbox.retry`.
     Retry { id: i64 },
+    /// Annuler un envoi **pas encore parti**.
+    ///
+    /// Distinct des deux autres : elle ne sort que de `queued`. Voir `outbox.cancel`.
+    Cancel { id: i64 },
     /// Ranger un fichier dans le magasin, pour le joindre.
     ///
     /// Le chemin ne quitte pas ce processus : voir `Link::stage`.
@@ -418,6 +422,12 @@ pub enum Reply {
     },
     /// Un message est en file. L'interface le verra dans le prochain `outbox.list`.
     Queued(Box<dto::Queued>),
+    /// Une annulation a été tranchée par le store : `true` si la ligne a été retirée.
+    ///
+    /// **`false` n.est pas une erreur**, c.est une course perdue — le facteur avait déjà pris
+    /// la ligne. L.interface doit le dire à l.utilisateur, donc elle a besoin de la valeur et
+    /// pas d.un simple accusé.
+    Cancelled(bool),
     /// Une écriture a été acceptée. L'interface en verra l'effet au prochain `Changed`.
     Acknowledged,
     /// Une tâche de fond a été mise en file. L'interface la verra dans le prochain `jobs.list`.
@@ -1601,6 +1611,7 @@ fn describe(request: &Request) -> (&'static str, &'static str, Value) {
             json!({"id": id, "decision": decision}),
         ),
         Request::Retry { id } => ("renvoi", m::OUTBOX_RETRY, json!({"id": id})),
+        Request::Cancel { id } => ("annulation", m::OUTBOX_CANCEL, json!({"id": id})),
         Request::Complete { prefix, .. } => (
             "complétion",
             m::CONTACTS_COMPLETE,
@@ -1776,6 +1787,17 @@ fn decode(request: Request, result: Value) -> Result<Reply, String> {
             // boucle une fenêtre vide.
             let saved: Option<dto::Draft> = from(result)?;
             Reply::Saved(saved.and_then(|it| it.id))
+        }
+        // **La valeur compte ici, contrairement aux accusés voisins.** Une annulation refusée
+        // n.est pas une panne : c.est une course perdue contre le facteur, et l.utilisateur doit
+        // lire « trop tard » plutôt que « annulé » ou un message d.erreur.
+        Request::Cancel { .. } => {
+            #[derive(serde::Deserialize)]
+            struct Cancelled {
+                cancelled: bool,
+            }
+            let it: Cancelled = from(result)?;
+            Reply::Cancelled(it.cancelled)
         }
         // Un accusé, pas une valeur : ce qui intéresse l'interface est que la liste a changé,
         // et le `Changed` de l'abonnement le dira.

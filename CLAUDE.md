@@ -343,6 +343,20 @@ le cas dérivé qui ne rentrait pas dans le moule des deux autres — trois leç
   opposés : un serveur qui a refusé n'a rien pris, un serveur qui n'a pas répondu a peut-être
   tout. Chaque fonction refuse l'état de l'autre. Et le renvoi remet `attempts` à zéro, sinon
   une ligne épuisée échouerait au premier refus passager.
+- **Un envoi `queued` s'annule, et la file a donc trois sorties, pas deux.**
+  `Store::cancel_outgoing` / `outbox.cancel` / `mail outbox --cancel` est la symétrique de
+  `forget_outgoing`, qui ne retire que des lignes **finies** : celle-ci ne retire que des lignes
+  **pas commencées**. Entre les deux, `sending` et `committing` ne sortent par aucune — ce sont
+  les états où personne ne sait ce que le serveur a vu. Deux choses à ne pas défaire :
+  - **le refus est dans le `WHERE`**, pas dans un `if` après lecture. Le facteur écrit `sending`
+    avant d'ouvrir l'enveloppe, donc lire puis effacer laisserait une fenêtre où l'annulation
+    retirerait un message déjà sur le fil ;
+  - **le maintien passe par `retry_after`, jamais par `state`.** Dix secondes (`queue::HOLD`)
+    écrites à la mise en file réutilisent la porte de `deliverable`, donc la règle du critère 2
+    n'est pas approchée. `mail send` passe `0` parce qu'il remet lui-même sans passer par cette
+    porte ; `outbox.send` passe `HOLD` parce que c'est le facteur qui remettra. Et le délai
+    **remonte au client** dans `dto::Queued` : une interface qui écrirait « 10 s » en dur
+    mentirait le jour où la constante change.
 
 **Les refus d'envoi sont provoqués depuis le 2026-09-10**, et trois leçons en sortent :
 

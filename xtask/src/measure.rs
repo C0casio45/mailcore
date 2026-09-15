@@ -873,8 +873,9 @@ pub fn attachment(megabytes: u64) -> Result<()> {
 
     // 1. L'assemblage et la mise en file.
     let assembling = Instant::now();
-    let (id, size) = mailsmtp::queue::stage(&store, first_account(&store)?, &draft, now_seconds())
-        .context("mise en file")?;
+    let (id, size) =
+        mailsmtp::queue::stage(&store, first_account(&store)?, &draft, now_seconds(), 0)
+            .context("mise en file")?;
     let after_stage = current_rss();
     println!(
         "Assemblage   {:.1}s, {} écrits, RSS {}",

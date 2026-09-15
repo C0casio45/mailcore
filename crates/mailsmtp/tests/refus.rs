@@ -229,6 +229,7 @@ fn queued(dir: &camino::Utf8Path) -> (Store, mailcore::OutboxId) {
             &["jean@ailleurs.fr".to_owned()],
             raw.len() as u64,
             1_000,
+            None,
         )
         .unwrap();
     (store, id)

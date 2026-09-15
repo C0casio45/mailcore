@@ -1517,6 +1517,7 @@ mod purge_tests {
                 &["jean@ailleurs.fr".to_owned()],
                 20,
                 1_000,
+                None,
             )
             .unwrap();
 
@@ -1551,6 +1552,7 @@ mod purge_tests {
                 &["jean@ailleurs.fr".to_owned()],
                 10,
                 1_000,
+                None,
             )
             .unwrap();
 
@@ -1607,6 +1609,7 @@ mod orphan_agreement_tests {
                 &["jean@ailleurs.fr".to_owned()],
                 7,
                 1_000,
+                None,
             )
             .unwrap();
         store.blobs().put(b"vraiment orphelin").unwrap();

@@ -36,9 +36,28 @@ impl Store {
     /// **avant**, parce qu'une ligne de file qui pointe vers un blob absent serait un message
     /// perdu que rien ne signale.
     ///
+    /// ## `not_before` est la fenêtre de rétractation, et elle réutilise la porte qui existe
+    ///
+    /// [`Store::deliverable`] refuse déjà ce dont `retry_after` est dans le futur : c'est le
+    /// recul entre deux tentatives. Un maintien à la mise en file est exactement la même
+    /// question posée plus tôt — « pas avant cet instant » — donc il s'écrit dans la même
+    /// colonne et passe par la même porte.
+    ///
+    /// Ce qu'il ne touche pas, et c'est ce qui rend le procédé sûr : **`state`**. La règle du
+    /// critère 2 — `committing` ne se remet jamais — vit sur l'état, pas sur le temps. Un
+    /// maintien ne peut donc pas la relâcher, quelle que soit sa durée.
+    ///
+    /// `None` veut dire « tout de suite », et c'est ce que passe un appelant qui remet
+    /// lui-même dans la foulée.
+    ///
     /// # Errors
     ///
     /// [`crate::Error::Sqlite`] si l'écriture échoue.
+    // Huit paramètres pour huit colonnes, et l'appelant est unique — `mailsmtp::queue::stage`.
+    // Les grouper dans une structure ne retirerait rien à ce qu'il faut savoir pour appeler :
+    // ça déplacerait les huit champs d'un cran, et ajouterait un type dont la seule raison
+    // d'être serait de contenter un compteur.
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
         account: AccountId,
@@ -47,6 +66,7 @@ impl Store {
         recipients: &[String],
         size: u64,
         now: i64,
+        not_before: Option<i64>,
     ) -> Result<OutboxId> {
         let joined = recipients.join("\n");
         // La taille est celle du message assemblé, connue par l'appelant qui vient de l'écrire.
@@ -56,8 +76,9 @@ impl Store {
         self.durably(|conn| {
             conn.execute(
                 "INSERT INTO outbox
-                    (account_id, blob_hash, sender, recipients, state, queued_at, size)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    (account_id, blob_hash, sender, recipients, state, queued_at, size,
+                     retry_after)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     account.0,
                     blob.as_bytes().as_slice(),
@@ -65,7 +86,8 @@ impl Store {
                     joined,
                     SendState::Queued.as_str(),
                     now,
-                    size
+                    size,
+                    not_before
                 ],
             )?;
             Ok(OutboxId(conn.last_insert_rowid()))
@@ -241,6 +263,60 @@ impl Store {
         })?;
         tracing::info!(job = id.0, "ligne de file retirée");
         Ok(true)
+    }
+
+    /// Retire une ligne **qui n'a pas commencé**, sur décision de l'utilisateur.
+    ///
+    /// C'est la symétrique de [`Store::forget_outgoing`], qui ne retire que des lignes finies :
+    /// celle-ci ne retire que des lignes pas encore parties. Entre les deux, il n'y a aucune
+    /// sortie, et c'est voulu — `sending` et `committing` sont exactement les états où personne
+    /// ne peut dire ce que le serveur a vu.
+    ///
+    /// ## Le refus est dans le `WHERE`, et c'est ce qui ferme la course
+    ///
+    /// Le facteur peut prendre la ligne entre le moment où on la lit et celui où on l'efface :
+    /// [`mailsmtp::queue::deliver_one`] écrit `sending` **avant** d'ouvrir l'enveloppe. Lire
+    /// l'état puis effacer laisserait donc une fenêtre où l'annulation retirerait un message
+    /// déjà sur le fil. La condition est dans la requête, donc SQLite tranche : ou bien la
+    /// ligne est encore `queued` et elle part, ou bien elle ne l'est plus et rien n'est écrit.
+    ///
+    /// Même raisonnement que la clause de [`Store::deliverable`] : la règle qui protège un
+    /// message vit dans le `WHERE`, pas dans la boucle appelante.
+    ///
+    /// ## Une tentative déjà comptée n'empêche pas d'annuler
+    ///
+    /// `queued` avec `attempts > 0` est une ligne qu'un refus passager a fait reculer. Le
+    /// serveur a refusé **avant** le corps — sinon l'état serait `committing` — donc il n'a
+    /// rien pris, donc il n'y a rien à annuler chez lui. Refuser ici obligerait l'utilisateur à
+    /// attendre l'épuisement des six tentatives pour se débarrasser d'un message qu'il ne veut
+    /// plus envoyer.
+    ///
+    /// ## Le blob n'est pas supprimé ici
+    ///
+    /// Pour la même raison que [`Store::forget_outgoing`] : deux envois du même contenu
+    /// partagent leur blob, par construction. `Store::orphan_blobs` le compte.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`]. Rend `false` — sans rien écrire — si la ligne n'existe pas ou
+    /// n'est plus `queued`.
+    pub fn cancel_outgoing(&self, id: OutboxId) -> Result<bool> {
+        let removed = self.durably(|conn| {
+            let changed = conn.execute(
+                "DELETE FROM outbox WHERE id = ?1 AND state = ?2",
+                params![id.0, SendState::Queued.as_str()],
+            )?;
+            Ok(changed == 1)
+        })?;
+        if removed {
+            tracing::info!(job = id.0, "envoi annulé avant tout départ");
+        } else {
+            tracing::warn!(
+                job = id.0,
+                "annulation refusée : la ligne n'est plus en attente"
+            );
+        }
+        Ok(removed)
     }
 
     /// Les messages que la boucle de remise peut prendre, du plus ancien au plus récent.
@@ -564,6 +640,7 @@ mod tests {
                 // `SIZE` en dépend, et un zéro veut dire « inconnue ».
                 42,
                 1_000,
+                None,
             )
             .unwrap()
     }
@@ -734,6 +811,7 @@ mod decision_tests {
                 // La taille : les tests de la file ne la lisent pas, mais `SIZE` en dépend.
                 42,
                 1_000,
+                None,
             )
             .unwrap();
         (dir, store, id)
@@ -897,5 +975,124 @@ mod decision_tests {
             Decision::parse("RESEND").is_err(),
             "la casse n'est pas un repli"
         );
+    }
+
+    // ------------------------------------------------------------------------------------
+    // L'annulation, et la fenêtre de rétractation
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_line_that_has_not_started_can_be_cancelled() {
+        let (_dir, store, id) = fixture();
+        assert!(store.cancel_outgoing(id).unwrap());
+        assert!(
+            store.outgoing(id).unwrap().is_none(),
+            "la ligne annulée doit disparaître, sinon elle repartirait"
+        );
+    }
+
+    #[test]
+    fn cancelling_refuses_every_state_but_queued() {
+        // **Le test qui porte le risque.** `sending` et `committing` sont les états où personne
+        // ne sait ce que le serveur a vu : les retirer perdrait un message, ou effacerait la
+        // trace d'un message peut-être parti — l'information même que le critère 2 conserve.
+        // `sent` et `failed` ne sortent que par `forget_outgoing`, qui est l'autre bout.
+        for state in [
+            SendState::Sending,
+            SendState::Committing,
+            SendState::Sent,
+            SendState::Failed,
+        ] {
+            let (_dir, store, id) = fixture();
+            store.commit_outgoing(id, state).unwrap();
+
+            assert!(
+                !store.cancel_outgoing(id).unwrap(),
+                "l'état « {} » ne doit pas s'annuler",
+                state.as_str()
+            );
+            assert!(
+                store.outgoing(id).unwrap().is_some(),
+                "la ligne « {} » a été retirée alors que l'annulation était refusée",
+                state.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_a_line_that_does_not_exist_is_not_a_panic() {
+        let (_dir, store, _id) = fixture();
+        assert!(!store.cancel_outgoing(OutboxId(9_999)).unwrap());
+    }
+
+    #[test]
+    fn a_transient_refusal_does_not_lock_the_message_in() {
+        // `queued` avec des tentatives est une ligne qu'un refus passager a fait reculer : le
+        // serveur a refusé **avant** le corps, donc il n'a rien pris. Refuser l'annulation ici
+        // obligerait à attendre l'épuisement des six tentatives pour se débarrasser d'un
+        // message dont on ne veut plus.
+        let (_dir, store, id) = fixture();
+        store
+            .record_attempt(
+                id,
+                SendState::Queued,
+                2_000,
+                Some("quota"),
+                Some(3_000),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(store.outgoing(id).unwrap().unwrap().attempts, 1);
+        assert!(store.cancel_outgoing(id).unwrap());
+    }
+
+    #[test]
+    fn a_held_line_is_not_deliverable_before_its_time() {
+        // La fenêtre de rétractation passe par la porte qui existe déjà — `retry_after` — et
+        // c'est ce qui la rend sûre : elle ne touche pas `state`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let store = Store::open(&root).unwrap();
+        let account = {
+            let writer = store.writer().unwrap();
+            let id = writer
+                .upsert_account(AccountKind::Imap.as_str(), "compte")
+                .unwrap();
+            writer.commit().unwrap();
+            id
+        };
+        let id = store
+            .enqueue(
+                account,
+                BlobHash::from_bytes([9_u8; 32]),
+                "marie@exemple.fr",
+                &["jean@ailleurs.fr".to_owned()],
+                42,
+                1_000,
+                Some(1_010),
+            )
+            .unwrap();
+
+        assert!(
+            store.deliverable(1_005, 10).unwrap().is_empty(),
+            "le facteur ne doit pas prendre une ligne encore tenue"
+        );
+        // L'état, lui, n'a pas bougé : c'est bien `queued`, donc annulable.
+        assert_eq!(
+            store.outgoing(id).unwrap().unwrap().state,
+            SendState::Queued
+        );
+        assert!(store.cancel_outgoing(id).unwrap());
+    }
+
+    #[test]
+    fn a_line_without_a_hold_is_deliverable_at_once() {
+        // Le contrôle négatif du précédent : sans maintien, rien ne retarde la remise. Sans
+        // lui, un `retry_after` écrit par erreur sur toutes les lignes passerait inaperçu.
+        let (_dir, store, id) = fixture();
+        let ready = store.deliverable(1_000, 10).unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, id);
     }
 }

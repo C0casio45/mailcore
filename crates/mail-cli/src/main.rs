@@ -319,6 +319,18 @@ enum Command {
         /// effacer la trace d'un message peut-être parti.
         #[arg(long)]
         forget: Option<i64>,
+        /// Annuler un envoi **qui n'est pas encore parti**.
+        ///
+        /// C'est la symétrique de `--forget`, à l'autre bout de la file : celle-ci ne retire
+        /// que ce qui n'a pas commencé. Entre les deux, `sending` et `committing` ne sortent
+        /// par aucune des deux — ce sont exactement les états où personne ne sait ce que le
+        /// serveur a vu.
+        ///
+        /// Un message mis en file par la coquille attend quelques secondes avant que le facteur
+        /// ne le prenne : c'est la fenêtre où cette commande marche encore. Passée, elle le dit
+        /// au lieu d'inventer.
+        #[arg(long, conflicts_with_all = ["accept", "forget", "retry", "resend"])]
+        cancel: Option<i64>,
     },
     /// Importe un profil Thunderbird dans le store. Lecture seule sur le profil.
     ///
@@ -643,14 +655,16 @@ fn main() -> Result<()> {
                 accept,
                 retry,
                 forget,
+                cancel,
             },
             None,
-        ) => match (resend, accept, retry, forget) {
-            (Some(id), _, _, _) => commands::send::decide(store, *id, "resend"),
-            (_, Some(id), _, _) => commands::send::decide(store, *id, "accept"),
-            (_, _, Some(id), _) => commands::send::retry(store, *id),
-            (_, _, _, Some(id)) => commands::send::forget(store, *id),
-            (None, None, None, None) => commands::send::list(store),
+        ) => match (resend, accept, retry, forget, cancel) {
+            (Some(id), _, _, _, _) => commands::send::decide(store, *id, "resend"),
+            (_, Some(id), _, _, _) => commands::send::decide(store, *id, "accept"),
+            (_, _, Some(id), _, _) => commands::send::retry(store, *id),
+            (_, _, _, Some(id), _) => commands::send::forget(store, *id),
+            (_, _, _, _, Some(id)) => commands::send::cancel(store, *id),
+            (None, None, None, None, None) => commands::send::list(store),
         },
         (Command::Contacts { command }, None) => match command {
             ContactsCommand::Rebuild => commands::contacts::rebuild(store),
