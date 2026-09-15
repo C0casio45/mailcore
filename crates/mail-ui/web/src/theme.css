@@ -1,0 +1,452 @@
+/*
+ * Le thème : minimaliste, bureautique. Un outil de travail, pas une vitrine.
+ *
+ * Les règles viennent de `docs/PHASE-1.md`, section « Thème » :
+ *
+ * - Police système. Pas de police embarquée, pas de police web — c'est aussi la seule façon
+ *   de tenir `font-src 'self'` sans rien servir.
+ * - Densité avant respiration : ligne de liste à 22 px, ~40 messages visibles sans défiler.
+ * - Niveaux de gris plus **un seul** accent, pour la sélection et le non-lu.
+ * - Pas de dégradé, pas d'ombre portée, pas de coin arrondi décoratif.
+ * - La hiérarchie passe par la graisse et l'espacement, pas par la couleur.
+ * - Bordures 1 px entre panneaux. Pas de carte flottante.
+ * - Clair et sombre, en suivant le réglage système.
+ *
+ * Le mode sombre est fait par redéfinition de variables sous `prefers-color-scheme`, et non
+ * par une classe posée en JavaScript : le thème est alors juste avant que le premier script
+ * tourne, ce qui évite l'éclair blanc au démarrage — et ça compte pour le critère 1.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #ffffff;
+  --bg-panel: #f7f7f7;
+  --bg-hover: #ededed;
+  --bg-selected: #dce7f5;
+  --text: #1a1a1a;
+  --text-muted: #6b6b6b;
+  --border: #d4d4d4;
+  --accent: #1f5fa8;
+  --danger: #a01414;
+
+  --row-height: 22px;
+  --font: 13px/1.4 system-ui, "Segoe UI", Roboto, sans-serif;
+  --mono: 12px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1c;
+    --bg-panel: #232323;
+    --bg-hover: #2c2c2c;
+    --bg-selected: #24384f;
+    --text: #e4e4e4;
+    --text-muted: #9a9a9a;
+    --border: #383838;
+    --accent: #6ea8e8;
+    --danger: #e08080;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  font: var(--font);
+  color: var(--text);
+  background: var(--bg);
+}
+
+#app {
+  height: 100%;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.error {
+  color: var(--danger);
+}
+
+/* --- Structure --- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.panes {
+  display: grid;
+  /* Dossiers fixes, liste et lecture en parts. Pas de poignée de redimensionnement pour
+     l'instant : ce serait de l'état à persister pour un gain que personne n'a demandé. */
+  grid-template-columns: 220px minmax(320px, 1fr) minmax(360px, 1.4fr);
+  flex: 1;
+  min-height: 0;
+}
+
+.panes > * {
+  min-width: 0;
+  min-height: 0;
+}
+
+.offline {
+  padding: 5px 10px;
+  background: var(--danger);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+/* --- Dossiers --- */
+
+.folders {
+  border-right: 1px solid var(--border);
+  background: var(--bg-panel);
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
+/* Un intitulé de compte par groupe. Sans lui, les onze `INBOX` du corpus réel sont
+   indiscernables — c'est ce qui rendait le panneau illisible au premier jet. */
+.account-name {
+  position: sticky;
+  top: 0;
+  margin: 0;
+  padding: 5px 10px 2px;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account + .account .account-name {
+  margin-top: 6px;
+}
+
+.folder {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  /* Le retrait vient de la profondeur du chemin, posé en style en ligne. */
+  padding: 2px 10px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: default;
+}
+
+.folder:hover {
+  background: var(--bg-hover);
+}
+
+.folder.current {
+  background: var(--bg-selected);
+  font-weight: 600;
+}
+
+/*
+ * `min-width: 0` n'est pas décoratif : un élément de `flex` a `min-width: auto` par défaut et
+ * refuse de se réduire sous la largeur de son contenu. Sans cette ligne, l'`ellipsis` ne se
+ * déclenche jamais et un nom long déborde du bouton en poussant le compteur de non-lus hors
+ * du panneau. C'était le défaut d'affichage du premier jet.
+ */
+.folder-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folder-unread {
+  flex: none;
+  color: var(--accent);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Recherche et en-tête de liste --- */
+
+.middle {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+}
+
+.search {
+  display: flex;
+  gap: 4px;
+  padding: 5px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.search input {
+  flex: 1;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+}
+
+.search input:focus-visible,
+.list:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.list-header {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text-muted);
+}
+
+.list-title {
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.list-footer {
+  padding: 3px 10px;
+  border-top: 1px solid var(--border);
+}
+
+/* --- La liste virtualisée --- */
+
+.list {
+  flex: 1;
+  overflow-y: auto;
+  /* `contain` dit au moteur que rien à l'intérieur n'affecte la mise en page extérieure :
+     il n'a donc pas à remonter l'arbre à chaque image de défilement. */
+  contain: strict;
+  outline: none;
+}
+
+.list-spacer {
+  position: relative;
+}
+
+.list-window {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  /* Promue en couche : le `translateY` de chaque image devient une composition et non un
+     recalcul de mise en page. C'est ce qui tient le critère 2. */
+  will-change: transform;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 52px 180px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  height: var(--row-height);
+  padding: 0 10px;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.row:hover {
+  background: var(--bg-hover);
+}
+
+.row.selected {
+  background: var(--bg-selected);
+}
+
+.row.unread .cell-from,
+.row.unread .cell-subject {
+  font-weight: 600;
+}
+
+/* Une ligne pas encore chargée : rien, pas un mot qui défile. */
+.row.pending {
+  opacity: 0.35;
+}
+
+.cell-date {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.cell-from,
+.cell-subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell-marks {
+  color: var(--text-muted);
+}
+
+/* --- Le volet de lecture --- */
+
+.reader {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.reader-state {
+  padding: 10px 14px;
+}
+
+.reader-head {
+  padding: 10px 14px 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.reader-subject {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.reader-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.reader-address,
+.reader-date,
+.reader-to {
+  color: var(--text-muted);
+}
+
+.reader-to {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.banner button,
+.search button,
+.login button {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  cursor: default;
+}
+
+.banner button:hover,
+.search button:hover,
+.login button:hover {
+  background: var(--bg-hover);
+}
+
+.trackers {
+  margin: 0;
+  padding: 5px 14px 5px 30px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.trackers code {
+  font: var(--mono);
+}
+
+/* Le corps du message. Sans bordure : le document a son propre fond, et un cadre autour
+   donnerait l'impression d'une carte flottante. */
+.reader-body {
+  flex: 1;
+  min-height: 320px;
+  border: 0;
+  width: 100%;
+  background: var(--bg);
+}
+
+.reader-text {
+  margin: 0;
+  padding: 10px 14px;
+  font: var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.attachments {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.attachments-title {
+  font-weight: 600;
+}
+
+.attachments ul,
+.trackers {
+  list-style: none;
+}
+
+.attachments ul {
+  margin: 4px 0 0;
+  padding: 0;
+}
+
+/* --- Écrans pleins --- */
+
+.login {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 340px;
+  margin: 12vh auto 0;
+  padding: 0 16px;
+}
+
+.login h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.login p {
+  margin: 0;
+}
+
+.login input {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+}

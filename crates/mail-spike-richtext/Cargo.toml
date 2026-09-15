@@ -1,0 +1,23 @@
+[package]
+name        = "mail-spike-richtext"
+description = "Sonde jetable : éditeur riche dans egui, mesuré. Voir src/main.rs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[dependencies]
+mailhtml.workspace = true
+# `glow` et non `wgpu`, pour la même raison que les autres coquilles : l'initialisation de wgpu
+# coûte l'essentiel d'un démarrage. Ici ça ne décide de rien — la sonde ne mesure pas le
+# démarrage — mais garder la même pile évite qu'un chiffre soit incomparable avec la coquille.
+eframe = { version = "0.36.1", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+egui = "0.36.1"
+
+[lints]
+workspace = true

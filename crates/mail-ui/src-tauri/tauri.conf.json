@@ -1,0 +1,61 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "mailcore",
+  "version": "0.1.0",
+
+  "identifier": "io.github.c0casio45.mailcore",
+
+  "build": {
+    "frontendDist": "../web/dist-tauri",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix web run dev:tauri",
+    "beforeBuildCommand": "npm --prefix web run build:tauri"
+  },
+
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "mailcore",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 500,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'none'",
+        "script-src": "'self'",
+        "style-src": ["'self'", "'unsafe-inline'"],
+        "img-src": ["'self'", "data:"],
+        "font-src": "'self'",
+        "connect-src": ["'self'", "ipc:", "http://ipc.localhost"],
+        "frame-src": "'self'",
+        "form-action": "'none'",
+        "base-uri": "'none'"
+      }
+    }
+  },
+
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "publisher": "mailcore",
+    "shortDescription": "Client mail natif, local et sans mouchard.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name        = "mail-spike-webview"
+description = "Sonde jetable : le coût plancher d'un webview, sans Tauri. Voir src/main.rs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# `wry` et `tao` sont déjà dans l'arbre de dépendances par Tauri, aux mêmes versions : cette
+# sonde ne coûte donc presque rien à compiler. C'est la raison pour laquelle elle est un membre
+# du workspace plutôt qu'un projet à part, qui rechargerait tout.
+[dependencies]
+wry = "0.55"
+tao = "0.35"
+
+[lints]
+workspace = true

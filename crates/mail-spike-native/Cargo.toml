@@ -1,0 +1,32 @@
+[package]
+name        = "mail-spike-native"
+description = "Sonde jetable : coquille native egui sur le vrai store. Voir src/main.rs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[dependencies]
+mailcore.workspace = true
+anyhow.workspace   = true
+camino.workspace   = true
+# `glow` (OpenGL) et non `wgpu`, qui est le défaut d'eframe 0.36.
+#
+# Ce n'est pas une préférence : mesuré sur cette machine, l'initialisation de wgpu — énumération
+# des adaptateurs DX12, création du périphérique, compilation des pipelines à la première image —
+# coûte l'essentiel d'un démarrage à 1 300 ms. Le critère 1 se joue là.
+eframe = { version = "0.36.1", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "links",
+    "wayland",
+    "x11",
+] }
+winit = "0.30"
+softbuffer = "0.4"
+
+[lints]
+workspace = true

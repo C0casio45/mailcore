@@ -1,0 +1,56 @@
+[package]
+name        = "mail-ui"
+description = "La coquille Tauri de mailcore. Embarque le service, sans socket ni jeton."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# Nommée `mail_ui_lib` et non `mail_ui` : le binaire `mail-ui` produit lui aussi un
+# `mail_ui.pdb`, et Cargo signale la collision. Tauri exige une bibliothèque en plus du binaire : c'est elle que la cible mobile lie, et le
+# binaire de bureau n'en est qu'un appelant. On garde la convention même sans cible mobile,
+# pour ne pas avoir à réorganiser le jour où il y en aurait une.
+[lib]
+name = "mail_ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "mail-ui"
+path = "src/main.rs"
+
+# `custom-protocol` décide **où la fenêtre prend sa page**, et rien de moins.
+#
+# Sans elle, Tauri charge `devUrl` — le serveur Vite sur `localhost:5173`. Avec elle, il sert
+# le paquet embarqué dans l'exécutable. Le mode de compilation n'y change rien : un
+# `cargo build --release` nu produit une application qui s'ouvre sur une page d'erreur de
+# webview, silencieusement, parce que rien n'écoute sur ce port.
+#
+# Pas dans `default` : `tauri dev` a besoin du serveur de développement pour le rechargement à
+# chaud, et une caractéristique par défaut ne se désactive pas par profil. C'est donc aux
+# constructions destinées à tourner de la demander — `cargo xtask measure-ui` le fait, et la
+# CLI de Tauri aussi pour `tauri build`. La coquille prévient au démarrage quand elle a été
+# construite sans, pour qu'une fenêtre vide ait au moins une ligne d'explication.
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+maild.workspace      = true
+mailapi              = { workspace = true, features = ["token-store"] }
+mailcore.workspace   = true
+anyhow.workspace     = true
+camino.workspace     = true
+directories.workspace = true
+serde.workspace      = true
+serde_json.workspace = true
+tauri.workspace      = true
+tokio.workspace     = true
+tracing.workspace    = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

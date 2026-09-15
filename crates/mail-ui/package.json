@@ -1,0 +1,14 @@
+{
+  "name": "mailcore-shell",
+  "private": true,
+  "version": "0.1.0",
+  "description": "La coquille Tauri. Le front web est dans web/, qui a son propre paquet.",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "bundle:debug": "tauri build --debug"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.0"
+  }
+}

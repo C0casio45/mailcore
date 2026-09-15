@@ -1,0 +1,25 @@
+[package]
+name        = "mail-spike-software"
+description = "Sonde jetable : egui à rendu logiciel, sans contexte GPU. Voir src/main.rs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[dependencies]
+mailcore.workspace = true
+anyhow.workspace   = true
+camino.workspace   = true
+
+# **egui 0.34 et non 0.36, et c'est le nœud de cette sonde.** `egui_software_backend` est en
+# 0.0.3 et suit egui 0.34 ; `eframe` 0.36 amène egui 0.36. Les deux ne peuvent pas cohabiter
+# dans un même crate — d'où un crate séparé pour la sonde plutôt qu'un binaire de plus dans
+# `mail-spike-native`. Si la mesure est bonne, le prix à payer est celui-là : une coquille
+# épinglée à une version d'egui décidée par un crate à un seul mainteneur.
+egui                  = "0.34"
+egui_software_backend = "0.0.3"
+
+[lints]
+workspace = true

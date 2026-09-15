@@ -1,0 +1,80 @@
+[package]
+name        = "mail-shell"
+description = "La coquille native de mailcore : egui, fenêtre unique, aucun webview au démarrage."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[[bin]]
+name = "mail-shell"
+path = "src/main.rs"
+
+[dependencies]
+# Le service embarqué : **exactement le même code que le démon**. La coquille est un client
+# de `Api::handle_message`, comme la page de la coquille Tauri l'est à travers l'IPC. Deux
+# surfaces parallèles finiraient par diverger, et celle de l'UI serait la moins relue.
+maild.workspace    = true
+# `token-store` : le jeton du mode distant vit dans le trousseau du système, jamais dans un
+# fichier ni dans une variable d'environnement — `docs/PRIVACY.md` §7.
+# Le trousseau du systeme, pour la page de parametres : declarer un compte y ecrit un secret,
+# et `has_secret` dit sa presence sans jamais le lire. Rien de tout ca ne passe par l'API —
+# voir `crate::settings`.
+mailauth.workspace = true
+mailapi            = { workspace = true, features = ["token-store"] }
+mailcore.workspace = true
+mailhtml.workspace = true
+# La règle de fil d'une réponse — `In-Reply-To` et `References` — vit là-bas, en un seul
+# exemplaire : voir `compose::reply_threading`.
+mailsmtp.workspace = true
+
+anyhow.workspace             = true
+camino.workspace             = true
+directories.workspace        = true
+serde_json.workspace         = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+
+# Le runtime construit à l'exécution est un **fil courant** : `Api::handle_message` est
+# `async` et `store.wait` a besoin d'une horloge, mais rien ici n'a besoin d'un ordonnanceur
+# multi-fils — les lectures partent sur le pool bloquant, et les tâches de fond de `maild`
+# tournent sur leur propre fil `std`.
+#
+# Les caractéristiques restent celles du workspace : `maild` demande déjà `rt-multi-thread`, et
+# l'unification des features de Cargo les allume donc de toute façon. En demander moins ici ne
+# retirerait rien du binaire et ferait mentir la source unique de versions.
+tokio.workspace = true
+
+# `glow` (OpenGL) et non `wgpu`, qui est le défaut d'eframe 0.36.
+#
+# Mesuré le 2026-09-02 : l'initialisation de wgpu — adaptateurs DX12, périphérique,
+# pipelines — coûte ~800 ms sur la machine de référence, contre ~150 ms pour un contexte
+# OpenGL. Le critère 1 se joue là. Le rendu logiciel, lui, démarre encore plus vite (~320 ms)
+# mais coûte 24 ms par image en 4K : voir `docs/PHASE-1.md`.
+eframe = { version = "0.36.1", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "links",
+    "wayland",
+    "x11",
+] }
+egui = "0.36.1"
+
+# Ouvrir un fichier ou une URL avec l'application du système. Utilisé pour l'échappatoire de
+# fidélité du volet de lecture, et pour les liens d'un message.
+#
+# Un crate plutôt qu'un `Command` à la main : `cmd /c start` a des pièges de guillemets sur
+# Windows, et « ouvrir ce chemin » est exactement le genre de ligne qu'on ne veut pas écrire
+# trois fois pour trois systèmes.
+clap.workspace = true
+
+serde.workspace              = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
