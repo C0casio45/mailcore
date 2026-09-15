@@ -63,5 +63,16 @@ local indisponible dégrade des fonctionnalités, ne casse jamais le client.
 - Ne pas viser la parité fonctionnelle avec Thunderbird. Les deux tournent en
   parallèle pendant toute la montée en puissance ; mailcore n'a pas à tout faire
   pour être utile.
-- Pas de calendrier, pas de carnet d'adresses, pas de chat en phase 1 à 3.
-- Pas de webmail, pas de serveur. C'est un client local.
+- ~~Pas de calendrier, pas de carnet d'adresses, pas de chat en phase 1 à 3.~~
+  **Révisé le 2026-09-09** : le carnet d'adresses et le calendrier entrent en phase 3, à la
+  demande de l'utilisateur du produit. La ligne est barrée plutôt que retirée — un non-objectif
+  qui change de camp est une décision, et elle mérite d'être relisible.
+
+  Ce qui reste vrai de son intention : **ni l'un ni l'autre ne doit devenir un produit à côté**.
+  Le carnet sert d'abord l'autocomplétion d'une adresse en rédaction, et le calendrier sert
+  d'abord les invitations qui arrivent **par mail**. Voir `docs/PHASE-3.md` pour ce que ça
+  autorise et ce que ça exclut.
+- Pas de chat.
+- Pas de webmail, pas de service hébergé, pas de multi-utilisateurs. C'est un client,
+  pour une personne. Le démon peut tourner sur une autre machine du réseau local —
+  c'est un choix de déploiement, pas un serveur au sens d'un service partagé.
