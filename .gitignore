@@ -5,3 +5,18 @@
 *.sqlite-wal
 *.sqlite-shm
 /data
+
+# front web de mail-ui (étape 8)
+/crates/mail-ui/web/node_modules
+/crates/mail-ui/web/dist
+/crates/mail-ui/web/dist-tauri
+/crates/mail-ui/src-tauri/target
+
+# relevés de xtask
+/measurements
+
+# secrets de déploiement local
+/.env
+
+# CLI Tauri de mail-ui, installée par npm à la racine du crate
+/crates/mail-ui/node_modules

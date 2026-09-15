@@ -1,0 +1,138 @@
+[workspace]
+# Membres listés un par un, et non par `crates/*`.
+#
+# Le glob exige un manifeste dans **chaque** répertoire qu'il attrape. `crates/mail-ui/` n'en
+# a pas : ce n'est pas un paquet, c'est le répertoire de l'interface, qui contient la coquille
+# Tauri (`src-tauri/`) et le front web (`web/`). Une liste explicite dit aussi ce que le
+# workspace contient sans qu'on ait à parcourir l'arborescence.
+members = [
+    "crates/mailcore",
+    "crates/mailhtml",
+    "crates/mailimport",
+    "crates/mailapi",
+    "crates/mailmcp",
+    "crates/maild",
+    "crates/mail-cli",
+    "crates/mail-ui/src-tauri",
+    "crates/mail-spike-webview",
+    "crates/mail-spike-native",
+    "crates/mail-spike-software",
+    "crates/mail-spike-richtext",
+    "crates/mail-shell",
+    "crates/mailprivacy",
+    "crates/mailfake",
+    "crates/mailsync",
+    "crates/mailauth",
+    "crates/mailsmtp",
+    "crates/mailcal",
+    "xtask",
+]
+resolver = "3"
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.96"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/C0casio45/mailcore"
+publish      = false
+
+# Une seule source de vérité pour les versions. Chaque crate écrit `foo.workspace = true`.
+[workspace.dependencies]
+# --- crates internes ---
+mailcore   = { path = "crates/mailcore" }
+mailhtml   = { path = "crates/mailhtml" }
+mailimport = { path = "crates/mailimport" }
+mailapi    = { path = "crates/mailapi" }
+mailmcp    = { path = "crates/mailmcp" }
+maild      = { path = "crates/maild" }
+mailfake   = { path = "crates/mailfake" }
+mailsync   = { path = "crates/mailsync" }
+mailauth   = { path = "crates/mailauth" }
+mailsmtp   = { path = "crates/mailsmtp" }
+mailcal    = { path = "crates/mailcal" }
+
+# --- coeur : stockage, index, parsing ---
+blake3      = "1.8"
+zstd        = "0.13"
+memchr      = "2.8"
+rusqlite    = { version = "0.40", features = ["bundled"] }
+tantivy     = "0.26"
+mail-parser = "0.11"
+ammonia     = "4.1"
+
+# --- démon : MCP, async, sérialisation ---
+rmcp       = { version = "3.1", features = [
+    "server",
+    "macros",
+    "transport-io",                     # stdio, client sur la même machine
+    "transport-streamable-http-server", # client distant, docs/ARCHITECTURE.md
+    "server-side-http",                 # la couche tower que maild monte dans axum
+] }
+tokio      = { version = "1.53", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-std",
+    "io-util", # lecture ligne par ligne du JSON-RPC sur stdio
+    "sync",
+    "time",    # le long-poll de store.wait
+] }
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# --- transverse ---
+thiserror          = "2.0"
+anyhow             = "1.0"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories        = "6.0"
+tempfile           = "3.27"
+camino             = "1.2"
+getrandom          = "0.4"
+axum               = "0.8"
+# `ServeDir` pour le front servi par le démon. Écrire soi-même un serveur de fichiers
+# statiques veut dire écrire soi-même la protection contre la traversée de chemin, ce qui est
+# précisément le genre de code qu'on ne rédige pas à la main.
+tower-http         = { version = "0.6", features = ["fs"] }
+axum-server        = { version = "0.8", features = ["tls-rustls-no-provider"] }
+sysinfo            = { version = "0.39", default-features = false, features = ["system"] }
+clap               = { version = "4.6", features = ["derive", "env"] }
+# Saisie d'un mot de passe sans écho. Un mot de passe tapé en clair reste dans le tampon de
+# défilement du terminal, et parfois dans le journal de session : `docs/PRIVACY.md` §7 vise
+# les arguments et l'environnement, mais l'écho est la même classe de fuite.
+rpassword          = "7"
+# Le SASL de `XOAUTH2` est du base64, et un base64 écrit à la main se trompe sur le bourrage
+# une fois sur trois. Aucune capacité réseau : c'est du calcul pur.
+base64             = "0.22"
+rustls             = { version = "0.23", features = ["ring"] }
+tauri              = { version = "2.11", features = [] }
+tauri-build        = { version = "2.6", features = [] }
+keyring            = { version = "4.1", default-features = false, features = [
+    "v1",                             # l'API `Entry`, stable et suffisante ici
+    "apple-native-keyring-store",
+    "windows-native-keyring-store",
+    # `zbus` et non `dbus` : implémentation pure Rust du Secret Service, donc aucune
+    # en-tête système à installer. L'unification des features de Cargo fait que ce greffon
+    # est compilé dès qu'un membre du workspace active `token-store` — c'est-à-dire à chaque
+    # build complet, CI comprise. Le variant `dbus` y imposerait `libdbus-1-dev`.
+    "zbus-secret-service-keyring-store",
+] }
+
+# Appliqué par `lints.workspace = true` dans chaque crate.
+[workspace.lints.rust]
+unsafe_code                   = "forbid"
+missing_debug_implementations = "warn"
+
+# `unwrap_used` / `expect_used` en deny : la règle du CLAUDE.md, appliquée par l'outil
+# plutôt que par la relecture. Les modules de test lèvent l'interdiction localement.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+
+# L'import doit être mesurable sans attendre une compilation release complète.
+[profile.dev.package."*"]
+opt-level = 2

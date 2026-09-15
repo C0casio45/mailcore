@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Passe rapide : format et lint. Rien ne sert de tester si ça ne compile pas propre.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      # Les coquilles ont besoin des en-têtes du système : WebKitGTK pour le webview de Tauri
+      # et de `wry`, et la pile X11/Wayland pour la fenêtre native d'egui. Sans elles, `cargo
+      # clippy --workspace` ne compile même pas — et c'est une dépendance de compilation, pas
+      # une dépendance d'exécution du cœur : `maild`, `mailcore` et la CLI n'en ont aucune.
+      - name: Dépendances système des coquilles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev \
+            libwayland-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # Les tests, sur les deux plateformes.
+  #
+  # Windows est la plateforme cible : mailimport manipule des chemins Windows et le profil
+  # Thunderbird de référence y vit. Linux est là parce qu'il est rapide et qu'il attrape la
+  # quasi-totalité des régressions — un échec Linux fait tomber la PR sans attendre Windows.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Dépendances système des coquilles
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev \
+            libxdo-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxkbcommon-dev \
+            libgl1-mesa-dev \
+            libwayland-dev
+      - run: cargo test --workspace --all-targets
+
+      # Pas de ligne pour la feature `token-store` de mailapi : `mail-cli` l'active, et
+      # l'unification des features de Cargo l'allume donc pour tout le workspace. La
+      # commande ci-dessus la compile et la teste déjà, sur les deux plateformes.
+      #
+      # C'est aussi pourquoi le greffon Secret Service retenu est `zbus` et non `dbus` :
+      # pur Rust, donc pas d'en-tête système à installer sur le runner Linux. Voir le
+      # manifeste du workspace.
+      #
+      # Ces tests touchent le vrai trousseau de la machine. Ils s'ignorent proprement s'il
+      # est indisponible — un runner Linux sans session graphique n'en a pas — plutôt que de
+      # faire échouer la CI pour une raison d'environnement.
+
+  # Critère 8 de docs/PHASE-1.md, isolé pour qu'un échec soit lisible dans la liste des
+  # checks sans avoir à ouvrir les logs. Bloque la fusion.
+  #
+  # **Deux étages, et les deux tournent ici.**
+  #
+  # - Étage 1 : l'assainisseur, sans moteur de rendu. Portable, rapide.
+  # - Étage 2 : le même message piégé rendu dans le **vrai moteur du système**, avec la CSP et
+  #   le `sandbox` de `mailhtml::csp`. C'est lui qui prouve la première barrière, celle que le
+  #   moteur applique — l'étage 1 ne valide que la ceinture que nous écrivons.
+  #
+  # L'étage 2 tourne sur les deux systèmes parce que **le moteur n'est pas le même** :
+  # WebView2 sur Windows, WebKitGTK sur Linux. Un zéro sur l'un ne dit rien de l'autre. macOS
+  # et son WKWebView manquent encore — c'est écrit dans docs/PRIVACY.md plutôt que caché.
+  #
+  # Le programme porte son propre contrôle positif : il rend d'abord le message **sans** CSP
+  # et exige que le moteur aille chercher les ressources. Une exécution où le contrôle ne
+  # compte rien sort en échec, parce qu'un zéro obtenu par un webview mort ne prouve rien.
+  privacy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Dépendances système du moteur de rendu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            xvfb
+
+      - name: Étage 1 — l'assainisseur
+        run: cargo test --package mailprivacy --test sanitiser
+
+      # Un webview veut un serveur d'affichage, même pour une fenêtre invisible : `xvfb-run`
+      # en fournit un jetable. Sur Windows, il n'y a rien à monter.
+      - name: Étage 2 — le vrai moteur de rendu (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run --auto-servernum cargo run --release --package mailprivacy
+
+      - name: Étage 2 — le vrai moteur de rendu (Windows)
+        if: runner.os == 'Windows'
+        run: cargo run --release --package mailprivacy
