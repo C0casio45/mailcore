@@ -1,0 +1,48 @@
+[package]
+name        = "xtask"
+description = "Outillage de mesure des critères d'acceptation de docs/PHASE-1.md."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace     = true
+camino.workspace     = true
+clap.workspace       = true
+blake3.workspace     = true
+tracing.workspace    = true
+mailcore.workspace   = true
+# Le lecteur d'invitations, mesuré par `measure-invitations` sur le corpus réel.
+mailcal.workspace    = true
+# Le parcours MIME, pour trouver les pièces `text/calendar` là où elles sont.
+mail-parser.workspace = true
+mailsmtp.workspace   = true
+mailimport.workspace = true
+sysinfo.workspace    = true
+serde_json.workspace = true
+mailapi = { workspace = true, features = ["token-store"] }
+rusqlite.workspace   = true
+
+# Le banc du critère 4 fait tourner une vraie moisson contre un vrai serveur de test pendant
+# que la coquille défile. Les deux crates sont donc des dépendances de l'outillage, pas
+# seulement des tests.
+mailsync.workspace   = true
+mailfake.workspace   = true
+tempfile.workspace   = true
+
+# Le critère 6 sur un vrai serveur lit les secrets au trousseau pour aller les chercher
+# ensuite dans tout ce que la synchronisation a écrit. `memchr` parce que balayer 3,5 Gio de
+# blobs avec une comparaison naïve durerait des heures, `tracing-subscriber` parce que les
+# journaux doivent être capturés au niveau TRACE dans le processus qui synchronise.
+mailauth.workspace   = true
+memchr.workspace     = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
