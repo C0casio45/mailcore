@@ -9,9 +9,22 @@ Lis `docs/VISION.md` (le pourquoi), `docs/ARCHITECTURE.md` (le comment),
 appris)
 avant d'écrire du code.
 
-**La phase 1 est close depuis le 2026-09-03** et **la phase 2 depuis le 2026-09-09** : leurs dix
-critères respectifs sont mesurés sur le corpus réel. La phase 3 est l'envoi, puis le carnet
-d'adresses, la signature riche et les invitations reçues.
+**La phase 1 est close depuis le 2026-09-03**, **la phase 2 depuis le 2026-09-09** et **la
+phase 3 depuis le 2026-09-15** : leurs critères sont mesurés sur le corpus réel, et les deux
+derniers de la phase 3 sur un vrai serveur. La phase 3 était l'envoi, puis le carnet d'adresses,
+la signature riche et les invitations reçues.
+
+**Le dépôt est public depuis le 2026-09-15**, et deux choses en découlent :
+
+- **toute mesure nouvelle se pseudonymise avant d'entrer dans `docs/`.** Une adresse dans une
+  colonne de tableau ne se lit pas comme une donnée personnelle — elle est là comme libellé de
+  ligne — et c'est exactement ce qui la fait passer. Les comptes réels sont `compte-a`,
+  `contact@perso.invalid`, `mail.perso.invalid` ; l'historique git étant public lui aussi, un
+  nettoyage par-dessus ne retire rien ;
+- **la CI est le seul endroit qui teste Linux.** Elle a trouvé deux défauts au premier passage,
+  dont un test du critère 2 qui passait **par accident** sur Windows : un processus tué y produit
+  un `RST` donc une erreur de lecture, là où Linux ferme proprement et donne un EOF. Un serveur
+  de test qui traite une fin de flux comme un point final compte un message jamais reçu.
 
 **L'envoi est le premier morceau irréparable du projet.** Un bug de lecture affiche faux ; un bug
 d'envoi expédie un message à quelqu'un. Les critères 1, 2 et 8 de `docs/PHASE-3.md` sont là pour

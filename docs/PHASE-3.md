@@ -88,14 +88,21 @@ d'organisateur ou de conférence. Elle s'affiche, elle ne se suit pas.
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | Un message envoyé arrive, et il est **conforme** | reçu sur un compte du corpus, `Message-ID` présent, `In-Reply-To`/`References` corrects sur une réponse, en-têtes non ASCII lisibles chez le destinataire. Vérifié en s'écrivant d'un compte réel à un autre | **partiel, mais très avancé (2026-09-10)** — deux aller-retours réels le 2026-09-09 (sujet accentué, tiret cadratin, ligne commençant par un point, aucun en-tête `Bcc`). La conformité d'une **réponse** est maintenant mesurée mécaniquement sur **57 840 vrais fils** du corpus : `Message-ID` présent, `In-Reply-To` et `References` corrects après un aller-retour assemblage → relecture, sujet identique — **100 %, aucun manquement**, dont 36 481 sujets non ASCII et une chaîne de 128 identifiants. Le banc a trouvé **deux défauts réels** qu'il a fallu corriger pour y arriver (sujet mis entre guillemets, identifiants sans chevrons). Ce qui reste : l'envoi réel d'une réponse, que seul un serveur peut confirmer |
+| 1 | Un message envoyé arrive, et il est **conforme** | reçu sur un compte du corpus, `Message-ID` présent, `In-Reply-To`/`References` corrects sur une réponse, en-têtes non ASCII lisibles chez le destinataire. Vérifié en s'écrivant d'un compte réel à un autre | **tenu (2026-09-15)** — deux aller-retours réels le 2026-09-09 (sujet accentué, tiret cadratin, ligne commençant par un point, aucun en-tête `Bcc`). La conformité d'une **réponse** est maintenant mesurée mécaniquement sur **57 840 vrais fils** du corpus : `Message-ID` présent, `In-Reply-To` et `References` corrects après un aller-retour assemblage → relecture, sujet identique — **100 %, aucun manquement**, dont 36 481 sujets non ASCII et une chaîne de 128 identifiants. Le banc a trouvé **deux défauts réels** qu'il a fallu corriger pour y arriver (sujet mis entre guillemets, identifiants sans chevrons). **La remise est faite le 2026-09-15** : une réponse composée dans la coquille, partie par `smtp.gmail.com`, revenue par IMAP, et relue **sur la copie reçue** — `In-Reply-To` et `References` portent exactement le `Message-ID` du germe, le sujet est un mot encodé RFC 2047 et non une chaîne entre guillemets, et le bloc d'en-têtes ne porte rien hors de la liste close. Ce que les 57 840 fils prouvaient était l'assemblage ; ceci prouve la remise |
 | 2 | Envoi **exactement une fois**, y compris sur coupure | **0 doublon** et **0 perte** sur une coupure provoquée entre l'acceptation du serveur et l'écriture locale. Mesuré en tuant le processus à cet instant précis, pas en le simulant | **tenu (2026-09-09)** — processus enfant tué aux deux instants qui comptent, 1 message reçu dans les trois cas, contrôles négatifs sur les deux barrières |
 | 3 | Un message de 25 Mo de pièces jointes | part sans charger le message entier en mémoire : **RSS < 200 Mo**, et l'encodage `base64` est streamé | **tenu (2026-09-09)** — crête **10,1 Mio**, dont **428 Kio** de croissance depuis le repos. Et la mémoire ne dépend pas de la taille : 200 Mo de pièce jointe donnent 584 Kio. Vérifié aussi sur un envoi réel de 3 Mo, revenu de Gmail à l'octet près |
 | 4 | Autocomplétion d'un destinataire sur le corpus réel | **< 16,7 ms** par frappe en p95, sur les 105 000 références et leurs adresses distinctes | **tenu (2026-09-09)** — p95 **643,8 µs** sur 6 320 frappes, 4 635 adresses dérivées de 48 551 messages. Le pire préfixe touche 3 021 adresses, donc le relevé porte bien sur le cas difficile |
 | 5 | L'éditeur de signature, en frappe et en collage | **< 16,7 ms** en p95 par image, sur un document de 200 lignes avec gras, italique, liens et listes. Et un collage de 50 Ko de HTML depuis un navigateur ne doit pas figer l'interface | **tenu (2026-09-10)** — mesuré sur l'**éditeur livré** (banc `signature`, trois exécutions) : frappe p95 **7,06 à 8,14 ms** par image, dont **5,55 à 6,09 ms** de travail, sur **31 511 glyphes et 808 intervalles stylés**. Collage de 50 096 octets converti en **2,54 à 2,92 ms**. Limite dite par le relevé : une image sur quelques centaines arrive à **42 ms**, pour **6,27 ms** de travail — c'est l'ordonnancement du système, pas la mise en page. La sonde `mail-spike-richtext` avait donné 0,31 à 0,47 ms sur le modèle nu ; l'écart est le champ de texte, la fenêtre et le compositeur |
 | 6 | Une invitation `text/calendar` du corpus réel | dates, fuseau, organisateur et participants lus juste sur **tous** les `text/calendar` du corpus, ou refusés en nommant ce qui manque. **Zéro requête réseau** | **tenu (2026-09-10)** — **930 pièces** dans 927 messages, sur les 73 825 du corpus : **901 (96,88 %)** avec un instant absolu, **27 (2,90 %)** lues avec leur réserve nommée — heure flottante, RFC 5545 §3.3.5 — **2 (0,22 %)** refusées en nommant la raison, et **0 illisible sans raison**. Titre lu sur 99,68 %, organisateur sur 89,78 %, participants sur 92,15 % (8 150 en tout), fin sur 99,78 %. Contrôle : **0 pièce contenant `VEVENT` sans qu'un événement soit lu**. Zéro requête réseau **par construction** — `mailcal` n'a aucune dépendance, donc aucun client HTTP et aucune base de fuseaux |
 | 7 | Aucun secret nouveau, aucun identifiant en clair | **exactement 0** — le même harnais que le critère 6 de la phase 2, étendu à SMTP | **tenu (2026-09-09)** — 13 secrets réels, **0 trouvé** dans le store, les journaux `TRACE` et `%TEMP%`, après une moisson IMAP des 5 comptes **et** une authentification SMTP réelle. La sonde s'arrête avant le `DATA` : rien n'est envoyé. Limite dite par le relevé : 4 comptes sur 5 n'ont pas de serveur d'envoi, donc leur chemin SMTP n'est pas mesuré |
-| 8 | Un envoi refusé par le serveur | l'utilisateur voit **quoi** faire : quota, destinataire refusé, message trop gros, authentification. Pas un code numérique | **presque tenu (2026-09-10)** — les cinq familles sont **provoquées de bout en bout** contre un serveur scripté : refus SMTP → état en file → phrase lue, une par famille, plus le refus de taille annoncé à l'`EHLO` (`crates/mailsmtp/tests/refus.rs`, 12 tests). Le banc a trouvé un défaut réel : un refus passager promettait « rien à faire » **après** l'épuisement des tentatives, sur une ligne morte. La phrase se compose donc après la décision, et le geste qu'elle nomme existe : `resendable` sur la ligne de file, bouton « Renvoyer tel quel » dans la coquille, `mail outbox --retry`. Reste ouvert : **aucun vrai serveur n'a refusé** — non autorisé, rien n'a été envoyé |
+| 8 | Un envoi refusé par le serveur | l'utilisateur voit **quoi** faire : quota, destinataire refusé, message trop gros, authentification. Pas un code numérique | **tenu (2026-09-15)** — les cinq familles sont **provoquées de bout en bout** contre un serveur scripté : refus SMTP → état en file → phrase lue, une par famille, plus le refus de taille annoncé à l'`EHLO` (`crates/mailsmtp/tests/refus.rs`, 12 tests). Le banc a trouvé un défaut réel : un refus passager promettait « rien à faire » **après** l'épuisement des tentatives, sur une ligne morte. La phrase se compose donc après la décision, et le geste qu'elle nomme existe : `resendable` sur la ligne de file, bouton « Renvoyer tel quel » dans la coquille, `mail outbox --retry`. **Deux familles sont provoquées par un vrai serveur le 2026-09-15**, sans qu'aucun message ne parte : la taille — `SIZE 35882577` annoncé à l'`EHLO`, message de 54 737 581 o, refusé **avant** le transfert — et l'authentification — `535 5.7.8 Username and Password not accepted`, rendu par `smtp.gmail.com`. La troisième tentative a trouvé mieux qu'un refus : un destinataire injoignable (`.invalid`) est **accepté**. Un serveur de soumission relaie, il ne vérifie pas le destinataire ; ce refus-là arrive plus tard en rapport de non-remise et **aucun** serveur de soumission ne le rendra à la connexion. La famille reste donc couverte par le serveur scripté, et c'est la seule façon de la couvrir |
+
+**Les huit critères sont tenus, et la phase 3 est close le 2026-09-15.** Les deux dernières
+réserves portaient sur ce qu'aucune mesure locale ne peut donner : une réponse réellement remise
+à un serveur, et un refus réellement rendu par un serveur. La première est levée par une remise
+vérifiée sur la copie reçue ; la seconde par deux familles provoquées en vrai — et par la
+démonstration que la troisième ne peut pas l'être, un serveur de soumission ne vérifiant jamais
+le destinataire. Voir le journal du jour.
 
 Le critère 2 est celui qui porte le vrai risque de la phase, et c'est la raison de l'ordre de
 travail ci-dessous.
@@ -2761,3 +2768,177 @@ chemins, la même à l'envers, la réponse qui rejoint son parent, le parent qui
 message qui quitte son groupe de sujet, les deux invariants du schéma — aucun `thread_id` pendant,
 aucun fil vide, aucun compteur qui dérive — la reconstruction forcée d'un store sans faits, et la
 passe qui finit toujours.
+
+---
+
+### 2026-09-15 — le dépôt sort, la CI trouve deux défauts, et les critères 1 et 8 se ferment
+
+Journée sans nouvelle fonctionnalité, et c'est la plus instructive depuis longtemps. Trois
+choses en sont sorties : le code existe enfin ailleurs que sur une machine, une CI qui n'avait
+jamais tourné a trouvé deux défauts réels au premier passage, et les deux réserves qui restaient
+sur les critères 1 et 8 sont levées — l'une par une remise réelle, l'autre par un constat qui dit
+qu'elle ne pouvait pas l'être.
+
+#### Un mois de travail dans un seul répertoire
+
+L'état du dépôt avant de commencer : **un commit**, celui des docs initiales, et **234 fichiers
+non suivis**. Tout `crates/`, tout `xtask/`, le `Cargo.lock`, le déploiement. Aucun remote. Et
+`.github/workflows/ci.yml`, écrit, complet, **jamais exécuté une seule fois**.
+
+Ce n'est pas une négligence de rangement : c'est le seul point du projet où « on corrigera au
+prochain passage » ne s'applique pas non plus, pour la même raison que l'envoi. Un disque qui
+lâche ne se relit pas.
+
+Huit commits découpés par couche — socle, cœur, réseau, service, coquilles, outillage,
+déploiement, journaux — et un piège au passage : `.gitignore` couvrait
+`crates/mail-ui/web/node_modules` mais pas `crates/mail-ui/node_modules`, à la racine du crate.
+Dix-neuf fichiers, dont un binaire de 80 Mo, seraient entrés dans l'historique pour toujours.
+
+#### Publier, c'est publier l'historique — et un tableau de mesure est une liste d'identités
+
+Le dépôt part en public. Or les journaux des phases 2 et 3 nomment les cinq comptes réels **une
+quarantaine de fois** : ce sont les libellés des tableaux de relevé. S'y ajoutent le nom d'hôte
+du serveur Dovecot personnel, dans trois commentaires de mesure de `mailsync`, un `prefs.js`
+d'exemple dans `mailimport`, et le chemin du profil Thunderbird dans `CLAUDE.md`.
+
+**Une adresse dans une colonne de tableau ne se lit pas comme une donnée personnelle**, et c'est
+précisément ce qui la fait passer. Elle est là comme libellé de ligne, au même titre que `p95`
+ou `nombre de dossiers` ; personne ne la relit comme « l'inventaire des boîtes mail de
+quelqu'un ». C'est pourtant exactement ce que ça publie.
+
+Le remède n'est pas de nettoyer les fichiers : **l'historique git est public lui aussi**, donc un
+nettoyage par-dessus ne retire rien. Les neuf commits locaux ont été réécrits avant tout push, et
+le contrôle porte sur `git rev-list` complet et non sur l'arbre de travail : zéro occurrence des
+six adresses, du nom d'hôte, des surnoms de compte et du chemin de profil dans **toute**
+l'histoire. Les relevés n'y perdent rien — ce qui porte les conclusions est le fournisseur et le
+volume, pas l'adresse.
+
+Corollaire écrit dans `CLAUDE.md` : toute mesure nouvelle se pseudonymise **avant** d'entrer dans
+`docs/`, sinon la publication rouvre ce qui a été refermé.
+
+#### La CI, au premier passage : deux défauts que Windows masquait
+
+`lint` et les deux jobs Windows passent. Les deux jobs Linux tombent, et les deux pour de bonnes
+raisons.
+
+**Le serveur compteur du critère 2 comptait un message qu'il n'avait jamais reçu.** Sa boucle
+`DATA` sortait sur le point final — et aussi sur une **fin de flux**, c'est-à-dire un client tué
+en plein transfert. Les deux cas tombaient sur le `push` qui range le message reçu. Le test qui
+vérifie qu'une coupure *avant* la frontière ne laisse rien au serveur voyait donc un envoi.
+
+Pourquoi Windows ne le voyait pas : un processus tué y produit un `RST`, donc une **erreur** de
+lecture, donc un retour anticipé. Linux ferme proprement, donc un EOF, donc la chute dans le
+`push`. **Le test passait par accident des deux côtés** : sur Windows par un détail de la pile
+réseau, sur Linux pas du tout. Un instrument qui confond « transaction interrompue » et « message
+reçu » ne mesure pas le critère 2 — il mesure son contraire.
+
+**Le webview de l'étage 2 ne se construit pas sur une fenêtre GTK invisible.** La fenêtre est en
+`with_visible(false)` : un banc qui vole le premier plan est une nuisance, et la visibilité ne
+change rien à ce que le moteur charge. Sur Windows et macOS, une fenêtre cachée a quand même son
+`HWND` ou sa `NSView`. Sur Linux, une fenêtre jamais montrée n'est pas *réalisée*, donc n'a
+aucune poignée native, et `wry` refuse : « the underlying handle is not available ». Le remède
+n'est pas de la montrer mais de construire le moteur dans le **conteneur GTK**, qui existe sans
+réalisation.
+
+Et une chose que le programme a bien faite : il a **refusé de se féliciter**. « Exécution
+invalide : ne pas cocher le critère 8 » est ce qu'il doit dire quand il n'a rien mesuré, et c'est
+ce qui a transformé une impossibilité en échec de CI plutôt qu'en vert silencieux.
+
+#### Le critère 8 de la phase 2 gagne un second moteur
+
+Une fois le webview construit, l'étage 2 tourne vraiment sous WebKitGTK :
+
+| phase | connexions | vecteurs |
+|---|---|---|
+| A — contrôle | 21 | 18 |
+| B — la CSP seule | **0** | 0 |
+| C — les deux ceintures | **0** | 0 |
+| D — contrôle final | 21 | 18 |
+
+`mailprivacy` disait lui-même qu'il ne couvre qu'un moteur à la fois et que la CI devrait le
+lancer sur les trois plates-formes. Il en couvre deux depuis aujourd'hui — et le contrôle final à
+21 dit que le moteur était encore vivant à la fin, sans quoi les zéros de B et C ne vaudraient
+rien.
+
+#### Le critère 1 : ce que 57 840 fils ne pouvaient pas prouver
+
+Le store de production était vide depuis le 2026-09-10. Le remettre en état a donné, au passage,
+le constat qui ouvre `docs/VISION.md`, mesuré en direct sur un compte Gmail :
+
+```
+Corps reçus     11 930
+Nouveaux         5 061
+Dédup           57,6 % du reçu était déjà dans le store
+```
+
+Puis un message-germe envoyé à soi-même, une réponse composée **dans la coquille** — le seul
+chemin qui applique `compose::reply_threading` — et la vérification faite là où elle compte : sur
+la copie **reçue**, relue par `mail source`.
+
+```
+Subject: =?UTF-8?B?UmU6IEVzc2FpIGRlIGZpbCDigJQgY3JpdMOocmUgMSA6IGFjY2VudHMsIG/DuSDDp2EsIGV0IHVuIHRpcmV0IGNhZHJhdGlu?=
+Message-ID:  <10415cb0ac17d960c76d246921c9fac2@gmail.com>
+In-Reply-To: <d06756fb11efe96b530934506b6022c7@gmail.com>
+References:  <d06756fb11efe96b530934506b6022c7@gmail.com>
+```
+
+`d06756fb…` est exactement le `Message-ID` que `source --outbox` affichait avant le départ. Le
+sujet est un mot encodé et non une chaîne entre guillemets : le défaut trouvé par le banc le
+2026-09-10 est bien mort, et il l'est **chez le destinataire**, ce qu'un aller-retour local ne
+peut pas dire. Le bloc d'en-têtes ne porte rien hors de la liste close ; `Return-Path` et
+`Received` viennent du serveur.
+
+#### Le critère 8 : deux familles vraies, et une troisième qui ne peut pas l'être
+
+Les deux qui ne font partir aucun message :
+
+| famille | ce que le vrai serveur a rendu |
+|---|---|
+| taille | `SIZE 35882577` à l'`EHLO`, message de 54 737 581 o → refus **avant** le transfert |
+| authentification | `535 5.7.8 Username and Password not accepted` |
+
+Pour la seconde, le mot de passe fautif ne devait pas atterrir sur la clé du vrai compte :
+`account forget` efface **les deux** entrées d'un couple (hôte, identifiant), jeton OAuth2
+compris. Un alias `+refus` donne une clé de trousseau distincte, et le vrai secret n'est jamais
+approché.
+
+La troisième est le résultat intéressant. Un destinataire injoignable par construction — domaine
+`.invalid`, réservé par la RFC 2606 — a été **accepté** : `#3 envoyé.`
+
+**Un serveur de soumission relaie, il ne vérifie pas le destinataire.** Le refus arrive plus tard,
+en rapport de non-remise, par un autre message. Ce n'est pas une particularité de Gmail : aucun
+serveur de soumission ne rendra ce refus à la connexion, parce qu'à cet instant il ne sait pas
+encore ce que le serveur de destination répondra. La famille « destinataire refusé » est donc
+**structurellement improvocable** en réel, et le serveur scripté n'est pas un pis-aller pour
+elle : c'est le seul instrument qui puisse la produire.
+
+La leçon dépasse le critère : **« nous n'avons pas pu le provoquer en vrai » et « ça ne peut pas
+se produire en vrai » sont deux réserves très différentes**, et la seconde se démontre au lieu de
+s'attendre.
+
+#### Ce que l'usage a trouvé, et qui reste ouvert
+
+**Rien n'annule un message en file.** La bannière de la coquille dit « Il partira même si vous
+fermez la fenêtre » — c'est vrai, c'est la règle 3, et c'est une information qu'on ne peut pas
+deviner. Mais il n'existe **aucune** annulation : ni `cancel` ni `discard` dans
+`mailcore::store::outbox`, ni dans l'API, ni dans la CLI. Les seules sorties d'une ligne sont
+« renvoyer » (un refus) et « trancher » (un doute). La phrase annonce donc une irréversibilité
+sans offrir le geste — la leçon du 2026-09-10 prise à l'envers.
+
+Et l'objection écrite contre le modèle Apple ne couvre pas le cas qu'elle croyait couvrir : elle
+vise « un envoi différé **qui part quand l'application se ferme** », c'est-à-dire un client où
+fermer vide la file. Ici le facteur est dans le démon, pas dans la fenêtre. Le coût technique est
+par ailleurs presque nul : `Store::deliverable` porte **déjà** une porte temporelle,
+`retry_after IS NULL OR retry_after <= ?1`, et un `retry_after = maintenant + délai` posé à la
+mise en file la réutilise sans toucher à `state` — donc sans toucher à la règle du critère 2.
+L'annulation, elle, devra refuser tout sauf `queued` sans tentative, comme `retry_outgoing` et
+`resolve_doubt` refusent chacun l'état de l'autre.
+
+**`mail search` n'affiche aucun identifiant**, alors que `mail source --id` documente
+« l'identifiant tel que `mail search` le rend ». Deux commandes qui se citent l'une l'autre sans
+se parler.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 326 tests verts** en local, et la CI complète au vert sur **Linux
+et Windows**, ce qui est la première fois que ce chiffre veut dire quelque chose ailleurs que sur
+une machine.
