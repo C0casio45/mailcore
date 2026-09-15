@@ -9032,9 +9032,11 @@ dependencies = [
  "mailsync",
  "memchr",
  "rusqlite",
+ "serde",
  "serde_json",
  "sysinfo",
  "tempfile",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
 ]

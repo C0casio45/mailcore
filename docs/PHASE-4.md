@@ -85,7 +85,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | à faire |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **référence mesurée le 2026-09-15** — 22 requêtes écrites sur le corpus réel, `cargo xtask measure-recall`. Tantivy seul : **0,0 %** sur les 10 requêtes sans mot commun, **58,3 %** sur les 12 autres, **31,8 %** sur le jeu entier. Le moteur reste à écrire |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | à faire |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | à faire |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
@@ -102,17 +102,17 @@ utilisable.
 
 **Le banc avant le moteur**, et cette fois c'est écrit comme une étape, pas comme une intention.
 
-1. **Le jeu de requêtes et sa vérité terrain.** Une trentaine de requêtes en français, écrites en
-   regardant le corpus réel, chacune avec le message qu'elle doit trouver. C'est le seul travail
-   de la phase qui ne peut pas être fait par un programme, et il vient en premier parce que sans
-   lui, tout ce qui suit s'auto-évalue.
+1. ~~**Le jeu de requêtes et sa vérité terrain.**~~ Fait le 2026-09-15 : 22 requêtes écrites sur le
+   corpus réel, dans `measurements/phase4-queries.toml` — **hors du dépôt**, parce qu'il nomme des
+   messages réels. `cargo xtask corpus-sample` sort les messages à regarder pour l'écrire.
 
    Le sous-ensemble qui compte est celui des requêtes **sans mot commun** avec leur cible : c'est
-   là que tantivy ne peut rien, donc là que le sémantique se justifie ou ne se justifie pas.
+   là que tantivy ne peut rien, donc là que le sémantique se justifie ou ne se justifie pas. Il
+   fait 10 requêtes sur 22.
 
-2. **Le banc lui-même**, qui mesure tantivy seul sur ce jeu. Un chiffre de référence obtenu
-   **avant** d'avoir un moteur à défendre. Sans lui, le premier relevé du moteur sémantique n'aura
-   rien à quoi se comparer, et « ça a l'air bien » remplacera la mesure.
+2. ~~**Le banc lui-même**, qui mesure tantivy seul sur ce jeu.~~ Fait le 2026-09-15 :
+   `cargo xtask measure-recall`. Un chiffre de référence obtenu **avant** d'avoir un moteur à
+   défendre — **0,0 % sur le sous-ensemble dur**. Voir le journal.
 
 3. **Le modèle local** : le choisir, le charger, mesurer son coût par message et sa mémoire. Un
    modèle multilingue, parce que le corpus est français — voir les pièges. Rien n'est indexé à
@@ -167,3 +167,119 @@ qui rend l'ordre sûr**, et le drapeau se pose **après** que le vecteur est dur
 
 **Le premier relevé accusera le banc.** C'est arrivé au critère 1 de la phase 3, et ça arrivera
 ici. Un rappel de 0 % ou de 100 % au premier essai est un symptôme, pas un résultat.
+
+## Journal
+
+### 2026-09-15 — le banc avant le moteur, et les deux défauts qu'il a trouvés sans moteur
+
+Les étapes 1 et 2, dans l'ordre que la phase s'était fixé. Elles n'écrivent pas une ligne de
+moteur sémantique, et elles ont pourtant trouvé deux défauts réels — un dans l'instrument, un
+dans le produit livré.
+
+#### Un tirage uniforme sur un corpus réel donne neuf notifications sur dix
+
+L'étape 1 demande de regarder de vrais messages pour écrire des requêtes. `cargo xtask
+corpus-sample` les sort, étalés sur toute la période du corpus plutôt que pris au début — les N
+premiers messages d'un store sont ceux d'un dossier et d'une période, et un jeu de requêtes écrit
+dessus mesurerait la recherche sur trois semaines de courrier.
+
+Le premier tirage a donné **Facebook six fois, Dribbble quatre, YouTube, Twitch, Pinterest**.
+Personne ne cherche la notification Facebook de mars 2016. Un corpus personnel n'est pas une
+distribution uniforme de choses qu'on voudra retrouver : c'est une majorité écrasante de bruit
+récurrent, et quelques centaines de messages qui comptent.
+
+Le premier filtre essayé était le carnet d'adresses : ne garder que les expéditeurs à qui
+l'utilisateur a **écrit** — `seen_to > 0`. Un expéditeur automatique ne reçoit jamais de réponse,
+et aucune liste de domaines à bannir n'est à tenir à jour. Ça marche, et ça garde **32 messages
+sur 5 063** : trop peu, et surtout ça exclut le cas canonique de la phase. « La facture du
+plombier de l'an dernier » vient d'un expéditeur automatique.
+
+**Ce qui distingue une facture d'une notification n'est pas l'humain derrière, c'est la rareté.**
+Une facture arrive une fois, Facebook écrit quatre cents fois. Le filtre est donc l'union des
+deux : un correspondant à qui on a écrit, **ou** un expéditeur vu au plus cinq fois. 633 messages
+retenus sur 5 063, et l'échantillon devient exploitable — école, commandes, confirmations,
+services ponctuels.
+
+#### Le jeu de requêtes ne peut pas entrer dans le dépôt
+
+Il nomme des messages réels par leur identifiant, et ses requêtes disent ce que quelqu'un cherche
+dans son courrier. Il vit dans `measurements/`, gitignoré — même règle que les relevés de `xtask`
+et que la pseudonymisation du même jour.
+
+Deux décisions de forme, et la seconde a compté :
+
+- **le partage d'un mot n'est pas déclaré dans le fichier, il est calculé par le banc.** Deux
+  sources pour le même fait finiraient par se contredire, et c'est ce fait-là qui porte la
+  conclusion de la phase ;
+- **une cible absente fait échouer la commande**, au lieu d'être comptée comme un échec de
+  rappel. Un jeu de requêtes est lié au store sur lequel il a été écrit : un réimport renumérote
+  les messages, et le banc mesurerait alors contre des cibles qui ont glissé — en rendant un
+  chiffre parfaitement présentable.
+
+Et une liste de mots-outils, qui est **une décision de mesure et pas un détail** : sans elle, « le »,
+« de » et « que » sont dans toutes les requêtes et dans tous les messages, donc tout partage un mot
+avec tout, et le sous-ensemble qui décide de la phase disparaît. Elle ne contient que des
+mots-outils : « compte » y serait tentant — il est dans des dizaines de messages — mais c'est
+précisément ce qui rend facile, pour un moteur de mots, une requête qui le contient.
+
+#### Le défaut du produit : l'apostrophe
+
+La deuxième requête du jeu a fait tomber le banc :
+
+```
+Error: recherche « l'achat qui m'attend en boutique »
+  1: Syntax Error: l'achat qui m'attend en boutique
+```
+
+**L'apostrophe ouvre une chaîne dans la grammaire de tantivy.** `l'achat` n'a pas de fin de
+chaîne, donc la requête est refusée. En français, ça vise un utilisateur sur deux : `l'équipe`,
+`aujourd'hui`, `qu'il`, `n'est`. `mail search` — et la barre de recherche de la coquille avec
+elle — répondait « requête invalide » à une phrase française ordinaire, depuis la phase 1.
+
+Le remède tient en une règle : essayer la **grammaire** d'abord, ce qui préserve `from:` et les
+phrases exactes de qui les connaît ; si elle refuse **à cause d'une apostrophe**, réessayer sans
+elles. Les deux apostrophes comptent, la droite et la typographique `U+2019` que les téléphones
+et les correcteurs produisent sans prévenir.
+
+#### Et le test qui a resserré le remède
+
+Le premier jet neutralisait **toute** la syntaxe, pas seulement les apostrophes.
+`a_malformed_query_is_an_error_not_a_silent_empty_result` est tombé, et sa justification écrite
+— « une erreur, pas un silence » — **couvrait** le cas : `subject:(` est une grammaire qu'on a
+voulue et ratée. Lui rendre les messages contenant le mot « subject » n'est pas un silence, c'est
+pire. **Un refus se corrige ; une liste sans rapport se croit.**
+
+C'est la règle du 2026-09-10 appliquée dans l'autre sens. Quand un test gêne, on relit sa
+justification ; ce jour-là elle ne couvrait que la moitié du cas et le test a bougé. Ici elle
+tenait, et c'est le code qui a bougé.
+
+#### Le relevé de référence
+
+`cargo xtask measure-recall`, 22 requêtes, corpus réel de 5 063 messages :
+
+| sous-ensemble | requêtes | dans le top 10 | rappel |
+|---|---:|---:|---:|
+| **aucun mot commun avec la cible** | 10 | **0** | **0,0 %** |
+| au moins un mot commun | 12 | 7 | 58,3 % |
+| tout le jeu | 22 | 7 | 31,8 % |
+
+**Zéro n'accuse pas le banc, cette fois.** La règle du projet veut qu'on suspecte l'instrument
+devant un chiffre extrême, et c'est ce qui a été fait — mais ici zéro est ce que la définition
+prédit : si la requête ne partage aucun mot avec sa cible, BM25 n'a littéralement rien à
+accrocher. Le message ne peut sortir que par accident. Les contrôles le confirment dans l'autre
+sens : « Colissimo », « AdSense désactivé », « VALORANT closed beta » et « assemblée générale CESI
+Alumni » sont tous trouvés.
+
+Ce que le 58,3 % dit, en revanche, est moins évident et plus utile : **partager un mot ne suffit
+pas**. « Les émissions que je n'ai pas eu le temps de voir » partage un mot avec sa cible et ne la
+trouve pas ; « ma participation au jury » la trouve au rang 50. Un mot incident noyé dans un corps
+de mail ne pèse rien en BM25 — ce qui veut dire que le vrai périmètre du problème est plus large
+que les 10 requêtes du sous-ensemble dur.
+
+La barre est donc sans ambiguïté pour l'étape 3 : **tout ce qui dépasse 0 % sur le sous-ensemble
+dur est un gain**, et le critère en demande 80.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 337 tests verts**, soit 3 de plus : l'apostrophe remplacée par une
+espace et non par rien, la typographique traitée comme la droite, et le contrôle qui protège le
+refus de `subject:(`.

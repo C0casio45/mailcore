@@ -25,7 +25,9 @@ mail-parser.workspace = true
 mailsmtp.workspace   = true
 mailimport.workspace = true
 sysinfo.workspace    = true
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 mailapi = { workspace = true, features = ["token-store"] }
 rusqlite.workspace   = true
 

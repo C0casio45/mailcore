@@ -170,3 +170,192 @@ pub fn scripts(store_root: &Utf8PathBuf) -> Result<()> {
 
     Ok(())
 }
+
+/// Combien de caractères de corps montrer par message, par défaut.
+///
+/// Assez pour reconnaître de quoi parle le message, pas assez pour le lire. Un échantillon
+/// dont chaque bloc fait vingt lignes n'est plus un échantillon : on ne le parcourt plus.
+const EXCERPT: usize = 240;
+
+/// Sort un échantillon de messages réels, étalé sur toute la période du corpus.
+///
+/// ## Pourquoi cette commande existe
+///
+/// L'étape 1 de `docs/PHASE-4.md` est la seule de la phase qu'un programme ne peut pas faire :
+/// écrire des requêtes en français **avec la réponse qu'elles doivent trouver**. Un humain ne
+/// peut le faire que sur des messages qu'il a sous les yeux, et ouvrir cinq mille messages un
+/// par un n'est pas une méthode.
+///
+/// ## Étalé, et pas les N premiers
+///
+/// Les N premiers messages d'un store sont ceux d'un dossier et d'une période. Un jeu de
+/// requêtes écrit dessus mesurerait la recherche sur trois semaines de courrier, et le relevé
+/// serait bon sans vouloir dire quoi que ce soit. Le pas est donc calculé sur le corpus trié
+/// par date : l'échantillon couvre la même étendue que le corpus.
+///
+/// ## Elle ne fait que lire
+///
+/// Aucune écriture, donc elle peut viser le store de production — contrairement aux bancs qui
+/// écrivent, qui se font leur propre store jetable. C'est même son intérêt : le jeu de
+/// requêtes ne vaut que s'il porte sur le vrai courrier de quelqu'un.
+///
+/// # Errors
+///
+/// Si le store est illisible, ou si aucun message n'y est indexé.
+pub fn sample(
+    store_root: &Utf8PathBuf,
+    count: usize,
+    excerpt: Option<usize>,
+    everything: bool,
+    max_from: usize,
+) -> Result<()> {
+    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let mailbox = mailcore::Mailbox::open(store_root)
+        .with_context(|| format!("ouverture de la boîte {store_root}"))?;
+
+    let mut rows = store.all_for_indexing()?;
+    if rows.is_empty() {
+        anyhow::bail!(
+            "aucun message dans {store_root} — `mail sync` d'abord, ou viser un autre store"
+        );
+    }
+    let corpus = rows.len();
+
+    // **Le filtre qui rend l'échantillon utilisable**, et il vient d'un relevé : un tirage
+    // uniforme sur le corpus réel a donné 90 % de notifications — Facebook, Dribbble, YouTube,
+    // Twitch. Personne ne cherche la notification Facebook de mars 2016, donc un jeu de
+    // requêtes écrit dessus mesurerait la recherche sur du courrier que personne ne relit.
+    //
+    // Le signal n'est pas le rang du carnet mais **`seen_to > 0`** : une adresse à laquelle
+    // l'utilisateur a écrit au moins une fois. Un expéditeur automatique ne reçoit jamais de
+    // réponse, et aucune liste de domaines à bannir n'est à tenir à jour.
+    // Deux façons d'être retenu, et la seconde est celle qui a manqué au premier jet. Filtrer
+    // sur les seuls correspondants gardait 32 messages sur 5 063 — et surtout il excluait le
+    // cas canonique de la phase : « la facture du plombier de l'an dernier » vient d'un
+    // expéditeur automatique, à qui personne ne répond jamais.
+    //
+    // Ce qui distingue une facture d'une notification n'est donc pas l'humain derrière, c'est
+    // la **rareté** : une facture arrive une fois, Facebook écrit quatre cents fois. Un
+    // expéditeur au-dessus du seuil est une source récurrente, et ce qu'on cherche dans une
+    // source récurrente n'est pas un message mais un fil de vie.
+    let kept = if everything {
+        None
+    } else {
+        let contacts = store.top_contacts(usize::MAX)?;
+        let corresponded: std::collections::HashSet<String> = contacts
+            .into_iter()
+            .filter(|it| it.seen_to > 0)
+            .map(|it| it.address)
+            .collect();
+
+        let mut volume: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for row in &rows {
+            *volume.entry(row.from_addr.to_lowercase()).or_default() += 1;
+        }
+
+        rows.retain(|row| {
+            let from = row.from_addr.to_lowercase();
+            corresponded.contains(&from) || volume.get(&from).is_some_and(|it| *it <= max_from)
+        });
+        Some((corresponded.len(), max_from))
+    };
+
+    if rows.is_empty() {
+        anyhow::bail!(
+            "aucun message d'un correspondant à qui l'utilisateur a écrit — \
+             `--everything` pour tirer sans filtre"
+        );
+    }
+    rows.sort_by_key(|row| row.date);
+
+    let excerpt = excerpt.unwrap_or(EXCERPT);
+    let total = rows.len();
+    let count = count.min(total);
+    // Le pas en virgule flottante puis arrondi : un pas entier sur 5 063 messages et 30
+    // demandés donnerait 168, donc le dernier échantillon tomberait au message 5 040 et les
+    // vingt-trois derniers ne seraient jamais tirés.
+    #[allow(clippy::cast_precision_loss)]
+    let step = total as f64 / count as f64;
+
+    println!("# Échantillon du corpus — {store_root}");
+    println!("#");
+    match kept {
+        Some((addresses, cap)) => println!(
+            "# {total} messages retenus sur {corpus} : ceux d'une des {addresses} adresses à \
+             qui l'utilisateur a écrit, plus ceux d'un expéditeur vu au plus {cap} fois"
+        ),
+        None => println!("# {total} messages, sans filtre (`--everything`)"),
+    }
+    println!("# {count} tirés, un tous les {step:.1}");
+    println!("# Du plus ancien au plus récent. L'identifiant est celui de `mail source --id`.");
+    println!();
+
+    for rank in 0..count {
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        let at = ((rank as f64 * step) as usize).min(total - 1);
+        let row = &rows[at];
+
+        let who = row.from_name.as_deref().unwrap_or(&row.from_addr);
+        println!(
+            "#{:<6} {}  {} <{}>",
+            row.id.0,
+            mailapi::human::date(row.date),
+            who,
+            row.from_addr
+        );
+        println!(
+            "       {}",
+            if row.subject.is_empty() {
+                "(sans sujet)"
+            } else {
+                &row.subject
+            }
+        );
+
+        // Le corps passe par `Mailbox::message`, donc par le même aplatissement que
+        // l'indexation. Le réécrire ici donnerait un échantillon qui ne ressemble pas à ce que
+        // la recherche voit — et c'est exactement ce que le jeu de requêtes doit viser.
+        match mailbox.message(row.id) {
+            Ok(Some(detail)) => println!("       {}", squeeze(&detail.body, excerpt)),
+            Ok(None) => println!("       (corps introuvable — voir `mail doctor`)"),
+            Err(source) => println!("       (corps illisible : {source})"),
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Réduit un corps à une ligne lisible : espaces repliés, coupé sur une frontière de
+/// caractère.
+///
+/// Couper sur un index d'octet planterait au milieu d'un caractère accentué, ce qui sur un
+/// corpus français veut dire « presque toujours ».
+fn squeeze(body: &str, limit: usize) -> String {
+    let mut out = String::with_capacity(limit + 1);
+    let mut space = false;
+    for ch in body.chars() {
+        if out.chars().count() >= limit {
+            out.push('…');
+            break;
+        }
+        if ch.is_whitespace() {
+            // Un seul blanc pour toute suite de blancs : un corps de mail est plein de sauts
+            // de ligne et d'indentations de citation.
+            if !out.is_empty() {
+                space = true;
+            }
+            continue;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        "(corps vide)".to_owned()
+    } else {
+        out
+    }
+}

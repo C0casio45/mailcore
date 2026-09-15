@@ -21,6 +21,7 @@ mod followup;
 mod inspect;
 mod measure;
 mod profile;
+mod recall;
 mod replies;
 mod schema;
 mod secrets;
@@ -226,6 +227,60 @@ enum Command {
         store: Utf8PathBuf,
     },
 
+    /// Mesure le critère 1 de la phase 4 : le rappel sur un jeu de requêtes à réponse connue.
+    ///
+    /// Le premier relevé porte sur **tantivy seul**, avant qu'un moteur sémantique existe :
+    /// c'est le chiffre auquel tout le reste de la phase se comparera.
+    ///
+    /// Le jeu de requêtes nomme des messages réels, donc il vit dans `measurements/`, qui est
+    /// gitignoré. Il est lié au store sur lequel il a été écrit : une cible absente fait
+    /// échouer la commande au lieu de rendre un chiffre présentable.
+    MeasureRecall {
+        /// Racine du store indexé.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le jeu de requêtes et leurs réponses attendues.
+        #[arg(long, default_value = "measurements/phase4-queries.toml")]
+        queries: Utf8PathBuf,
+        /// Combien de résultats demander au moteur. Au-delà du top mesuré, pour voir de
+        /// combien une cible manquée est manquée.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+
+    /// Sort un échantillon de messages réels, étalé sur toute la période du corpus.
+    ///
+    /// Sert l'étape 1 de `docs/PHASE-4.md` : écrire des requêtes en français avec la réponse
+    /// qu'elles doivent trouver. C'est la seule étape de la phase qu'un programme ne peut pas
+    /// faire, et elle demande d'avoir de vrais messages sous les yeux.
+    ///
+    /// **Ne fait que lire**, donc elle peut viser le store de production — c'est même son
+    /// intérêt : un jeu de requêtes ne vaut que sur du vrai courrier.
+    CorpusSample {
+        /// Racine du store à lire.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Combien de messages tirer.
+        #[arg(long, default_value_t = 30)]
+        count: usize,
+        /// Combien de caractères de corps montrer par message.
+        #[arg(long)]
+        excerpt: Option<usize>,
+        /// Au-dessus de ce nombre de messages, un expéditeur est une source récurrente et ses
+        /// messages ne sont pas tirés — sauf si l'utilisateur lui a écrit.
+        ///
+        /// Une facture arrive une fois ; Facebook écrit quatre cents fois. C'est la rareté qui
+        /// distingue un message qu'on cherchera d'un fil de vie qu'on ne relit jamais.
+        #[arg(long, default_value_t = 5)]
+        max_from: usize,
+        /// Tirer sans filtre, notifications comprises.
+        ///
+        /// Par défaut, seuls les messages d'une adresse à qui l'utilisateur a **écrit** sont
+        /// tirés : un tirage uniforme sur un corpus réel donne neuf notifications sur dix.
+        #[arg(long)]
+        everything: bool,
+    },
+
     /// Mesure quel lanceur ouvre vraiment le navigateur, et à quelle longueur d'URL.
     ///
     /// Ouvre un port éphémère sur le bouclage, donne son URL à chaque lanceur candidat, et
@@ -390,6 +445,18 @@ fn main() -> Result<()> {
         Command::MeasureSecrets { store, account } => secrets::audit(&store, account),
         Command::MeasureApi { store, repeats } => api::measure(&store, repeats),
         Command::CorpusScripts { store } => corpus::scripts(&store),
+        Command::MeasureRecall {
+            store,
+            queries,
+            limit,
+        } => recall::measure(&store, &queries, limit),
+        Command::CorpusSample {
+            store,
+            count,
+            excerpt,
+            everything,
+            max_from,
+        } => corpus::sample(&store, count, excerpt, everything, max_from),
         Command::CorpusCalendar { store } => calendar::survey(&store),
         Command::MeasureInvitations { store, gaps } => calendar::measure(&store, gaps),
         Command::MeasureReplies { store, limit } => replies::measure(&store, limit),
