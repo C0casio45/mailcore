@@ -124,13 +124,24 @@ fn serve(stream: TcpStream, sink: &Arc<Mutex<Vec<Vec<u8>>>>) {
             let _ = out.write_all(b"354 vas-y\r\n");
             let _ = out.flush();
             let mut body = Vec::new();
+            let mut terminated = false;
             for raw in lines.by_ref() {
                 let Ok(raw) = raw else { return };
                 if raw == "." {
+                    terminated = true;
                     break;
                 }
                 body.extend_from_slice(raw.as_bytes());
                 body.push(b'\n');
+            }
+            // **Un `DATA` interrompu n'est pas un message reçu**, et l'oublier fait mentir
+            // l'instrument sur le critère qu'il mesure. La boucle sort aussi bien sur le point
+            // final que sur une fin de flux — un client tué en plein transfert — et compter les
+            // deux faisait voir un envoi là où le corps n'était jamais parti. Le défaut est
+            // resté invisible sur Windows, où un processus tué produit un `RST` donc une erreur
+            // de lecture ; Linux ferme proprement, et la CI l'a sorti au premier passage.
+            if !terminated {
+                return;
             }
             if let Ok(mut held) = sink.lock() {
                 held.push(body);

@@ -523,11 +523,35 @@ fn main() {
     };
 
     let handler = proxy.clone();
-    let webview = match WebViewBuilder::new()
+    let builder = WebViewBuilder::new()
         .with_html(host_page())
-        .with_ipc_handler(move |request| on_message(request.body(), &handler))
-        .build(&window)
-    {
+        .with_ipc_handler(move |request| on_message(request.body(), &handler));
+
+    // **La fenêtre invisible n'a pas de poignée sur Linux, et c'est GTK qui l'exige.**
+    //
+    // Sur Windows et sur macOS, une fenêtre cachée a quand même son `HWND` ou sa `NSView` :
+    // `build(&window)` marche. Sur Linux, une fenêtre GTK qu'on n'a jamais montrée n'est pas
+    // *réalisée*, donc elle n'a aucune poignée native, et `wry` refuse avec « the underlying
+    // handle is not available ». C'est ce que la CI a rendu au premier passage sur Linux.
+    //
+    // Le remède n'est pas de montrer la fenêtre — un banc qui vole le premier plan est une
+    // nuisance, et la visibilité ne change rien à ce que le moteur charge. C'est de construire
+    // le webview dans le **conteneur GTK** de la fenêtre, qui existe sans réalisation. C'est le
+    // chemin que `wry` documente pour Linux, et il ne concerne que Linux.
+    #[cfg(target_os = "linux")]
+    let built = {
+        use tao::platform::unix::WindowExtUnix;
+        use wry::WebViewBuilderExtUnix;
+
+        match window.default_vbox() {
+            Some(vbox) => builder.build_gtk(vbox),
+            None => fail("la fenêtre GTK n'a pas de conteneur : rien à quoi accrocher le moteur"),
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let built = builder.build(&window);
+
+    let webview = match built {
         Ok(webview) => webview,
         Err(source) => fail(&format!("webview non créé : {source}")),
     };
