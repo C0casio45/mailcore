@@ -1,0 +1,31 @@
+[package]
+name        = "mail-cli"
+description = "Client CLI : import, requête, statistiques, diagnostic."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[[bin]]
+name = "mail"
+path = "src/main.rs"
+
+[dependencies]
+mailapi                      = { workspace = true, features = ["token-store"] }
+mailcore.workspace           = true
+mailimport.workspace         = true
+anyhow.workspace             = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+camino.workspace             = true
+clap.workspace               = true
+serde_json.workspace         = true
+mailsync.workspace           = true
+mailauth.workspace           = true
+mailsmtp.workspace           = true
+rpassword.workspace          = true
+
+[lints]
+workspace = true

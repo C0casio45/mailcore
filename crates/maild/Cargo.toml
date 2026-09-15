@@ -1,0 +1,63 @@
+[package]
+name        = "maild"
+description = "Le démon mailcore : store, index, API locale et serveur MCP."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[lib]
+name = "maild"
+path = "src/lib.rs"
+
+[[bin]]
+name = "maild"
+path = "src/main.rs"
+
+[dependencies]
+mailcore.workspace           = true
+mailapi.workspace            = true
+mailimport.workspace         = true
+
+# La synchronisation est un job de fond du démon : c'est lui qui se connecte au serveur IMAP,
+# donc lui qui a besoin du client et du trousseau. Voir `jobs::Kind::Sync`.
+mailsync.workspace           = true
+mailsmtp.workspace           = true
+mailauth.workspace           = true
+mailmcp.workspace            = true
+rmcp.workspace               = true
+tokio.workspace              = true
+serde.workspace              = true
+serde_json.workspace         = true
+anyhow.workspace             = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+camino.workspace             = true
+clap.workspace               = true
+getrandom.workspace          = true
+axum.workspace               = true
+axum-server.workspace        = true
+tower-http.workspace         = true
+rustls.workspace             = true
+thiserror.workspace          = true
+directories.workspace = true
+
+[dev-dependencies]
+camino.workspace   = true
+# La signature revient de l'API en document : le test la relit avec le type qui l'écrit,
+# plutôt que de comparer du JSON à la main. Dépendance **de test** seulement — le démon, lui,
+# ne fait que transporter ce document.
+mailhtml.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+# Le veilleur `IDLE` se teste contre un serveur qu'on maîtrise, et qui sait annoncer une
+# arrivée à la demande. Sans lui, la boucle qui décide **quand** synchroniser n'aurait aucune
+# couverture d'intégration.
+mailfake.workspace = true
+
+
+[lints]
+workspace = true

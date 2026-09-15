@@ -1,0 +1,34 @@
+[package]
+name        = "mailapi"
+description = "Le contrat JSON-RPC entre le démon et ses clients non-MCP : UI, CLI."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[dependencies]
+mailcore.workspace   = true
+mailhtml.workspace   = true
+# Les types de l'invitation lue, projetés vers le contrat de fil par `invitation()`.
+mailcal.workspace    = true
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+tracing.workspace    = true
+keyring              = { workspace = true, optional = true }
+
+[features]
+# Le stockage du jeton dans le trousseau du système. Activé par les clients — la CLI,
+# le front — et pas par le démon, qui lit son jeton depuis son environnement de service et
+# n'a donc aucune raison de compiler les greffons de trousseau de trois plateformes.
+default    = []
+token-store = ["dep:keyring"]
+
+[dev-dependencies]
+camino.workspace   = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
