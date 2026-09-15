@@ -1,0 +1,67 @@
+# Le démon mailcore sur la machine dédiée.
+#
+# Avant le premier démarrage :
+#
+#   1. Importer le corpus **là où vit le profil**, pas ici :
+#        mail --store <chemin> import --profile <profil>
+#        mail --store <chemin> index
+#        mail --store <chemin> thread
+#   2. Générer un jeton :  docker compose run --rm maild token
+#   3. Le poser dans un fichier `.env` à côté de ce compose :
+#        MAILCORE_TOKEN=...
+#        MAILCORE_STORE_PATH=/chemin/vers/le/store
+#
+# Puis : docker compose up -d
+
+services:
+  maild:
+    build: .
+    image: mailcore:latest
+    restart: unless-stopped
+
+    # Publié sur le bouclage de l'hôte uniquement. Le démon écoute sur 0.0.0.0 *dans le
+    # conteneur* — c'est la seule adresse qu'il puisse y atteindre — mais rien ne sort de la
+    # machine sans que quelqu'un l'ait décidé.
+    #
+    # Pour un accès depuis un autre poste : monter un tunnel (WireGuard, SSH) jusqu'à ce
+    # port. C'est le déploiement recommandé de docs/ARCHITECTURE.md — il ramène le cas
+    # distant au cas local et réduit à zéro la surface d'attaque que nous écrivons.
+    # `--insecure-no-tls` est requis et assumé : dans le conteneur, `0.0.0.0` est la seule
+    # adresse atteignable, et ce qui confine est la publication de port ci-dessus. Le démon
+    # ne peut pas le voir, donc il faut le lui affirmer. Le jeton reste obligatoire.
+    command: ["http", "--listen", "0.0.0.0:7847", "--insecure-no-tls"]
+
+    ports:
+      - "127.0.0.1:7847:7847"
+
+    environment:
+      # Obligatoire. Sans lui, le démon refuse de démarrer — ce n'est pas un avertissement,
+      # le conteneur s'arrête avec un code d'erreur (critère 10).
+      MAILCORE_TOKEN: ${MAILCORE_TOKEN:?jeton absent — voir l en-tête de ce fichier}
+      RUST_LOG: ${RUST_LOG:-info}
+
+    volumes:
+      # Le store, rempli ailleurs. En lecture-écriture : le démon ne modifie pas le courrier
+      # en phase 1, mais SQLite écrit son WAL même pour lire.
+      - ${MAILCORE_STORE_PATH:?chemin du store absent}:/store
+
+    # Le conteneur n'a besoin d'écrire que dans le store.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      # Sans jeton, la réponse attendue est 401 : ça prouve que le service écoute **et** que
+      # l'authentification est active. Un 200 ici serait une alerte, pas un succès.
+      test:
+        - CMD-SHELL
+        - >-
+          maild check --listen 127.0.0.1:7847 >/dev/null 2>&1 || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
