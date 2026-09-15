@@ -1,0 +1,26 @@
+[package]
+name        = "mailfake"
+description = "Un serveur IMAP de test, en Rust, qui sait répondre faux. Le harnais de la phase 2."
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+[lib]
+name = "mailfake"
+path = "src/lib.rs"
+
+# Aucune dépendance, et c'est le point.
+#
+# Un serveur IMAP de test dont la raison d'être est de **mal répondre** ne peut pas s'appuyer
+# sur une bibliothèque IMAP : elle refuserait d'émettre ce qu'on veut émettre. Tout est écrit
+# ici, sur `std::net`, sans async — un fil par connexion, et une connexion à la fois dans les
+# tests.
+[dependencies]
+tracing.workspace = true
+
+[lints]
+workspace = true

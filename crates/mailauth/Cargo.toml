@@ -1,0 +1,29 @@
+[package]
+name        = "mailauth"
+description = "Les secrets des comptes, dans le trousseau du système. Jamais ailleurs."
+
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# Un crate à part de `mailsync`, et pour une raison de dépendances.
+#
+# OAuth2 apportera un client HTTP et l'ouverture d'un navigateur. `mailsync` n'a aucune raison
+# de tirer ça pour un compte à mot de passe applicatif, et un crate qui garde des secrets a
+# d'autant plus intérêt à avoir un arbre de dépendances court.
+[dependencies]
+keyring.workspace   = true
+rustls.workspace    = true
+rustls-platform-verifier = "0.7"
+base64.workspace    = true
+serde_json.workspace = true
+getrandom.workspace = true
+ring                = "0.17"
+thiserror.workspace = true
+tracing.workspace   = true
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+[package]
+name        = "mailsmtp"
+description = "Client SMTP de mailcore : composition RFC 5322 et remise."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[dependencies]
+# TLS obligatoire dès la connexion (465) ou après STARTTLS (587). Il n'y a pas de mode en clair
+# dans `mailcore::Security`, donc pas de chemin où cette dépendance serait optionnelle.
+mailcore.workspace = true
+# La signature rejoint le corps ici, et par le même chemin que celui qui affiche le courrier
+# reçu : `mailhtml::rich`. Voir `Draft::sign_with`.
+mailhtml.workspace = true
+base64.workspace     = true
+thiserror.workspace  = true
+tracing.workspace    = true
+getrandom.workspace  = true
+rustls.workspace     = true
+rustls-platform-verifier = "0.7"
+
+[dev-dependencies]
+mail-parser.workspace = true
+tempfile.workspace = true
+camino.workspace   = true
+
+[lints]
+workspace = true
