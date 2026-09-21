@@ -13,6 +13,7 @@
 pub mod contacts;
 pub mod dedup;
 pub mod error;
+pub mod fusion;
 pub mod index;
 pub mod model;
 pub mod progress;

@@ -85,7 +85,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **référence mesurée le 2026-09-15** — 22 requêtes écrites sur le corpus réel, `cargo xtask measure-recall`. Tantivy seul : **0,0 %** sur les 10 requêtes sans mot commun, **58,3 %** sur les 12 autres, **31,8 %** sur le jeu entier. Le moteur reste à écrire |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, mesuré le 2026-09-21** sur les 73 658 messages. Les trois bras donnent **0,0 %** sur les 10 requêtes sans mot commun — plein texte, sémantique, hybride. Le sémantique ne trouve **que** ce qui partage un mot (5/12 là où il y en a un, 0/10 là où il n'y en a pas) : `potion-multilingual-128M` se comporte en apparieur lexical flou, pas en moteur de sens. La règle de fusion, elle, marche — voir le journal |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu le 2026-09-21** — `cargo xtask measure-vectors` sur les 73 658 messages : **339 s**, soit **217 messages/s**, 0 blob absent et 13 textes vides. Reprenable, drapeau par ligne (`SCHEMA_V14`) et écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
@@ -130,7 +130,14 @@ utilisable.
    que l'étape a trouvé au passage : les citations en texte brut n'étaient reconnues **nulle
    part**, ni pour la vectorisation ni pour l'affichage. Voir le journal.
 
-6. **La fusion avec tantivy**, et le critère 1 mesuré pour de bon.
+6. ~~**La fusion avec tantivy**, et le critère 1 mesuré pour de bon.~~ Fait le 2026-09-21 :
+   `mailcore::fusion` (rangs réciproques), `mailvec::search::Hybrid`, et le banc à trois bras.
+   **Le critère 1 n'est pas tenu** — 0,0 % sur le sous-ensemble dur, pour les trois moteurs. Le
+   modèle est la limite, et la mesure dit de combien. Voir le journal, et l'étape 6 bis.
+
+6 bis. **Changer de modèle, et remesurer.** Décidé par le relevé ci-dessus et rendu abordable par
+   celui de l'étape 5 : le modèle pèse **4 %** du coût de la passe, donc un modèle trente fois
+   plus lent la ferait passer de 6 à 12 minutes. C'est le prix d'un vrai transformeur.
 
 7. **La passe incrémentale** — critère 4 — sur le modèle des trois dérivés existants, et une
    quatrième ligne dans `measure-followup`.
@@ -719,6 +726,132 @@ serait le genre de faux qui rassure.
 
 Sur ce corpus : **0 blob absent, 13 textes vides** sur 73 658. Le second chiffre est celui qui
 aurait pu accuser l'extraction, et treize sur soixante-treize mille dit qu'elle ne perd rien.
+
+### 2026-09-21 (suite) — le critère 1 mesuré, et il n'est pas tenu
+
+L'étape 6 : la règle de fusion, la recherche hybride, le banc à trois bras. Elle répond à la
+question qui décide de la phase, et la réponse est non. Elle dit aussi **pourquoi**, ce qui est
+la seule chose qui rende un non utile.
+
+#### Avant le résultat : le jeu de requêtes était périmé, et le garde-fou n'a rien vu
+
+Le jeu du 2026-09-15 désignait ses cibles par `messages.id`. Le store a été réimporté depuis, et
+`messages.id` est un `rowid` attribué à l'import :
+
+```
+--- l'ancien identifiant désigne-t-il encore le bon message ? ---
+Vérifiables        18 (celles dont la note cite un sujet)
+Encore justes      0
+Ayant glissé       18
+```
+
+**Dix-huit sur dix-huit.** Le banc avait pourtant un contrôle, écrit exprès le 2026-09-15 : « une
+cible absente fait échouer la commande ». Il n'a rien dit, parce que les 22 cibles **existaient**
+toutes — elles désignaient simplement d'autres messages. Le bon geste sur la mauvaise chose.
+
+Ce que ça vaut comme leçon, et elle dépasse ce banc : **un contrôle d'existence ne contrôle pas
+une identité.** Ce qui doit désigner un message au-delà de la vie d'un store le désigne par son
+**contenu** — `BlobHash`, l'identité que le projet emploie déjà pour dédupliquer. Elle survit à un
+réimport, à un changement de machine, à un renumérotage. `Store::message_by_blob` est la porte, et
+le banc refuse maintenant un jeu à l'ancien format en disant quoi lancer.
+
+#### Et une décision sur ce qu'est une bonne réponse
+
+Sur 73 658 messages, « quand mon paquet est arrivé » a **neuf** bonnes réponses : neuf avis de
+livraison. Exiger celle que l'auteur du jeu avait sous les yeux en septembre ne mesure pas le
+moteur, ça mesure sa chance. Le format porte donc **toutes** les réponses acceptables, et une
+requête est satisfaite dès qu'une d'elles est dans les dix premiers.
+
+C'est un assouplissement, et il faut le dire deux fois : **les chiffres d'aujourd'hui ne se
+comparent pas à ceux du 2026-09-15**, qui étaient sur cible unique. C'est pour ça que le banc
+mesure les **trois** bras sur le même jeu — la comparaison qui décide du critère est
+hybride contre plein texte, et celle-là reste valable.
+
+`cargo xtask queries-rebind` fait la migration, et il refuse ce qu'il ne peut pas déduire : 16
+requêtes reliées par la phrase exacte citée dans la note, 2 par « tous les mots » quand la note
+paraphrase, 4 par les mots de la requête pour les contrôles. Le relevé **dit par quelle règle**
+chacune a été reliée : une règle plus faible n'invalide pas le lien, mais elle dit laquelle
+relire en premier.
+
+#### Le relevé
+
+73 658 messages vectorisés, 22 requêtes, fusion par rangs réciproques à `K = 60` :
+
+| sous-ensemble | plein texte | sémantique | hybride |
+|---|---:|---:|---:|
+| **aucun mot commun** (10) | **0,0 %** | **0,0 %** | **0,0 %** |
+| au moins un mot commun (12) | 41,7 % | 41,7 % | 41,7 % |
+| tout le jeu (22) | 22,7 % | 22,7 % | 22,7 % |
+
+Trois colonnes identiques : le réflexe du projet est d'accuser l'instrument, et il a été suivi.
+Le détail par requête montre que les trois bras diffèrent bel et bien — l'égalité des totaux est
+une coïncidence à n = 22, pas un bug de branchement. Deux preuves indépendantes que la chaîne
+marche :
+
+- les quatre requêtes de **contrôle** sont trouvées par le sémantique seul, aux rangs 1, 1, 5 et
+  7. Vecteurs, identifiants, encodage de la requête et balayage sont donc tous en place ;
+- « l'application pour préparer des vacances » passe du **rang 29** en plein texte au **rang 7**
+  en sémantique, et au **rang 2** après fusion. La règle de fusion fait exactement ce pour quoi
+  elle a été écrite.
+
+#### Ce que le modèle fait réellement
+
+Le motif est net, et il se lit en une ligne : **le sémantique ne trouve que ce qui partage un mot
+avec sa cible.** 5 sur 12 là où un mot est commun, **0 sur 10** là où il n'y en a pas. Autrement
+dit `potion-multilingual-128M` se comporte en **apparieur lexical flou** — un tantivy plus
+tolérant sur les formes — et pas en moteur de sens.
+
+Ce n'est pas surprenant après coup, et l'étape 3 l'avait à moitié écrit : un embedding statique
+est une **moyenne de vecteurs de tokens**, sans attention ni contexte. Il rapproche deux textes
+qui emploient les mêmes tokens ; il n'a aucun mécanisme pour rapprocher « dénoncé » de
+« signalement » ou « méditation » de « pleine conscience » — les deux cas français du
+sous-ensemble dur, tous deux ratés.
+
+#### La fusion n'est pas la limite, et c'est mesuré
+
+`K` a été balayé à 5, 20, 60 et 200 : **0,0 % sur le sous-ensemble dur à chaque valeur**. On ne
+fusionne pas un résultat que ni l'un ni l'autre n'a trouvé. Le réglage repris de la publication
+n'a donc pas été éprouvé faute d'avoir de la matière à régler — c'est à dire, et c'est différent
+de « il est bon ».
+
+Un effet de bord, en revanche, est réel et mérite d'être noté avant qu'il morde : la fusion a
+**dégradé** une requête, « l'achat qui m'attend en boutique », du rang 8 au rang 16. C'est le
+défaut connu de RRF quand une des listes est du bruit — un document trouvé premier par le bruit
+(`1/61`) bat un document trouvé huitième par le bon moteur (`1/68`). Le remède est un poids par
+moteur, que `docs/PHASE-4.md` interdit de deviner et que rien ne justifie de mesurer tant que le
+bras sémantique ne vaut pas mieux que ça.
+
+#### Le sous-ensemble dur mesure autre chose que ce qu'il croyait
+
+En regardant les dix requêtes une par une, **sept visent un message dont le sujet est en
+anglais** pour une requête en français. C'est mécanique : une requête française ne partage aucun
+mot avec un sujet anglais, donc elle tombe dans le sous-ensemble « aucun mot commun » par
+construction, sans que la synonymie y soit pour quoi que ce soit.
+
+Le sous-ensemble confond donc deux problèmes : la **synonymie** — paquet/colis, dénoncé/signalement
+— et le **passage d'une langue à l'autre**. Le second est plus dur et n'était pas le sujet
+annoncé de la phase. Les trois requêtes franco-françaises du lot échouent aussi, donc changer la
+définition ne sauverait pas le résultat — mais la prochaine version du jeu doit séparer les deux,
+sans quoi un futur modèle sera jugé sur un mélange que personne n'a choisi.
+
+#### Ce que ce non autorise
+
+L'étape 3 avait choisi le modèle le moins cher qui pouvait marcher — la règle du projet. Il ne
+marche pas, et **c'est maintenant mesuré plutôt que supposé**. Ce qui rend la suite abordable est
+le relevé de l'étape 5 : le modèle pèse **4 % du coût de la passe**, le reste étant la relecture
+des blobs et l'assainissement. Un modèle **trente fois plus lent** ferait donc passer la passe
+complète de six à douze minutes, une fois.
+
+C'est le prix d'un vrai transformeur — `candle` plus `multilingual-e5-small`, l'autre branche
+écartée le 2026-09-15. La décision de la prendre n'est plus un pari : elle est payée par deux
+mesures, l'une qui dit que l'actuel ne suffit pas, l'autre qui dit que le remplacer ne coûte
+presque rien là où on croyait que ça coûterait tout.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 403 tests verts**, dont 10 sur la règle de fusion et 5 sur la
+recherche hybride. Ceux qui portent l'étape : « un message que seul un moteur a vu entre dans la
+liste » et son inverse « l'accord des deux bat une première place isolée » ; « sans modèle, la
+recherche répond quand même, et elle répond ce que le plein texte répondait ».
 
 Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` — **1 388 tests verts**, soit 35 de plus. Les quatre qui portent l'étape :

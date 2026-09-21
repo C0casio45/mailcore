@@ -377,6 +377,22 @@ enum Command {
         #[arg(long)]
         detach: bool,
     },
+    /// Calcule les embeddings du corpus avec le modèle **local**, pour la recherche sémantique.
+    ///
+    /// Incrémentale par défaut : elle ne traite que ce qui n'a pas encore de vecteur, et une
+    /// passe coupée repart où elle en était. Aucun octet de courrier ne quitte la machine — le
+    /// modèle est un fichier, et le crate qui l'emploie n'embarque aucun client HTTP.
+    Vectors {
+        /// Le répertoire du modèle. Par défaut, `model/` sous la racine du store.
+        #[arg(long)]
+        model: Option<Utf8PathBuf>,
+        /// Tout refaire depuis zéro.
+        ///
+        /// Nécessaire après un changement de modèle : les vecteurs d'un modèle ne se comparent
+        /// pas à ceux d'un autre, et les mélanger donnerait un classement qui ne veut rien dire.
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// La source d'un message : les octets tels qu'ils sont.
     ///
     /// Ce que le message porte, et rien d'autre : ni sujet décodé, ni en-tête déplié, ni HTML
@@ -447,8 +463,19 @@ fn store_root(requested: Option<&Utf8PathBuf>) -> Result<Utf8PathBuf> {
 }
 
 fn main() -> Result<()> {
+    // `warn` par défaut, **sauf `html5ever`**, et ce n'est pas une préférence esthétique.
+    //
+    // `ammonia` s'appuie sur `html5ever`, qui émet un `WARN` — « foster parenting not
+    // implemented » — sur tout HTML dont les tables sont mal imbriquées. C'est la moitié des
+    // newsletters. Tant que l'assainissement ne servait qu'à afficher **un** message à la fois,
+    // ça passait inaperçu ; `mail vectors` en assainit soixante-treize mille et le relevé
+    // disparaissait sous des milliers de lignes identiques, trouvé le 2026-09-21 en le lançant.
+    //
+    // Le filtre vise cette cible nommément plutôt que de descendre le niveau global : un
+    // avertissement de `mailcore` ou de `mailvec` pendant une passe de six minutes est
+    // exactement ce qu'on veut voir. `RUST_LOG` reprend la main sur le tout.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn,html5ever=error"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
@@ -542,6 +569,13 @@ fn main() -> Result<()> {
         // compte est dans le trousseau du démon, et **la file d'envoi est dans son store**.
         // Composer ici puis remettre là-bas demanderait de transporter le message par le
         // réseau, ce qui est un protocole qui n'existe pas encore.
+        // Le même raisonnement que pour le carnet, avec un motif de plus : la passe lit un
+        // **modèle installé sur la machine du démon**. Un `--daemon` laisserait croire qu'on
+        // vectorise son propre courrier avec son propre modèle, alors qu'on déclencherait un
+        // travail ailleurs, avec un modèle qu'on n'a pas choisi.
+        (Command::Vectors { .. }, Some(_)) => anyhow::bail!(
+            "la vectorisation vit du côté du démon : c'est son store qui porte les messages et \n             sa machine qui porte le modèle. Lancer `mail vectors` sur la machine du démon, \n             sans --daemon."
+        ),
         (Command::Contacts { .. }, Some(_)) => anyhow::bail!(
             "le carnet vit dans le store du démon : c'est lui qui le reconstruit. Lancer \n             `mail contacts` sur la machine du démon, sans --daemon."
         ),
@@ -598,6 +632,13 @@ fn main() -> Result<()> {
         }
         (Command::Index { .. }, None) => commands::index::run(store),
         (Command::Thread { .. }, None) => commands::thread::run(store),
+        // Pas de variante distante : la passe écrit dans le store **de la machine du démon** et
+        // lit un modèle installé sur elle. Un `mail vectors --daemon` laisserait croire qu'on
+        // vectorise son propre courrier alors qu'on déclencherait un job ailleurs — c'est le
+        // raisonnement de `accounts.add`, appliqué à un travail de fond.
+        (Command::Vectors { model, rebuild }, None) => {
+            commands::vectors::run(store, model.as_ref(), *rebuild)
+        }
         (Command::Search { query, limit }, None) => {
             commands::search::run(store, &query.join(" "), *limit)
         }

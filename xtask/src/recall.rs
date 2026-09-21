@@ -63,8 +63,29 @@ const STOPWORDS: &[&str] = &[
 struct Query {
     /// Ce que l'utilisateur taperait.
     text: String,
-    /// L'identifiant du message attendu, tel que `mail search` le rend.
-    target: i64,
+    /// Les **empreintes de contenu** des messages qui répondent à la requête, en hexadécimal.
+    ///
+    /// ## Pourquoi des empreintes et pas des identifiants
+    ///
+    /// `messages.id` est attribué à l'import. Le 2026-09-21, le store a été réimporté et les 22
+    /// cibles du jeu ont désigné d'autres messages — sans que rien ne tombe, puisqu'elles
+    /// **existaient** toutes. Le contrôle d'existence était le bon geste sur la mauvaise chose.
+    /// L'empreinte BLAKE3 des octets RFC 5322 est l'identité que le projet emploie déjà pour
+    /// dédupliquer ; elle survit à un réimport, à un changement de machine, à un renumérotage.
+    ///
+    /// ## Pourquoi **plusieurs** et pas une
+    ///
+    /// Sur soixante-treize mille messages, « quand mon paquet est arrivé » a neuf bonnes
+    /// réponses : neuf avis de livraison. Exiger celle que l'auteur du jeu avait sous les yeux
+    /// en septembre ne mesure pas mieux le moteur — ça mesure sa chance. Un moteur qui remonte
+    /// un autre avis de livraison a **répondu à la question posée**, et le compter en échec
+    /// sous-estimerait le rappel au lieu de l'établir.
+    ///
+    /// Ce que ça coûte, et il faut le dire : le critère 1 devient « la liste contient une
+    /// réponse acceptable » plutôt que « la liste contient *le* message ». C'est un
+    /// assouplissement assumé, et il est **borné par le jeu** — c'est un humain qui a écrit
+    /// quelles réponses sont acceptables, pas une heuristique appliquée au moment du calcul.
+    blobs: Vec<String>,
     /// Pourquoi cette requête est dans le jeu. Pour le lecteur, jamais pour le calcul.
     #[serde(default)]
     #[allow(dead_code)]
@@ -77,16 +98,53 @@ struct Ground {
     query: Vec<Query>,
 }
 
+/// Les moteurs comparés, dans l'ordre où le relevé les imprime.
+///
+/// Les trois bras et pas seulement l'hybride, parce que le critère 1 demande explicitement que
+/// l'hybride soit **strictement meilleur que tantivy seul** sur le sous-ensemble dur. Sans le
+/// bras sémantique isolé, on ne saurait pas non plus si un gain vient du sémantique ou de la
+/// règle de fusion — et c'est la question que l'étape 6 doit trancher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Engine {
+    /// `tantivy` seul, le chiffre de référence du 2026-09-15.
+    FullText,
+    /// Le balayage vectoriel seul.
+    Semantic,
+    /// Les deux, fusionnés par rangs réciproques.
+    Hybrid,
+}
+
+impl Engine {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::FullText => "plein texte seul",
+            Self::Semantic => "sémantique seul",
+            Self::Hybrid => "hybride (fusion par rangs)",
+        }
+    }
+}
+
 /// Ce qu'une requête a donné.
 struct Outcome {
     text: String,
-    target: MessageId,
-    /// Le sujet de la cible, pour que l'échec soit lisible sans rouvrir le store.
+    /// Les messages qui répondent à la requête.
+    targets: Vec<MessageId>,
+    /// Le sujet de la première cible, pour que l'échec soit lisible sans rouvrir le store.
     subject: String,
-    /// Le rang de la cible dans les résultats, à partir de 1. `None` si absente.
-    rank: Option<usize>,
+    /// Le rang de la cible pour chaque moteur mesuré, à partir de 1. `None` si absente.
+    ranks: Vec<(Engine, Option<usize>)>,
     /// La requête partage-t-elle un mot porteur avec sa cible ?
     shares_a_word: bool,
+}
+
+impl Outcome {
+    /// Le rang obtenu par un moteur donné.
+    fn rank(&self, engine: Engine) -> Option<usize> {
+        self.ranks
+            .iter()
+            .find(|(which, _)| *which == engine)
+            .and_then(|(_, rank)| *rank)
+    }
 }
 
 /// Mesure le rappel du moteur plein texte sur le jeu de requêtes.
@@ -95,10 +153,23 @@ struct Outcome {
 ///
 /// Si le store est illisible, si le fichier de requêtes est absent ou mal formé, ou si une cible
 /// n'existe pas dans ce store.
-pub fn measure(store_root: &Utf8PathBuf, queries: &Utf8PathBuf, limit: usize) -> Result<()> {
+pub fn measure(
+    store_root: &Utf8PathBuf,
+    queries: &Utf8PathBuf,
+    limit: usize,
+    model: Option<&Utf8PathBuf>,
+    k: f32,
+) -> Result<()> {
     let raw = std::fs::read_to_string(queries)
         .with_context(|| format!("lecture du jeu de requêtes {queries}"))?;
-    let ground: Ground = toml::from_str(&raw).with_context(|| format!("analyse de {queries}"))?;
+    let ground: Ground = toml::from_str(&raw).with_context(|| {
+        format!(
+            "analyse de {queries}.\nSi le message parle d'un champ `blob` manquant : ce jeu \
+             désigne encore ses cibles par `target`, c'est-à-dire par un identifiant que le \
+             prochain réimport fera glisser. `cargo xtask queries-rebind` dit quoi mettre à la \
+             place."
+        )
+    })?;
     anyhow::ensure!(
         !ground.query.is_empty(),
         "{queries} ne contient aucune requête"
@@ -107,43 +178,121 @@ pub fn measure(store_root: &Utf8PathBuf, queries: &Utf8PathBuf, limit: usize) ->
     let mailbox =
         Mailbox::open(store_root).with_context(|| format!("ouverture de la boîte {store_root}"))?;
 
+    // Le moteur sémantique est **optionnel** ici comme dans le produit : sans modèle, le banc
+    // rend le relevé de référence, celui du 2026-09-15. C'est ce qui permet de rejouer l'ancien
+    // chiffre avec le code d'aujourd'hui plutôt que de le recopier depuis le journal.
+    let semantic = match model {
+        Some(dir) => {
+            let engine = mailvec::search::Semantic::open(mailbox.store(), dir)
+                .with_context(|| format!("ouverture du moteur sémantique sur {dir}"))?;
+            anyhow::ensure!(
+                !engine.is_empty(),
+                "le magasin de vecteurs est vide : lancez la passe de vectorisation d'abord"
+            );
+            println!("Vecteurs           {} messages", engine.len());
+            Some(engine)
+        }
+        None => None,
+    };
+    let engines: Vec<Engine> = if semantic.is_some() {
+        vec![Engine::FullText, Engine::Semantic, Engine::Hybrid]
+    } else {
+        vec![Engine::FullText]
+    };
+    let hybrid = mailvec::search::Hybrid::new(&mailbox, semantic).with_k(k);
+
     let mut outcomes = Vec::with_capacity(ground.query.len());
     for query in &ground.query {
-        let target = MessageId(query.target);
+        anyhow::ensure!(
+            !query.blobs.is_empty(),
+            "« {} » n'a aucune cible : une requête sans réponse attendue ne mesure rien",
+            query.text
+        );
 
-        // **La cible est vérifiée avant d'être cherchée.** Un jeu de requêtes est lié au store
-        // sur lequel il a été écrit : un réimport renumérote les messages, et le banc mesurerait
-        // alors un rappel contre des cibles qui ont glissé — en rendant un chiffre parfaitement
-        // présentable. Mieux vaut refuser.
-        let detail = mailbox
-            .message(target)
-            .with_context(|| format!("relecture de la cible #{} ", query.target))?
-            .with_context(|| {
-                format!(
-                    "la cible #{} n'existe pas dans {store_root} : ce jeu de requêtes a été \
-                     écrit sur un autre store, ou le store a été réimporté",
-                    query.target
-                )
-            })?;
+        // **Chaque cible est résolue par son contenu, puis relue.** Deux contrôles, et il en
+        // faut deux : l'empreinte dit *quel* message, la relecture dit qu'il est là. Le jeu
+        // d'avant ne faisait que le second, sur un identifiant — il a laissé passer un réimport
+        // complet le 2026-09-21.
+        let mut targets = Vec::with_capacity(query.blobs.len());
+        let mut details = Vec::with_capacity(query.blobs.len());
+        for hex in &query.blobs {
+            let blob = mailcore::BlobHash::from_hex(hex.trim())
+                .with_context(|| format!("empreinte illisible pour « {} »", query.text))?;
+            let target = mailbox
+                .store()
+                .message_by_blob(blob)
+                .with_context(|| format!("résolution d'une cible de « {} »", query.text))?
+                .with_context(|| {
+                    format!(
+                        "aucun message de ce contenu dans {store_root} pour « {} » : ce store \
+                         ne porte pas le message que ce jeu de requêtes vise",
+                        query.text
+                    )
+                })?;
+            let detail = mailbox
+                .message(target)
+                .with_context(|| format!("relecture d'une cible de « {} »", query.text))?
+                .with_context(|| {
+                    format!("cible introuvable après résolution de « {} »", query.text)
+                })?;
+            targets.push(target);
+            details.push(detail);
+        }
+        // Le premier sert d'échantillon pour l'affichage d'un échec ; les autres comptent tout
+        // autant pour le calcul.
+        let detail = &details[0];
 
-        let hits = mailbox
-            .search(&query.text, limit)
-            .with_context(|| format!("recherche « {} »", query.text))?;
-        let rank = hits
-            .iter()
-            .position(|hit| hit.item.id == target)
-            .map(|at| at + 1);
+        // **Le rang retenu est le meilleur de toutes les cibles acceptables.** Une requête est
+        // satisfaite dès qu'une réponse valable est dans la liste ; prendre autre chose que le
+        // meilleur rang reviendrait à pénaliser un moteur pour avoir aussi trouvé les autres.
+        let mut ranks = Vec::with_capacity(engines.len());
+        for engine in &engines {
+            let found: Vec<MessageId> = match engine {
+                Engine::FullText => mailbox
+                    .search(&query.text, limit)
+                    .with_context(|| format!("plein texte « {} »", query.text))?
+                    .into_iter()
+                    .map(|hit| hit.item.id)
+                    .collect(),
+                Engine::Semantic => hybrid
+                    .semantic()
+                    .context("bras sémantique demandé sans moteur")?
+                    .search(&query.text, limit)
+                    .with_context(|| format!("sémantique « {} »", query.text))?
+                    .into_iter()
+                    .map(|hit| hit.id)
+                    .collect(),
+                Engine::Hybrid => hybrid
+                    .search(&query.text, limit)
+                    .with_context(|| format!("hybride « {} »", query.text))?
+                    .into_iter()
+                    .map(|hit| hit.id)
+                    .collect(),
+            };
+            let rank = found
+                .iter()
+                .position(|id| targets.contains(id))
+                .map(|at| at + 1);
+            ranks.push((*engine, rank));
+        }
+
+        // **Le partage d'un mot se lit sur *toutes* les cibles.** Si l'une d'elles partage un
+        // mot avec la requête, un moteur de mots peut l'atteindre — donc la requête n'est pas
+        // dans le sous-ensemble dur, même si les autres cibles n'ont rien en commun. La
+        // définition conservatrice est la seule honnête : elle ne peut que **sous-estimer** ce
+        // que le sémantique apporte, jamais le gonfler.
+        let shares = details.iter().any(|it| shares_a_word(&query.text, it));
 
         outcomes.push(Outcome {
             text: query.text.clone(),
-            target,
+            targets,
             subject: detail.item.subject.clone(),
-            rank,
-            shares_a_word: shares_a_word(&query.text, &detail),
+            ranks,
+            shares_a_word: shares,
         });
     }
 
-    report(store_root, queries, &outcomes);
+    report(store_root, queries, &engines, k, &outcomes);
     Ok(())
 }
 
@@ -177,69 +326,127 @@ fn words(text: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 /// Imprime le relevé.
-fn report(store_root: &Utf8PathBuf, queries: &Utf8PathBuf, outcomes: &[Outcome]) {
+fn report(
+    store_root: &Utf8PathBuf,
+    queries: &Utf8PathBuf,
+    engines: &[Engine],
+    k: f32,
+    outcomes: &[Outcome],
+) {
     println!("Store              {store_root}");
     println!("Jeu de requêtes    {queries}");
-    println!("Moteur             tantivy seul — plein texte");
+    if engines.contains(&Engine::Hybrid) {
+        println!("Fusion             rangs réciproques, K = {k}");
+    }
     println!();
 
     let (hard, easy): (Vec<_>, Vec<_>) = outcomes.iter().partition(|it| !it.shares_a_word);
+    let all: Vec<&Outcome> = outcomes.iter().collect();
 
-    println!(
-        "{:<42} {:>7} {:>9} {:>9}",
-        "sous-ensemble", "requêtes", "dans le top", "rappel"
-    );
+    // **Le sous-ensemble dur en premier**, parce que c'est lui qui décide. Le rappel global peut
+    // être gonflé par des requêtes qui reprennent les mots du sujet ; celui-ci ne peut pas.
     for (label, set) in [
         ("aucun mot commun avec la cible", &hard),
         ("au moins un mot commun", &easy),
+        ("tout le jeu", &all),
     ] {
-        print_row(label, set);
-    }
-    let all: Vec<&Outcome> = outcomes.iter().collect();
-    print_row("tout le jeu", &all);
-
-    println!();
-    println!("Ce qui n'est pas trouvé dans les {TOP} premiers :");
-    let mut missed = 0;
-    for outcome in outcomes {
-        if outcome.rank.is_some_and(|rank| rank <= TOP) {
-            continue;
-        }
-        missed += 1;
-        let where_it_is = match outcome.rank {
-            Some(rank) => format!("rang {rank}"),
-            None => "absente".to_owned(),
-        };
-        let kind = if outcome.shares_a_word {
-            "mot commun"
-        } else {
-            "aucun mot commun"
-        };
-        println!("  « {} »", outcome.text);
+        println!("--- {label} — {} requêtes ---", set.len());
         println!(
-            "      cible #{} — {}   [{kind}, {where_it_is}]",
-            outcome.target.0,
-            short(&outcome.subject)
+            "{:<30} {:>13} {:>9} {:>12}",
+            "moteur", "dans le top", "rappel", "rang médian"
         );
+        for engine in engines {
+            print_row(*engine, set);
+        }
+        println!();
     }
-    if missed == 0 {
-        println!("  (rien — toutes les cibles sont dans les {TOP} premiers)");
+
+    // Le détail par requête : sans lui, un chiffre agrégé ne se diagnostique pas. Il montre
+    // aussi les **régressions** de la fusion, qui sont ce qu'un rappel moyen cache le mieux.
+    println!("Détail par requête — rang de la cible, « — » si elle n'est pas rendue du tout :");
+    let header: Vec<&str> = engines.iter().map(|e| short_label(*e)).collect();
+    println!(
+        "  {:<8} {:<8} {:<8}  requête",
+        header.first().copied().unwrap_or(""),
+        header.get(1).copied().unwrap_or(""),
+        header.get(2).copied().unwrap_or("")
+    );
+    for outcome in outcomes {
+        let cells: Vec<String> = engines
+            .iter()
+            .map(|engine| match outcome.rank(*engine) {
+                Some(rank) if rank <= TOP => format!("{rank}"),
+                Some(rank) => format!("({rank})"),
+                None => "—".to_owned(),
+            })
+            .collect();
+        let mark = if outcome.shares_a_word { " " } else { "*" };
+        println!(
+            "{mark} {:<8} {:<8} {:<8}  « {} »",
+            cells.first().cloned().unwrap_or_default(),
+            cells.get(1).cloned().unwrap_or_default(),
+            cells.get(2).cloned().unwrap_or_default(),
+            short(&outcome.text)
+        );
+        // Le sujet de la cible n'est rappelé que quand le **dernier** moteur — l'hybride quand il
+        // y en a un — l'a manquée : c'est là qu'on a besoin de savoir ce qu'on cherchait. Le
+        // montrer partout noierait les échecs dans les réussites.
+        let last = engines.last().copied().unwrap_or(Engine::FullText);
+        if outcome.rank(last).is_none_or(|rank| rank > TOP) {
+            let plural = if outcome.targets.len() > 1 {
+                format!(
+                    " (et {} autres réponses acceptables)",
+                    outcome.targets.len() - 1
+                )
+            } else {
+                String::new()
+            };
+            println!("           cible — {}{plural}", short(&outcome.subject));
+        }
+    }
+    println!("\n  * = aucun mot commun avec la cible.  (n) = trouvée, mais hors du top {TOP}.");
+}
+
+/// Un libellé court pour la colonne du détail.
+const fn short_label(engine: Engine) -> &'static str {
+    match engine {
+        Engine::FullText => "texte",
+        Engine::Semantic => "sémant.",
+        Engine::Hybrid => "hybride",
     }
 }
 
 /// Une ligne du tableau.
-fn print_row(label: &str, set: &[&Outcome]) {
-    let found = set
-        .iter()
-        .filter(|it| it.rank.is_some_and(|rank| rank <= TOP))
-        .count();
+fn print_row(engine: Engine, set: &[&Outcome]) {
     if set.is_empty() {
-        println!("{label:<42} {:>7} {:>9} {:>9}", 0, 0, "—");
+        println!("{:<30} {:>13} {:>9} {:>12}", engine.label(), 0, "—", "—");
         return;
     }
+    let found = set
+        .iter()
+        .filter(|it| it.rank(engine).is_some_and(|rank| rank <= TOP))
+        .count();
     #[allow(clippy::cast_precision_loss)]
     let share = found as f64 * 100.0 / set.len() as f64;
-    println!("{label:<42} {:>7} {found:>9} {share:>8.1} %", set.len());
+
+    // Le rang médian dit ce que le rappel binaire cache : « manqué de peu » et « pas du tout »
+    // comptent pareil dans un taux, et pas du tout pareil pour qui cherche.
+    let mut ranks: Vec<usize> = set
+        .iter()
+        .map(|it| it.rank(engine).unwrap_or(usize::MAX))
+        .collect();
+    ranks.sort_unstable();
+    let median = ranks[ranks.len() / 2];
+    let median = if median == usize::MAX {
+        "absente".to_owned()
+    } else {
+        median.to_string()
+    };
+
+    println!(
+        "{:<30} {found:>13} {share:>8.1} % {median:>12}",
+        engine.label()
+    );
 }
 
 /// Un sujet raccourci, coupé sur une frontière de caractère.

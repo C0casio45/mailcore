@@ -22,6 +22,7 @@ mod inspect;
 mod measure;
 mod model;
 mod profile;
+mod rebind;
 mod recall;
 mod replies;
 mod scan;
@@ -306,6 +307,16 @@ enum Command {
         /// combien une cible manquée est manquée.
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Le répertoire du modèle. **Sans lui, le banc mesure tantivy seul** — c'est le relevé
+        /// de référence du 2026-09-15, rejouable avec le code d'aujourd'hui.
+        #[arg(long)]
+        model: Option<Utf8PathBuf>,
+        /// L'amortissement de la fusion par rangs réciproques.
+        ///
+        /// Réglable pour que le choix de `mailcore::fusion::K` soit un **résultat** et pas une
+        /// valeur reprise d'un article et jamais éprouvée sur ce corpus.
+        #[arg(long, default_value_t = mailcore::fusion::K)]
+        k: f32,
     },
 
     /// Mesure le critère 2 de la phase 4 : la latence d'un balayage vectoriel complet.
@@ -331,6 +342,28 @@ enum Command {
         /// que le rang 95 % veuille dire quelque chose.
         #[arg(long, default_value_t = 200)]
         queries: usize,
+    },
+
+    /// Relie un jeu de requêtes à un store par le **contenu** des messages, pas par leur
+    /// identifiant.
+    ///
+    /// À lancer quand le store a été réimporté : les `messages.id` changent, les empreintes non.
+    /// L'outil propose une empreinte quand il peut la déduire sans ambiguïté du sujet cité dans
+    /// la note, et **refuse** partout ailleurs — une vérité terrain devinée rend un chiffre, et
+    /// ce chiffre est faux sans le dire.
+    QueriesRebind {
+        /// Racine du store. Lu seulement.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le jeu de requêtes à relier.
+        #[arg(long, default_value = "measurements/phase4-queries.toml")]
+        queries: Utf8PathBuf,
+        /// Où écrire le jeu relié. Sans ce paramètre, l'outil ne fait que dire ce qu'il ferait.
+        ///
+        /// Un fichier neuf, jamais celui d'entrée : une vérité terrain écrite à la main ne se
+        /// remplace pas par un programme sans que quelqu'un ait relu ce qui la remplace.
+        #[arg(long)]
+        out: Option<Utf8PathBuf>,
     },
 
     /// Mesure les critères 3 et 5 de la phase 4 : le coût d'une passe de vectorisation.
@@ -570,13 +603,20 @@ fn main() -> Result<()> {
             store,
             queries,
             limit,
-        } => recall::measure(&store, &queries, limit),
+            model,
+            k,
+        } => recall::measure(&store, &queries, limit, model.as_ref(), k),
         Command::MeasureScan {
             messages,
             dim,
             limit,
             queries,
         } => scan::measure(messages, dim, limit, queries),
+        Command::QueriesRebind {
+            store,
+            queries,
+            out,
+        } => rebind::run(&store, &queries, out.as_ref()),
         Command::MeasureVectors {
             store,
             model,

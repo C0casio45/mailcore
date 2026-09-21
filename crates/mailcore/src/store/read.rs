@@ -347,6 +347,33 @@ impl Store {
         Ok(())
     }
 
+    /// Un message par l'identité de son contenu.
+    ///
+    /// ## Pourquoi cette porte existe
+    ///
+    /// `messages.id` est un `rowid` : il est attribué à l'import, donc **un réimport le change**.
+    /// Tout ce qui doit désigner un message au-delà de la vie d'un store — un jeu de requêtes de
+    /// référence, un rapport, un signet — doit le désigner par son contenu.
+    ///
+    /// Le coût de ne pas l'avoir a été payé le 2026-09-21 : la vérité terrain du critère 1
+    /// nommait ses cibles par leur identifiant, le store a été réimporté, et les 22 cibles
+    /// pointaient sur d'autres messages. Elles **existaient** toutes, donc le contrôle qui
+    /// vérifiait leur existence ne voyait rien.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn message_by_blob(&self, blob: BlobHash) -> Result<Option<MessageId>> {
+        let found = self
+            .connection()
+            .prepare_cached("SELECT id FROM messages WHERE blob_hash = ?1")?
+            .query_row([blob.as_bytes().as_slice()], |row| {
+                Ok(MessageId(row.get(0)?))
+            })
+            .optional()?;
+        Ok(found)
+    }
+
     /// Les messages qui n'ont pas encore de vecteur, au plus `limit`.
     ///
     /// Même forme que [`Self::unindexed`], sans la jointure des dossiers — voir [`VectorRow`].

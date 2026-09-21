@@ -29,7 +29,11 @@
 
 pub mod model;
 pub mod pass;
+pub mod search;
 pub mod text;
+
+#[cfg(test)]
+mod testing;
 
 /// Ce qui peut échouer dans ce crate.
 #[derive(Debug, thiserror::Error)]

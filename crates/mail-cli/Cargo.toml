@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 mailapi                      = { workspace = true, features = ["token-store"] }
 mailcore.workspace           = true
+mailvec.workspace            = true
 mailimport.workspace         = true
 anyhow.workspace             = true
 tracing.workspace            = true
