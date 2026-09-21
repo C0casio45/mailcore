@@ -21,6 +21,7 @@ mod followup;
 mod inspect;
 mod measure;
 mod model;
+mod probe;
 mod profile;
 mod rebind;
 mod recall;
@@ -344,6 +345,17 @@ enum Command {
         queries: usize,
     },
 
+    /// Demande à un modèle d'embeddings si deux mots qu'un humain juge proches le sont pour lui.
+    ///
+    /// La question la moins chère qu'on puisse poser à un modèle, et celle qui départage « le
+    /// rappel est nul parce que le modèle n'a pas de sens » de « le rappel est nul parce qu'un
+    /// réglage en aval est mauvais ». Une seconde, contre six minutes pour une passe complète.
+    ModelProbe {
+        /// Le répertoire du modèle à sonder.
+        #[arg(long, default_value = "measurements/models/potion-taille")]
+        model: Utf8PathBuf,
+    },
+
     /// Relie un jeu de requêtes à un store par le **contenu** des messages, pas par leur
     /// identifiant.
     ///
@@ -612,6 +624,7 @@ fn main() -> Result<()> {
             limit,
             queries,
         } => scan::measure(messages, dim, limit, queries),
+        Command::ModelProbe { model } => probe::model(&model),
         Command::QueriesRebind {
             store,
             queries,

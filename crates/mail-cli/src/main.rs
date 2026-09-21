@@ -392,6 +392,14 @@ enum Command {
         /// pas à ceux d'un autre, et les mélanger donnerait un classement qui ne veut rien dire.
         #[arg(long)]
         rebuild: bool,
+        /// Combien de caractères du corps entrent dans le vecteur.
+        ///
+        /// Un embedding est une moyenne : plus le texte est long, plus le vecteur ressemble à
+        /// celui de n'importe quel autre texte long. Ce réglage est **ce qui décide** de ce
+        /// qu'on garde d'un message, et il change tous les vecteurs — donc il demande
+        /// `--rebuild`.
+        #[arg(long)]
+        budget: Option<usize>,
     },
     /// La source d'un message : les octets tels qu'ils sont.
     ///
@@ -636,9 +644,14 @@ fn main() -> Result<()> {
         // lit un modèle installé sur elle. Un `mail vectors --daemon` laisserait croire qu'on
         // vectorise son propre courrier alors qu'on déclencherait un job ailleurs — c'est le
         // raisonnement de `accounts.add`, appliqué à un travail de fond.
-        (Command::Vectors { model, rebuild }, None) => {
-            commands::vectors::run(store, model.as_ref(), *rebuild)
-        }
+        (
+            Command::Vectors {
+                model,
+                rebuild,
+                budget,
+            },
+            None,
+        ) => commands::vectors::run(store, model.as_ref(), *rebuild, *budget),
         (Command::Search { query, limit }, None) => {
             commands::search::run(store, &query.join(" "), *limit)
         }

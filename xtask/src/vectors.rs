@@ -75,7 +75,13 @@ pub fn measure(store_root: &Utf8PathBuf, model: &Utf8PathBuf, resume: bool) -> R
 
     let progress = Progress::new();
     let at = Instant::now();
-    let stats = mailvec::pass::update_with(&store, &encoder, &progress).context("passe")?;
+    let stats = mailvec::pass::update_with(
+        &store,
+        &encoder,
+        mailvec::text::Budget::default(),
+        &progress,
+    )
+    .context("passe")?;
     let elapsed = at.elapsed();
     let rss_done = current_rss();
 
@@ -102,10 +108,14 @@ fn measure_resume(store: &Store, encoder: &mailvec::model::Model) -> Result<()> 
     // travail, ce qui n'est pas la coupure intéressante. On laisse donc un lot passer, puis on
     // annule — ce que la boucle regarde message par message.
     let progress = Progress::new();
-    let first = mailvec::pass::update_with(store, encoder, &progress).context("passe complète")?;
+    let first =
+        mailvec::pass::update_with(store, encoder, mailvec::text::Budget::default(), &progress)
+            .context("passe complète")?;
 
     let at = Instant::now();
-    let again = mailvec::pass::update_with(store, encoder, &progress).context("reprise")?;
+    let again =
+        mailvec::pass::update_with(store, encoder, mailvec::text::Budget::default(), &progress)
+            .context("reprise")?;
     let elapsed = at.elapsed();
 
     println!("\n--- reprise ---");

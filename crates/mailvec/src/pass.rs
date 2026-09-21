@@ -95,7 +95,12 @@ pub struct Stats {
 /// [`Error::Model`] si le modèle n'est pas chargeable, [`Error::Core`] si le store ou le magasin
 /// est illisible, [`Error::Encode`] si la bibliothèque rend autre chose que ce qu'on lui a
 /// demandé.
-pub fn update(store: &Store, model_dir: &camino::Utf8Path, progress: &Progress) -> Result<Stats> {
+pub fn update(
+    store: &Store,
+    model_dir: &camino::Utf8Path,
+    budget: crate::text::Budget,
+    progress: &Progress,
+) -> Result<Stats> {
     // **La question la moins chère en premier.** Charger le modèle coûte une cinquantaine de
     // millisecondes et une centaine de mébioctets ; le `COUNT` qui dit s'il y a du travail coûte
     // des microsecondes. La passe tourne après chaque moisson, et la grande majorité des
@@ -105,7 +110,7 @@ pub fn update(store: &Store, model_dir: &camino::Utf8Path, progress: &Progress) 
     }
 
     let model = Model::load(model_dir)?;
-    update_with(store, &model, progress)
+    update_with(store, &model, budget, progress)
 }
 
 /// [`update`] avec un encodeur déjà construit.
@@ -117,7 +122,12 @@ pub fn update(store: &Store, model_dir: &camino::Utf8Path, progress: &Progress) 
 /// # Errors
 ///
 /// Les mêmes que [`update`], hors chargement du modèle.
-pub fn update_with(store: &Store, model: &impl Encoder, progress: &Progress) -> Result<Stats> {
+pub fn update_with(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+) -> Result<Stats> {
     let path = store.vectors_path();
 
     // **Le critère 9 : les deux magasins ne doivent pas se contredire.** Le drapeau est dans
@@ -138,7 +148,7 @@ pub fn update_with(store: &Store, model: &impl Encoder, progress: &Progress) -> 
     }
     drop(stored);
 
-    advance(store, model, progress)
+    advance(store, model, budget, progress)
 }
 
 /// Refait tous les vecteurs, depuis zéro.
@@ -150,9 +160,14 @@ pub fn update_with(store: &Store, model: &impl Encoder, progress: &Progress) -> 
 /// # Errors
 ///
 /// Les mêmes que [`update`], plus [`Error::Core`] si le fichier n'est pas supprimable.
-pub fn rebuild(store: &Store, model_dir: &camino::Utf8Path, progress: &Progress) -> Result<Stats> {
+pub fn rebuild(
+    store: &Store,
+    model_dir: &camino::Utf8Path,
+    budget: crate::text::Budget,
+    progress: &Progress,
+) -> Result<Stats> {
     let model = Model::load(model_dir)?;
-    rebuild_with(store, &model, progress)
+    rebuild_with(store, &model, budget, progress)
 }
 
 /// [`rebuild`] avec un encodeur déjà construit.
@@ -160,7 +175,12 @@ pub fn rebuild(store: &Store, model_dir: &camino::Utf8Path, progress: &Progress)
 /// # Errors
 ///
 /// Les mêmes que [`rebuild`], hors chargement du modèle.
-pub fn rebuild_with(store: &Store, model: &impl Encoder, progress: &Progress) -> Result<Stats> {
+pub fn rebuild_with(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+) -> Result<Stats> {
     let path = store.vectors_path();
 
     if path.exists() {
@@ -176,7 +196,7 @@ pub fn rebuild_with(store: &Store, model: &impl Encoder, progress: &Progress) ->
     // déclenche jamais.
     store.reset_vectorised()?;
 
-    advance(store, model, progress)
+    advance(store, model, budget, progress)
 }
 
 /// La boucle partagée par [`update`] et [`rebuild`].
@@ -184,7 +204,12 @@ pub fn rebuild_with(store: &Store, model: &impl Encoder, progress: &Progress) ->
 /// Partagée et non recopiée : c'est la leçon du carnet, où deux boucles auraient divergé et où
 /// un carnet reconstruit n'aurait pas donné le même classement qu'un carnet tenu à jour. Ici, un
 /// magasin refait ne donnerait pas les mêmes vecteurs qu'un magasin suivi, et rien ne le dirait.
-fn advance(store: &Store, model: &impl Encoder, progress: &Progress) -> Result<Stats> {
+fn advance(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+) -> Result<Stats> {
     let mut stats = Stats::default();
     let parser = mail_parser::MessageParser::default();
     let mut writer = VectorWriter::open(store.vectors_path(), model.dim())?;
@@ -236,9 +261,12 @@ fn advance(store: &Store, model: &impl Encoder, progress: &Progress) -> Result<S
             };
 
             let text = match parser.parse(&raw) {
-                Some(parsed) => {
-                    crate::text::from_message(&parsed, &row.subject, row.from_name.as_deref())
-                }
+                Some(parsed) => crate::text::from_message(
+                    &parsed,
+                    &row.subject,
+                    row.from_name.as_deref(),
+                    budget,
+                ),
                 // En-têtes illisibles : on vectorise sur ce que SQLite sait déjà. Un message
                 // introuvable serait pire qu'un message mal placé.
                 None => crate::text::compose(&row.subject, row.from_name.as_deref(), ""),
@@ -329,17 +357,22 @@ mod tests {
 
     use crate::testing::corpus;
 
+    /// Le budget par défaut : ces tests portent sur la boucle, pas sur la longueur du texte.
+    fn budget() -> crate::text::Budget {
+        crate::text::Budget::default()
+    }
+
     #[test]
     fn a_pass_vectorises_everything_and_the_second_has_nothing_to_do() {
         let (_dir, store) = corpus(7);
         let fake = Fake::new(8);
         let progress = Progress::new();
 
-        let first = update_with(&store, &fake, &progress).unwrap();
+        let first = update_with(&store, &fake, budget(), &progress).unwrap();
         assert_eq!(first.vectorised, 7);
         assert_eq!(store.unvectorised_total().unwrap(), 0);
 
-        let again = update_with(&store, &fake, &progress).unwrap();
+        let again = update_with(&store, &fake, budget(), &progress).unwrap();
         assert_eq!(again.vectorised, 0, "la seconde passe a refait du travail");
         assert_eq!(
             Vectors::load(store.vectors_path(), 8).unwrap().len(),
@@ -360,12 +393,12 @@ mod tests {
 
         let progress = Progress::new();
         progress.cancel();
-        let stopped = update_with(&store, &fake, &progress).unwrap();
+        let stopped = update_with(&store, &fake, budget(), &progress).unwrap();
         assert_eq!(stopped.vectorised, 0);
         let done_first = fake.encoded.get();
 
         let progress = Progress::new();
-        let resumed = update_with(&store, &fake, &progress).unwrap();
+        let resumed = update_with(&store, &fake, budget(), &progress).unwrap();
         assert_eq!(resumed.vectorised, 4);
         assert_eq!(
             fake.encoded.get() - done_first,
@@ -385,9 +418,9 @@ mod tests {
         let fake = Fake::new(8);
         let progress = Progress::new();
 
-        update_with(&store, &fake, &progress).unwrap();
+        update_with(&store, &fake, budget(), &progress).unwrap();
         store.reset_vectorised().unwrap();
-        update_with(&store, &fake, &progress).unwrap();
+        update_with(&store, &fake, budget(), &progress).unwrap();
 
         assert_eq!(
             Vectors::load(store.vectors_path(), 8).unwrap().len(),
@@ -405,14 +438,14 @@ mod tests {
         let fake = Fake::new(8);
         let progress = Progress::new();
 
-        update_with(&store, &fake, &progress).unwrap();
+        update_with(&store, &fake, budget(), &progress).unwrap();
         std::fs::remove_file(store.vectors_path()).unwrap();
 
         // Le raccourci du `COUNT` ne se déclenche pas ici : `update_with` est appelée
         // directement, ce qui est le cas réel où le contrôle doit jouer — `update` ne
         // l'atteindrait qu'à l'arrivée d'un message, ce que le commentaire de `index::update`
         // avait déjà pesé.
-        let after = update_with(&store, &fake, &progress).unwrap();
+        let after = update_with(&store, &fake, budget(), &progress).unwrap();
         assert_eq!(after.vectorised, 3, "la divergence n'a pas été vue");
         assert_eq!(Vectors::load(store.vectors_path(), 8).unwrap().len(), 3);
     }
@@ -426,9 +459,9 @@ mod tests {
         let fake = Fake::new(8);
         let progress = Progress::new();
 
-        update_with(&store, &fake, &progress).unwrap();
+        update_with(&store, &fake, budget(), &progress).unwrap();
         let before = fake.encoded.get();
-        update_with(&store, &fake, &progress).unwrap();
+        update_with(&store, &fake, budget(), &progress).unwrap();
 
         assert_eq!(fake.encoded.get(), before, "le corpus a été revectorisé");
     }
@@ -439,8 +472,8 @@ mod tests {
         let fake = Fake::new(8);
         let progress = Progress::new();
 
-        update_with(&store, &fake, &progress).unwrap();
-        let redone = rebuild_with(&store, &fake, &progress).unwrap();
+        update_with(&store, &fake, budget(), &progress).unwrap();
+        let redone = rebuild_with(&store, &fake, budget(), &progress).unwrap();
 
         assert_eq!(redone.vectorised, 4);
         assert_eq!(Vectors::load(store.vectors_path(), 8).unwrap().len(), 4);
@@ -454,9 +487,9 @@ mod tests {
         let (_dir, store) = corpus(2);
         let progress = Progress::new();
 
-        update_with(&store, &Fake::new(8), &progress).unwrap();
+        update_with(&store, &Fake::new(8), budget(), &progress).unwrap();
         store.reset_vectorised().unwrap();
-        let found = update_with(&store, &Fake::new(16), &progress);
+        let found = update_with(&store, &Fake::new(16), budget(), &progress);
 
         assert!(found.is_err(), "un magasin de dimension 8 a accepté du 16");
     }

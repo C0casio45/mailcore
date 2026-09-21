@@ -31,12 +31,18 @@ pub fn run(
     store_root: Option<&Utf8PathBuf>,
     model: Option<&Utf8PathBuf>,
     rebuild: bool,
+    budget: Option<usize>,
 ) -> Result<()> {
     let root = crate::store_root(store_root)?;
     let store = Store::open(&root).with_context(|| format!("ouverture du store {root}"))?;
     let model = model
         .cloned()
         .unwrap_or_else(|| mailvec::model::default_dir(&root));
+
+    // Le budget de texte : combien de caractères du corps entrent dans le vecteur. Changer sa
+    // valeur change **tous** les vecteurs, donc il impose une reconstruction — c'est dit dans
+    // l'aide de --budget, et --rebuild est là pour ça.
+    let budget = budget.map_or_else(mailvec::text::Budget::default, mailvec::text::Budget::of);
 
     let pending = store.unvectorised_total().context("compte des messages")?;
     println!("Store              {root}");
@@ -58,9 +64,9 @@ pub fn run(
     let progress = Progress::new();
     let started = Instant::now();
     let stats = if rebuild {
-        mailvec::pass::rebuild(&store, &model, &progress)
+        mailvec::pass::rebuild(&store, &model, budget, &progress)
     } else {
-        mailvec::pass::update(&store, &model, &progress)
+        mailvec::pass::update(&store, &model, budget, &progress)
     };
 
     // Le modèle absent est le cas nominal d'une installation qui n'a pas fait l'étape, pas un

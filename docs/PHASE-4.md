@@ -85,7 +85,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, mesuré le 2026-09-21** sur les 73 658 messages. Les trois bras donnent **0,0 %** sur les 10 requêtes sans mot commun — plein texte, sémantique, hybride. Le sémantique ne trouve **que** ce qui partage un mot (5/12 là où il y en a un, 0/10 là où il n'y en a pas) : `potion-multilingual-128M` se comporte en apparieur lexical flou, pas en moteur de sens. La règle de fusion, elle, marche — voir le journal |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, mesuré le 2026-09-21** sur les 73 658 messages : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras. Le signal sémantique est pourtant réel — rang médian **1 992 sur 73 658**, dix-huit fois mieux que le hasard — mais il lui manque **deux ordres de grandeur**. Ni le budget de texte (balayé de 0 à 2 000) ni le réglage de fusion (K de 5 à 200) n'y changent quoi que ce soit. Seul point acquis : sur le sous-ensemble facile, la fusion bat ses deux bras — rang médian **30** contre 57 et 182 |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu le 2026-09-21** — `cargo xtask measure-vectors` sur les 73 658 messages : **339 s**, soit **217 messages/s**, 0 blob absent et 13 textes vides. Reprenable, drapeau par ligne (`SCHEMA_V14`) et écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
@@ -794,27 +794,72 @@ marche :
   en sémantique, et au **rang 2** après fusion. La règle de fusion fait exactement ce pour quoi
   elle a été écrite.
 
-#### Ce que le modèle fait réellement
+#### Ce que le modèle fait réellement — et la conclusion qu'il a d'abord fallu retirer
 
-Le motif est net, et il se lit en une ligne : **le sémantique ne trouve que ce qui partage un mot
-avec sa cible.** 5 sur 12 là où un mot est commun, **0 sur 10** là où il n'y en a pas. Autrement
-dit `potion-multilingual-128M` se comporte en **apparieur lexical flou** — un tantivy plus
-tolérant sur les formes — et pas en moteur de sens.
+Le motif visible est net : **le sémantique ne trouve dans les dix premiers que ce qui partage un
+mot avec sa cible.** 5 sur 12 là où un mot est commun, 0 sur 10 là où il n'y en a pas.
 
-Ce n'est pas surprenant après coup, et l'étape 3 l'avait à moitié écrit : un embedding statique
-est une **moyenne de vecteurs de tokens**, sans attention ni contexte. Il rapproche deux textes
-qui emploient les mêmes tokens ; il n'a aucun mécanisme pour rapprocher « dénoncé » de
-« signalement » ou « méditation » de « pleine conscience » — les deux cas français du
-sous-ensemble dur, tous deux ratés.
+La première version de ce journal en concluait que `potion-multilingual-128M` est un « apparieur
+lexical flou, pas un moteur de sens ». **C'était faux, et ça a été écrit avant d'avoir posé la
+question la moins chère** — la faute de méthode que le projet documente depuis le 2026-09-10, et
+qui consiste à conclure sur un composant sans être descendu d'un cran.
 
-#### La fusion n'est pas la limite, et c'est mesuré
+`cargo xtask model-probe` coûte une seconde et demande au modèle si des mots qu'un humain juge
+proches le sont pour lui :
 
-`K` a été balayé à 5, 20, 60 et 200 : **0,0 % sur le sous-ensemble dur à chaque valeur**. On ne
-fusionne pas un résultat que ni l'un ni l'autre n'a trouvé. Le réglage repris de la publication
-n'a donc pas été éprouvé faute d'avoir de la matière à régler — c'est à dire, et c'est différent
-de « il est bon ».
+| mot | proche | cos | témoin | cos | écart |
+|---|---|---:|---|---:|---:|
+| acheter | acquérir | 0,719 | dormir | 0,011 | **+0,709** |
+| clé de jeu | game key | 0,818 | parapluie | 0,087 | **+0,731** |
+| commentaires | comments | 0,759 | betterave | 0,012 | **+0,747** |
+| stockage en ligne | cloud storage | 0,376 | chaussure | −0,012 | +0,388 |
+| pleine conscience | méditation | 0,360 | plomberie | 0,012 | +0,349 |
+| facture | note à payer | 0,414 | bicyclette | 0,088 | +0,326 |
+| signalement | dénoncé | −0,041 | casserole | 0,082 | −0,123 |
 
-Un effet de bord, en revanche, est réel et mérite d'être noté avant qu'il morde : la fusion a
+Sept paires sur dix nettement séparées, écart moyen **+0,327**, et le passage d'une langue à
+l'autre marche **très bien** — ce qui démolit au passage l'explication « sept des dix ratés sont
+interlangues ». Le modèle porte du sens.
+
+#### Alors pourquoi 0 sur 10 : le signal est réel et deux cents fois trop faible
+
+Deux hypothèses ont été écartées par la mesure plutôt que par l'argument.
+
+**La dilution.** Un embedding statique est une moyenne ; une requête de six mots comparée à un
+document de quatre cents pouvait perdre son signal. Le budget de texte est donc devenu un
+paramètre, et il a été balayé — corps entier (2 000 caractères), 400, 150, et **0**, c'est-à-dire
+sujet et expéditeur seuls, exactement le régime court où la sonde marche. **0,0 % sur le
+sous-ensemble dur aux quatre valeurs.** La dilution n'explique rien.
+
+**La fusion.** `K` balayé à 5, 20, 60, 200 : 0,0 % partout. On ne fusionne pas un résultat que ni
+l'un ni l'autre n'a trouvé.
+
+Restait la question qu'aucun de ces relevés ne posait : **de combien la cible est-elle manquée ?**
+Un rappel binaire à dix confond « manquée de peu » et « pas du tout ». En demandant cinq mille
+résultats au lieu de cinquante :
+
+| sous-ensemble | plein texte | sémantique | hybride |
+|---|---:|---:|---:|
+| **aucun mot commun** — rang médian | absente | **1 992** | 2 412 |
+| au moins un mot commun — rang médian | 57 | 182 | **30** |
+
+**1 992 sur 73 658.** Le hasard donnerait 36 829 : le signal sémantique est **dix-huit fois
+meilleur que le hasard**, donc parfaitement réel — et il lui manque environ **deux ordres de
+grandeur** pour entrer dans dix résultats. C'est la formulation juste, et elle est très différente
+de « le modèle n'a pas de sens ».
+
+Et une chose que le rappel binaire cachait complètement : sur le sous-ensemble facile, **la fusion
+fait mieux que chacun de ses deux bras** — rang médian 30, contre 57 pour le plein texte et 182
+pour le sémantique. La règle de fusion n'est pas seulement correcte en théorie, elle gagne sur le
+corpus réel. C'est le seul résultat positif de l'étape, et il aurait été perdu sans le rang
+médian.
+
+#### L'effet de bord de la fusion, à noter avant qu'il morde
+
+Le réglage `K` repris de la publication n'a pas été éprouvé, faute d'avoir eu de la matière à
+régler sur le sous-ensemble dur — c'est à dire, et c'est différent de « il est bon ».
+
+Un effet de bord, en revanche, est réel : la fusion a
 **dégradé** une requête, « l'achat qui m'attend en boutique », du rang 8 au rang 16. C'est le
 défaut connu de RRF quand une des listes est du bruit — un document trouvé premier par le bruit
 (`1/61`) bat un document trouvé huitième par le bon moteur (`1/68`). Le remède est un poids par
@@ -837,15 +882,34 @@ sans quoi un futur modèle sera jugé sur un mélange que personne n'a choisi.
 #### Ce que ce non autorise
 
 L'étape 3 avait choisi le modèle le moins cher qui pouvait marcher — la règle du projet. Il ne
-marche pas, et **c'est maintenant mesuré plutôt que supposé**. Ce qui rend la suite abordable est
-le relevé de l'étape 5 : le modèle pèse **4 % du coût de la passe**, le reste étant la relecture
-des blobs et l'assainissement. Un modèle **trente fois plus lent** ferait donc passer la passe
-complète de six à douze minutes, une fois.
+suffit pas, et **c'est maintenant mesuré plutôt que supposé** : il manque deux ordres de grandeur,
+pas un réglage.
 
-C'est le prix d'un vrai transformeur — `candle` plus `multilingual-e5-small`, l'autre branche
-écartée le 2026-09-15. La décision de la prendre n'est plus un pari : elle est payée par deux
-mesures, l'une qui dit que l'actuel ne suffit pas, l'autre qui dit que le remplacer ne coûte
-presque rien là où on croyait que ça coûterait tout.
+Ce qui rend la suite abordable est le relevé de l'étape 5 : le modèle pèse **4 % du coût de la
+passe**, le reste étant la relecture des blobs et l'assainissement. Un modèle **trente fois plus
+lent** ferait donc passer la passe complète de six à douze minutes, une fois. C'est le prix d'un
+vrai transformeur — `candle` plus `multilingual-e5-small`, l'autre branche écartée le 2026-09-15.
+La décision de la prendre n'est plus un pari : elle est payée par deux mesures, l'une qui dit de
+combien l'actuel manque, l'autre qui dit que le remplacer ne coûte presque rien là où on croyait
+que ça coûterait tout.
+
+#### La leçon de méthode, qui vaut plus que le résultat
+
+**Trois hypothèses ont été formulées, et les deux premières étaient fausses.** Le modèle n'est pas
+dépourvu de sens — la sonde le montre. La dilution n'explique rien — le balayage du budget le
+montre. Aucune des deux n'aurait été écartée par un argument, et la première avait déjà été écrite
+dans ce journal et dans un message de commit avant d'être vérifiée.
+
+Ce qui a fini par trancher n'est pas une hypothèse de plus mais un **changement d'échelle de la
+mesure** : demander cinq mille résultats au lieu de cinquante. Un rappel binaire à dix confond
+« manquée de peu » et « pas du tout », et tant qu'on ne regardait que lui, toutes les causes
+avaient la même signature. La règle à en tirer : **un indicateur qui écrase un continuum en
+oui/non ne diagnostique rien** — il faut lui adjoindre la grandeur qu'il a écrasée, ici le rang.
+
+C'est la troisième fois de la phase que la question la moins chère aurait dû passer en premier :
+quatre cents octets d'en-tête avant un téléchargement de 530 Mo le 2026-09-15, un `COUNT` avant
+l'ouverture d'un index le 2026-09-11, une seconde de sonde avant une journée de conclusions
+aujourd'hui.
 
 Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` — **1 403 tests verts**, dont 10 sur la règle de fusion et 5 sur la

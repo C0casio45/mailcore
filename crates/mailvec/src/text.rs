@@ -52,6 +52,33 @@ use mailhtml::blocks::Kind;
 /// est la signature d'un réglage qui a un optimum et pas une monotonie.
 pub const BUDGET: usize = 2_000;
 
+/// Ce qu'on garde d'un message, et jusqu'où.
+///
+/// Un paramètre et non une constante depuis le 2026-09-21 : le relevé du critère 1 a rendu 0 %
+/// sur le sous-ensemble dur alors que le modèle sépare très bien des paires de mots — y compris
+/// d'une langue à l'autre. L'écart entre les deux pointe la **dilution** : une moyenne de quatre
+/// cents vecteurs de tokens ne ressemble plus à personne. On ne le saura qu'en faisant varier le
+/// budget, donc le budget varie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Budget {
+    /// Combien de caractères du corps entrent dans le vecteur. Zéro veut dire « pas de corps ».
+    pub body: usize,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self { body: BUDGET }
+    }
+}
+
+impl Budget {
+    /// Un budget de corps donné.
+    #[must_use]
+    pub const fn of(body: usize) -> Self {
+        Self { body }
+    }
+}
+
 /// Le texte d'un message, prêt pour le modèle.
 ///
 /// L'ordre est délibéré : le sujet d'abord, puis l'expéditeur, puis le corps. Il ne change rien
@@ -114,6 +141,7 @@ pub fn from_message(
     parsed: &mail_parser::Message<'_>,
     subject: &str,
     from_name: Option<&str>,
+    budget: Budget,
 ) -> String {
     let mut html = String::new();
     for id in &parsed.html_body {
@@ -125,7 +153,7 @@ pub fn from_message(
             _ => {}
         }
     }
-    compose(subject, from_name, &body(&html))
+    compose(subject, from_name, &body(&html, budget))
 }
 
 /// Le corps d'un message, cité retiré et tronqué au budget.
@@ -155,7 +183,7 @@ pub fn from_message(
 /// et non par la vigilance — étant entendu que ce module ne va de toute façon chercher aucune
 /// ressource, [`mailhtml::blocks`] ne sachant pas le faire.
 #[must_use]
-pub fn body(html: &str) -> String {
+pub fn body(html: &str, budget: Budget) -> String {
     let cleaned = mailhtml::sanitize::clean(html, mailhtml::Policy::default());
     let blocks = mailhtml::blocks::blocks(&cleaned.html);
 
@@ -172,14 +200,14 @@ pub fn body(html: &str) -> String {
         } else {
             &mut own
         };
-        if target.len() >= BUDGET {
+        if target.len() >= budget.body {
             continue;
         }
         push_block(target, &block.text());
     }
 
     let chosen = if own.trim().is_empty() { quoted } else { own };
-    truncate(chosen)
+    truncate(chosen, budget.body)
 }
 
 /// Ajoute le texte d'un bloc, séparé par une espace.
@@ -199,11 +227,11 @@ fn push_block(out: &mut String, text: &str) {
 /// La frontière n'est pas une élégance : `String::truncate` **panique** au milieu d'un caractère
 /// multioctet, et « à », « é », « ç » en sont. Sur un corpus français, couper à l'aveugle
 /// planterait la passe sur une bonne partie du corpus.
-fn truncate(mut text: String) -> String {
-    if text.len() <= BUDGET {
+fn truncate(mut text: String, budget: usize) -> String {
+    if text.len() <= budget {
         return text;
     }
-    let mut cut = BUDGET;
+    let mut cut = budget;
     while cut > 0 && !text.is_char_boundary(cut) {
         cut -= 1;
     }
@@ -235,7 +263,12 @@ mod tests {
                     > Cordialement.\r\n";
         let parser = mail_parser::MessageParser::default();
         let parsed = parser.parse(raw.as_slice()).unwrap();
-        let found = from_message(&parsed, "Re: chaudiere", Some("Plomberie Martin"));
+        let found = from_message(
+            &parsed,
+            "Re: chaudiere",
+            Some("Plomberie Martin"),
+            Budget::default(),
+        );
 
         assert!(
             found.contains("Bien recu"),
@@ -258,7 +291,7 @@ mod tests {
                     Voici le devis pour la chaudiere.\r\n";
         let parser = mail_parser::MessageParser::default();
         let parsed = parser.parse(raw.as_slice()).unwrap();
-        let found = from_message(&parsed, "chaudiere", None);
+        let found = from_message(&parsed, "chaudiere", None, Budget::default());
         assert!(
             found.contains("devis"),
             "le texte légitime a disparu : {found}"
@@ -269,7 +302,7 @@ mod tests {
     fn a_quote_does_not_enter_the_vector() {
         let html = "<p>Bien reçu, merci.</p><blockquote><p>Voici le devis pour la \
                     chaudière.</p></blockquote>";
-        let found = body(html);
+        let found = body(html, Budget::default());
         assert!(found.contains("Bien reçu"));
         assert!(
             !found.contains("chaudière"),
@@ -282,13 +315,13 @@ mod tests {
     #[test]
     fn what_is_not_a_quote_stays() {
         let html = "<p>Voici le devis pour la chaudière.</p>";
-        assert!(body(html).contains("chaudière"));
+        assert!(body(html, Budget::default()).contains("chaudière"));
     }
 
     #[test]
     fn a_message_that_is_only_a_quote_keeps_it_rather_than_vanishing() {
         let html = "<blockquote><p>Voici le devis pour la chaudière.</p></blockquote>";
-        let found = body(html);
+        let found = body(html, Budget::default());
         assert!(
             found.contains("chaudière"),
             "un transfert sans commentaire a produit un texte vide : {found:?}"
@@ -299,7 +332,7 @@ mod tests {
     fn nested_quotes_are_dropped_at_every_depth() {
         let html = "<p>ok</p><blockquote><p>alpha</p><blockquote><p>beta</p></blockquote>\
                     </blockquote>";
-        let found = body(html);
+        let found = body(html, Budget::default());
         assert!(!found.contains("alpha"));
         assert!(!found.contains("beta"));
     }
@@ -307,7 +340,7 @@ mod tests {
     #[test]
     fn a_long_body_is_cut_at_the_budget() {
         let html = format!("<p>{}</p>", "mot ".repeat(BUDGET));
-        assert!(body(&html).len() <= BUDGET);
+        assert!(body(&html, Budget::default()).len() <= BUDGET);
     }
 
     /// Le cas qui fait paniquer `truncate` si la frontière n'est pas cherchée. « é » fait deux
@@ -315,15 +348,15 @@ mod tests {
     #[test]
     fn cutting_in_the_middle_of_an_accent_does_not_panic() {
         let html = format!("<p>{}</p>", "é".repeat(BUDGET));
-        let found = body(&html);
+        let found = body(&html, Budget::default());
         assert!(found.len() <= BUDGET);
         assert!(found.ends_with('é'));
     }
 
     #[test]
     fn an_empty_body_gives_an_empty_text() {
-        assert!(body("").is_empty());
-        assert!(body("<p>   </p>").trim().is_empty());
+        assert!(body("", Budget::default()).is_empty());
+        assert!(body("<p>   </p>", Budget::default()).trim().is_empty());
     }
 
     #[test]
@@ -361,10 +394,10 @@ mod tests {
             "<<<>>><p",
         ];
         for case in cases {
-            let _ = body(case);
+            let _ = body(case, Budget::default());
         }
         assert!(
-            body("<script>secret</script><p>visible</p>").contains("visible"),
+            body("<script>secret</script><p>visible</p>", Budget::default()).contains("visible"),
             "le texte légitime a disparu avec le script"
         );
     }
