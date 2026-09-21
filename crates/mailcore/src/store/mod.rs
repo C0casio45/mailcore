@@ -73,6 +73,17 @@ impl Store {
         self.root.join("search")
     }
 
+    /// Le fichier du magasin de vecteurs.
+    ///
+    /// Un fichier et non un répertoire : le format est plat et en ajout seul, voir
+    /// [`crate::vectors`]. Il vit à côté de l'index tantivy parce qu'il a la même nature — un
+    /// dérivé reconstructible depuis les blobs, dont la perte coûte une passe et jamais une
+    /// donnée.
+    #[must_use]
+    pub fn vectors_path(&self) -> Utf8PathBuf {
+        self.root.join("vectors.bin")
+    }
+
     /// L'accès aux blobs, derrière le trait — les appelants n'ont pas à savoir que c'est le
     /// système de fichiers.
     #[must_use]

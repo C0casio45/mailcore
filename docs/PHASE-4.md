@@ -86,7 +86,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 | # | Critère | Seuil | État |
 |---|---|---|---|
 | 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **référence mesurée le 2026-09-15** — 22 requêtes écrites sur le corpus réel, `cargo xtask measure-recall`. Tantivy seul : **0,0 %** sur les 10 requêtes sans mot commun, **58,3 %** sur les 12 autres, **31,8 %** sur le jeu entier. Le moteur reste à écrire |
-| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | à faire |
+| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | à faire |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
 | 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | à faire |
@@ -118,9 +118,11 @@ utilisable.
    modèle multilingue, parce que le corpus est français — voir les pièges. Rien n'est indexé à
    cette étape : on mesure le moteur, pas le résultat.
 
-4. **Le magasin de vecteurs et le balayage.** Le critère 2 se mesure ici, sur des vecteurs
-   aléatoires s'il le faut : la latence d'un balayage ne dépend pas de ce que les nombres veulent
-   dire.
+4. ~~**Le magasin de vecteurs et le balayage.**~~ Fait le 2026-09-21 : `mailcore::vectors`, un
+   fichier plat en ajout seul, et `cargo xtask measure-scan`. La latence d'un balayage ne dépend
+   pas de ce que les nombres veulent dire, donc le banc tourne sur des vecteurs fabriqués et
+   n'attend pas le moteur. **6,2 ms de p95**, et le pire cas du tas borné à 10,2. Voir le
+   journal.
 
 5. **La passe complète et sa reprise** — critères 3 et 5.
 
@@ -509,3 +511,86 @@ un accès indirect, pas en ajouter. Le dire vaut mieux que de ne relever que ce 
 Ce que l'étape 3 laisse pour la suite : le modèle est choisi, mesuré, et tient dans le budget.
 Reste à écrire le magasin de vecteurs — étape 4 — dont la taille est déjà connue, puisqu'elle ne
 dépend que du nombre de messages et de la dimension : **73 658 × 256 × 4 octets, soit 72 Mio**.
+
+### 2026-09-21 — le balayage tient en 6 ms, et le banc a failli chronométrer le mauvais binaire
+
+L'étape 4 : `mailcore::vectors`, un magasin et un balayage, plus `cargo xtask measure-scan`. Les
+deux se mesurent **avant** qu'un seul vrai vecteur existe, parce qu'un produit scalaire coûte le
+même prix sur un vecteur qui décrit un message et sur un vecteur tiré au sort.
+
+#### Le format : ni SQLite, ni un index approché
+
+Un fichier plat, `MAILVEC1`, seize octets d'en-tête et un record de `8 + 4×dim` par message.
+
+**Pas SQLite**, parce que le balayage veut les octets contigus : une colonne `BLOB` ferait 73 658
+lectures de lignes par requête, et la comparaison n'a besoin d'aucune des garanties
+transactionnelles qu'on paierait. **Pas de HNSW** non plus — la phase l'a refusé tant qu'un
+balayage complet n'aura pas été montré insuffisant, et le relevé plus bas dit qu'il ne l'est pas.
+
+Il est **ajout seul**, et c'est ce qui rend l'ordre des écritures sûr. Un message vectorisé deux
+fois écrit deux records ; la relecture garde le dernier, donc l'écriture est **idempotente**, donc
+« vecteur durable **puis** drapeau posé » se coupe sans conséquence. C'est la leçon du 2026-09-11
+sur l'index plein texte, réemployée telle quelle. Corollaire à l'autre bout : un processus tué au
+milieu d'une écriture laisse une queue partielle, et la réouverture se replace **sur une frontière
+de record** plutôt que de faire du record suivant un décalage de quatre octets.
+
+#### Le piège du profil de débogage, que les bancs voisins n'avaient pas
+
+C'est la vraie leçon de l'étape, et elle ne parle pas de vecteurs.
+
+`measure-search` chronomètre tantivy ; `model-bench` chronomètre `model2vec-rs`. Ce sont des
+**dépendances**, donc le `[profile.dev.package."*"]` du `Cargo.toml` racine les optimise même en
+débogage, et les lancer par `cargo xtask` donne des chiffres justes. Le balayage, lui, vit dans
+`mailcore`, qui est un **membre de l'espace de travail** — que cette ligne ne couvre pas. Le même
+geste, sur le banc d'à côté, aurait rendu un p95 sans rapport avec le binaire livré, et **rien
+dans la sortie ne l'aurait dit**.
+
+`measure-scan` refuse donc de tourner en débogage, au lieu d'avertir : un relevé imprimé finit
+recopié. De combien le chiffre faux se serait écarté, on ne le saura pas — le refus a été écrit
+avant d'avoir relevé la valeur fausse, et aller la chercher maintenant demanderait de retirer le
+garde-fou.
+
+#### Le pire cas du tas borné valait d'être fabriqué
+
+Le tas écarte un message dès que son score passe sous le pire des retenus. Cette porte est franchie
+d'autant plus souvent que les scores arrivent en ordre croissant — ce qui n'arrive jamais par
+hasard, donc jamais sur des vecteurs tirés au sort. Le banc fabrique ce cas : un arc du plan porté
+par les deux premiers axes, dont le cosinus à la requête croît strictement avec le rang.
+
+Il coûte **1,6 fois** le cas ordinaire. Un banc qui ne l'aurait pas fabriqué aurait publié le
+chiffre flatteur, et la marge réelle serait restée inconnue jusqu'au jour où un corpus la
+révélerait.
+
+#### Le relevé
+
+Quatre exécutions, la première jetée, `xtask.exe` en release, 73 658 vecteurs de dimension 256 :
+
+| | p95 épars | p95 croissant |
+|---|---:|---:|
+| exécution 2 | 6,14 ms | 8,95 ms |
+| exécution 3 | 5,93 ms | 9,88 ms |
+| exécution 4 | 6,17 ms | 10,20 ms |
+
+La dispersion se lit avant la médiane, et elle est de 4 % sur le cas ordinaire : le relevé est
+sain. Reste une anomalie qu'on ne cache pas — la **première** exécution a rendu un RSS de 92,5 Mio
+contre 81 à 82 pour les trois autres, pendant que ses latences, elles, ne bougeaient pas. Elle
+n'est pas expliquée ; elle est jetée, ce qui est exactement ce à quoi la règle sert.
+
+Sur la mémoire : **82 Mio de RSS pour un fichier de 72,5** — une dizaine de mébioctets au-dessus
+des octets eux-mêmes. Ce qu'on peut en dire du critère 5 est une **addition et pas une mesure** :
+le modèle taillé pèse 71,8 Mio, donc un processus qui ferait les deux tiendrait autour de 154, soit
+trois fois sous le seuil. Ça se mesurera à l'étape 5, sur le vrai processus.
+
+#### Ce que le critère 2 attend encore
+
+Le banc mesure le **balayage**, pas le trajet. 6,2 ms des 50 accordées, il en reste 44 pour
+l'encodage de la requête — 0,17 ms mesuré à l'étape 3 — et pour l'aller-retour JSON-RPC, que
+`measure-api` sait déjà chiffrer. Le bout en bout se relèvera à l'étape 8, quand il y aura une
+méthode à appeler ; d'ici là, le critère est **en bonne voie et pas tenu**, et le tableau le dit
+dans ces termes.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 353 tests verts**, dont 17 neufs sur le magasin : le record coupé en
+deux, le magasin d'une autre dimension refusé des deux côtés, le vecteur écrit deux fois qui n'en
+laisse qu'un, la limite qui garde les meilleurs et non les premiers vus, et le message dont aucun
+token n'est connu qui rend des zéros et non des `NaN`.

@@ -24,6 +24,7 @@ mod model;
 mod profile;
 mod recall;
 mod replies;
+mod scan;
 mod schema;
 mod secrets;
 mod ui;
@@ -306,6 +307,31 @@ enum Command {
         limit: usize,
     },
 
+    /// Mesure le critère 2 de la phase 4 : la latence d'un balayage vectoriel complet.
+    ///
+    /// Sur des vecteurs **fabriqués**, et c'est tout l'intérêt : un produit scalaire coûte le
+    /// même prix sur un vecteur qui décrit un message et sur un vecteur tiré au sort, donc le
+    /// banc tourne **avant** la première passe de vectorisation. On saura si un balayage
+    /// complet tient le budget avant d'avoir écrit le moteur qui le remplirait.
+    ///
+    /// **Aucun `--store`** : elle écrit, donc elle crée son propre répertoire jetable — la
+    /// règle laissée par `measure-attachment`, qui a été visée sur les données de production.
+    MeasureScan {
+        /// Combien de messages fabriquer. Par défaut, la taille du corpus réel.
+        #[arg(long, default_value_t = 73_658)]
+        messages: usize,
+        /// La dimension des vecteurs. Par défaut, celle de `potion-multilingual-128M`.
+        #[arg(long, default_value_t = 256)]
+        dim: usize,
+        /// Combien de résultats garder par requête, donc la taille du tas borné.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Combien de requêtes chronométrer. Le p95 du critère demande d'en avoir assez pour
+        /// que le rang 95 % veuille dire quelque chose.
+        #[arg(long, default_value_t = 200)]
+        queries: usize,
+    },
+
     /// Sort un échantillon de messages réels, étalé sur toute la période du corpus.
     ///
     /// Sert l'étape 1 de `docs/PHASE-4.md` : écrire des requêtes en français avec la réponse
@@ -521,6 +547,12 @@ fn main() -> Result<()> {
             queries,
             limit,
         } => recall::measure(&store, &queries, limit),
+        Command::MeasureScan {
+            messages,
+            dim,
+            limit,
+            queries,
+        } => scan::measure(messages, dim, limit, queries),
         Command::CorpusSample {
             store,
             count,

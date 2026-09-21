@@ -313,7 +313,7 @@ fn ratio(before: usize, after: usize) -> f64 {
 }
 
 /// Des octets en mébioctets, parce que c'est l'unité du critère.
-fn mib(bytes: usize) -> String {
+pub(crate) fn mib(bytes: usize) -> String {
     #[allow(clippy::cast_precision_loss)]
     {
         format!("{:.1} Mio", bytes as f64 / (1024.0 * 1024.0))
@@ -546,7 +546,7 @@ pub fn bench(
 }
 
 /// La mémoire résidente du processus, maintenant.
-fn current_rss() -> u64 {
+pub(crate) fn current_rss() -> u64 {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = Pid::from_u32(std::process::id());
     let mut system = System::new();

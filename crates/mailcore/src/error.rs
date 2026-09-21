@@ -118,6 +118,34 @@ pub enum Error {
         reason: String,
     },
 
+    /// Le magasin de vecteurs ne porte pas l'en-tête attendu.
+    ///
+    /// Refusé plutôt que deviné, et c'est le même raisonnement que [`Error::UnknownSecurity`]
+    /// transposé : un magasin lu avec la mauvaise dimension ou le mauvais format rendrait des
+    /// vecteurs de la bonne **taille** et du mauvais **sens**. La recherche marcherait, et ses
+    /// résultats seraient du bruit qu'on mettrait sur le compte du modèle.
+    #[error("magasin de vecteurs illisible ({path}) : {reason}")]
+    VectorFormat {
+        /// Le fichier fautif.
+        path: camino::Utf8PathBuf,
+        /// Ce qui ne va pas, en clair.
+        reason: String,
+    },
+
+    /// Un vecteur n'a pas la dimension du magasin.
+    ///
+    /// Le cas réel est un modèle changé sans refaire la passe complète. Comparer les deux ne
+    /// planterait pas : il suffirait de s'arrêter au plus court. C'est exactement pour ça que
+    /// c'est une erreur — un classement calculé sur deux modèles différents n'a aucun sens et
+    /// n'a aucun symptôme.
+    #[error("vecteur de dimension {found}, attendu {expected}")]
+    VectorDim {
+        /// La dimension du magasin.
+        expected: usize,
+        /// Celle du vecteur présenté.
+        found: usize,
+    },
+
     /// La mise en forme rangée d'une valeur a échoué à l'**écriture**.
     ///
     /// Le seul usage est la signature d'un compte, sérialisée avant d'aller dans sa colonne.

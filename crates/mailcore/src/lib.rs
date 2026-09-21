@@ -20,6 +20,7 @@ pub mod query;
 pub mod source;
 pub mod store;
 pub mod thread;
+pub mod vectors;
 
 pub use error::{Error, Result};
 pub use model::{

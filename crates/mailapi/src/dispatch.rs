@@ -733,6 +733,17 @@ fn opaque(source: mailcore::Error) -> Error {
         mailcore::Error::CorruptRow { .. } | mailcore::Error::UnknownSendState { .. } => {
             "une ligne du store n'est pas exploitable"
         }
+        // Les deux magasins dérivés ne s'accordent plus : format, version ou dimension. Le
+        // chemin du fichier et la dimension du modèle restent ici pour la raison qui vaut
+        // pour tout le reste de cette fonction — ils décrivent l'installation de quelqu'un.
+        //
+        // Le message ne dit pas quoi faire, et c'est voulu : la seule réponse juste est une
+        // passe complète, qui appartient à qui tient le démon et non au client qui a cherché.
+        // Nommer un geste qu'aucune méthode de l'API ne réalise serait le critère 8 de la
+        // phase 3 pris à l'envers.
+        mailcore::Error::VectorFormat { .. } | mailcore::Error::VectorDim { .. } => {
+            "le magasin de vecteurs n'est pas exploitable"
+        }
         // Une valeur refusée par la mise en forme rangée, à l'écriture. Le sens inverse est
         // toléré par le store, donc ce chemin ne se rencontre pas en lecture.
         mailcore::Error::Unserialisable { .. } => "une valeur n'a pas pu être enregistrée",
