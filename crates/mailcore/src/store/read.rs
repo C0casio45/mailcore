@@ -59,6 +59,36 @@ pub struct IndexRow {
     pub folders: String,
 }
 
+/// Ce dont la passe de vectorisation a besoin pour un message.
+///
+/// ## Pourquoi elle n'est pas [`IndexRow`]
+///
+/// Deux champs de moins, et c'est le point : l'index plein texte joint les **dossiers** de chaque
+/// message, ce qui coûte un `LEFT JOIN` et un `GROUP BY` sur 73 000 lignes. Un embedding ne sait
+/// rien faire d'un chemin de dossier — « Archives/2019 » n'est pas du sens, c'est un rangement —
+/// donc le payer serait payer pour rien. La date non plus n'entre pas dans le vecteur : la
+/// recherche sémantique rend un classement de proximité, et le filtre temporel — « de l'an
+/// dernier » — appartient à la requête, pas au sens du message.
+///
+/// Ce qui reste est ce qui porte du sens et tient dans la fenêtre du modèle : le sujet, le nom de
+/// l'expéditeur, et de quoi aller relire le corps.
+#[derive(Debug, Clone)]
+pub struct VectorRow {
+    /// Identifiant interne.
+    pub id: MessageId,
+    /// L'identité du contenu, pour aller relire le corps.
+    pub blob: BlobHash,
+    /// Sujet décodé.
+    pub subject: String,
+    /// Nom affiché de l'expéditeur, s'il en a un.
+    ///
+    /// Le nom et non l'adresse : « Plomberie Martin » est du langage, `contact@pm-92.fr` est un
+    /// identifiant. Une adresse découpée en tokens par un modèle multilingue produit du bruit
+    /// qui dilue la moyenne du message — c'est exactement ce que la fenêtre courte interdit de
+    /// se permettre.
+    pub from_name: Option<String>,
+}
+
 /// Ce dont la passe de threading a besoin pour un message.
 #[derive(Debug, Clone)]
 pub struct ThreadRow {
@@ -314,6 +344,99 @@ impl Store {
     pub fn reset_indexed(&self) -> Result<()> {
         self.connection()
             .execute("UPDATE messages SET indexed = 0", [])?;
+        Ok(())
+    }
+
+    /// Les messages qui n'ont pas encore de vecteur, au plus `limit`.
+    ///
+    /// Même forme que [`Self::unindexed`], sans la jointure des dossiers — voir [`VectorRow`].
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn unvectorised(&self, limit: usize) -> Result<Vec<VectorRow>> {
+        let mut statement = self.connection().prepare_cached(
+            "SELECT id, blob_hash, subject, from_name
+             FROM messages
+             WHERE vectorised = 0
+             ORDER BY id
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], vector_row)?;
+        collect(rows)
+    }
+
+    /// Combien de messages restent à vectoriser.
+    ///
+    /// La question la moins chère de la passe, et celle qui doit passer en premier : un `COUNT`
+    /// sur colonne indexée coûte des microsecondes, là où charger le modèle en coûte cinquante
+    /// millions. C'est la leçon du 2026-09-11 sur la passe d'index à vide, appliquée avant
+    /// d'avoir le défaut.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn unvectorised_total(&self) -> Result<u64> {
+        let count: i64 = self.connection().query_row(
+            "SELECT COUNT(*) FROM messages WHERE vectorised = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Combien de messages se disent vectorisés.
+    ///
+    /// Sert le contrôle de cohérence entre les deux magasins — critère 9 de `docs/PHASE-4.md` :
+    /// un magasin de vecteurs vide alors que des messages se disent vectorisés veut dire que le
+    /// fichier a disparu sous les pieds du store. Voir `SCHEMA_V14`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn vectorised_count(&self) -> Result<u64> {
+        let count: i64 = self.connection().query_row(
+            "SELECT COUNT(*) FROM messages WHERE vectorised = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Marque des messages comme vectorisés.
+    ///
+    /// **À n'appeler qu'après que les vecteurs sont sur le disque** — `VectorWriter::sync`. Le
+    /// même ordre que [`Self::mark_indexed`], et il est sûr pour la même raison : le magasin est
+    /// en ajout seul et sa relecture garde le dernier record d'un message, donc revectoriser ne
+    /// fait rien. L'ordre inverse laisserait un message sans vecteur, marqué comme en ayant un,
+    /// et il ne sortirait plus jamais d'une recherche sémantique.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn mark_vectorised(&self, ids: &[MessageId]) -> Result<()> {
+        let tx = self.connection().unchecked_transaction()?;
+        {
+            let mut statement =
+                tx.prepare_cached("UPDATE messages SET vectorised = 1 WHERE id = ?1")?;
+            for id in ids {
+                statement.execute([id.0])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remet tous les messages à « pas encore vectorisé ».
+    ///
+    /// Le premier pas d'une passe complète, et le remède quand le magasin a été perdu ou refusé.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn reset_vectorised(&self) -> Result<()> {
+        self.connection()
+            .execute("UPDATE messages SET vectorised = 0", [])?;
         Ok(())
     }
 
@@ -1117,6 +1240,22 @@ fn index_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRow> {
         from_name: row.get(4)?,
         date: row.get(5)?,
         folders: row.get(6)?,
+    })
+}
+
+/// Lit une ligne de vectorisation.
+///
+/// Un seul appelant aujourd'hui — `unvectorised` —, mais il est écrit à part pour la raison que
+/// le mappeur d'indexation a apprise : le jour où une passe complète voudra sa propre requête,
+/// elle devra produire **la même ligne**, et deux mappeurs recopiés divergent au premier champ
+/// ajouté.
+fn vector_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VectorRow> {
+    let hash: Vec<u8> = row.get(1)?;
+    Ok(VectorRow {
+        id: MessageId(row.get(0)?),
+        blob: blob_hash(&hash),
+        subject: row.get(2)?,
+        from_name: row.get(3)?,
     })
 }
 

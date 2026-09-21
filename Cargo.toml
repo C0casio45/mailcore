@@ -25,6 +25,7 @@ members = [
     "crates/mailauth",
     "crates/mailsmtp",
     "crates/mailcal",
+    "crates/mailvec",
     "xtask",
 ]
 resolver = "3"
@@ -51,6 +52,7 @@ mailsync   = { path = "crates/mailsync" }
 mailauth   = { path = "crates/mailauth" }
 mailsmtp   = { path = "crates/mailsmtp" }
 mailcal    = { path = "crates/mailcal" }
+mailvec    = { path = "crates/mailvec" }
 
 # --- coeur : stockage, index, parsing ---
 blake3      = "1.8"

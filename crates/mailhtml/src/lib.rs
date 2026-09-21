@@ -19,6 +19,7 @@
 
 pub mod blocks;
 pub mod csp;
+pub mod plain;
 pub mod rich;
 pub mod sanitize;
 pub mod text;

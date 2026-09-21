@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// La version de schéma que ce binaire sait lire et écrire.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Le schéma initial.
 ///
@@ -687,6 +687,37 @@ CREATE INDEX messages_without_thread_facts ON messages (id)
     WHERE thread_link IS NULL AND thread_id IS NOT NULL;
 ";
 
+/// v14 — `messages.vectorised` : la passe de vectorisation peut reprendre où elle en était.
+///
+/// La même forme que [`SCHEMA_V12`], et pour une raison plus forte : l'index plein texte se
+/// refait en quelques minutes, la vectorisation du corpus entier est une passe qu'on ne veut pas
+/// recommencer parce qu'une mise à jour a redémarré la machine. Le critère 3 de
+/// `docs/PHASE-4.md` l'exige explicitement — « tuée au milieu, elle repart où elle en était ».
+///
+/// ## Le même piège à deux magasins que l'index, et le même endroit pour le voir
+///
+/// Le drapeau est dans SQLite, les vecteurs dans `vectors.bin`. Ils se contredisent quand le
+/// fichier disparaît — disque remplacé, répertoire nettoyé — ou quand il est refusé à
+/// l'ouverture parce qu'il porte une autre dimension. Des drapeaux qui disent « vectorisé »
+/// feraient alors sauter tous les messages, et la recherche sémantique resterait vide **pour
+/// toujours** sans que rien ne le signale. C'est le critère 9, et le contrôle vit au point
+/// d'usage — `mailvec::pass::update` — jamais à l'ouverture du magasin, qui sert aussi les
+/// chemins de lecture.
+///
+/// ## Pourquoi un drapeau et pas le magasin lui-même
+///
+/// Le magasin sait quels identifiants il porte : on pourrait s'en servir comme registre et se
+/// passer de colonne. Deux raisons de ne pas le faire. Il faudrait le relire en entier — 72 Mio
+/// — pour répondre à « reste-t-il du travail ? », là où un `COUNT` sur colonne indexée coûte des
+/// microsecondes, et c'est la leçon du 2026-09-11 sur la passe d'index à vide. Et un vecteur
+/// écrit mais pas encore validé sur le disque serait compté comme fait : le drapeau posé
+/// **après** la synchronisation est ce qui rend l'ordre honnête.
+const SCHEMA_V14: &str = r"
+ALTER TABLE messages ADD COLUMN vectorised INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_messages_unvectorised
+    ON messages(vectorised) WHERE vectorised = 0;
+";
+
 /// Applique les migrations manquantes.
 ///
 /// Sans effet si le store est déjà à jour — l'appeler à chaque ouverture est le mode
@@ -749,6 +780,9 @@ pub fn apply(conn: &Connection) -> Result<()> {
     }
     if current < 13 {
         tx.execute_batch(SCHEMA_V13)?;
+    }
+    if current < 14 {
+        tx.execute_batch(SCHEMA_V14)?;
     }
     // `PRAGMA` ne se paramètre pas ; la valeur interpolée est une constante de compilation.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;

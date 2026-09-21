@@ -28,6 +28,7 @@ mod scan;
 mod schema;
 mod secrets;
 mod ui;
+mod vectors;
 
 use anyhow::Result;
 use camino::Utf8PathBuf;
@@ -332,6 +333,29 @@ enum Command {
         queries: usize,
     },
 
+    /// Mesure les critères 3 et 5 de la phase 4 : le coût d'une passe de vectorisation.
+    ///
+    /// Débit, durée, mémoire **par palier** — le critère 5 demande de dire où elle va —, et le
+    /// contrôle de reprise, qui est ce que le critère 3 exige en propre.
+    ///
+    /// Elle prend un `--store` parce qu'une passe ne veut rien dire sur un corpus fabriqué, mais
+    /// elle **copie** le `index.sqlite` avant d'y toucher et relie les blobs en lecture. Le store
+    /// de production n'est jamais modifié — la règle laissée par `measure-attachment`.
+    MeasureVectors {
+        /// Racine du store à vectoriser. Lu, jamais écrit.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le répertoire du modèle taillé, tel que `model-trim` l'a produit.
+        #[arg(long, default_value = "measurements/models/potion-taille")]
+        model: Utf8PathBuf,
+        /// Enchaîner le contrôle de reprise, qui refait une passe complète puis une seconde.
+        ///
+        /// Séparé parce qu'il double la durée du banc : on veut le débit à chaque exécution, la
+        /// reprise une fois.
+        #[arg(long)]
+        resume: bool,
+    },
+
     /// Sort un échantillon de messages réels, étalé sur toute la période du corpus.
     ///
     /// Sert l'étape 1 de `docs/PHASE-4.md` : écrire des requêtes en français avec la réponse
@@ -553,6 +577,11 @@ fn main() -> Result<()> {
             limit,
             queries,
         } => scan::measure(messages, dim, limit, queries),
+        Command::MeasureVectors {
+            store,
+            model,
+            resume,
+        } => vectors::measure(&store, &model, resume),
         Command::CorpusSample {
             store,
             count,

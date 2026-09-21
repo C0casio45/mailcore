@@ -1,0 +1,38 @@
+[package]
+name        = "mailvec"
+description = "Le modèle d'embeddings local et la passe de vectorisation. Aucun client HTTP compilé dedans."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# **Pourquoi un crate à part et pas un module de `mailcore`.**
+#
+# `mailcore` est tiré par tout le monde : la coquille, le CLI, le démon, le serveur MCP. Y mettre
+# `tokenizers` et `model2vec-rs` ferait payer leur compilation — et leur surface — à quatre
+# binaires dont trois ne vectorisent rien. C'est la forme qu'ont déjà `mailsync`, `mailimport` et
+# `mailsmtp` : le cœur range, un crate au-dessus fait le travail.
+#
+# Le magasin de vecteurs, lui, est resté dans `mailcore::vectors` — il n'a aucune dépendance, et
+# la **recherche** doit pouvoir le lire sans rien savoir du modèle.
+#
+# **`local-only` n'est pas un détail de configuration.** Cette variante de `model2vec-rs` est
+# compilée sans client HTTP : le critère 6 de `docs/PHASE-4.md` — zéro requête réseau — y est
+# vrai par construction et non par vigilance, comme pour `mailcal`. Un modèle se charge depuis un
+# répertoire, jamais depuis un identifiant de dépôt.
+[dependencies]
+mailcore.workspace  = true
+mailhtml.workspace  = true
+mail-parser.workspace = true
+model2vec-rs.workspace = true
+thiserror.workspace = true
+tracing.workspace   = true
+camino.workspace    = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

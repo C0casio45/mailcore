@@ -4320,6 +4320,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mailvec"
+version = "0.1.0"
+dependencies = [
+ "camino",
+ "mail-parser",
+ "mailcore",
+ "mailhtml",
+ "model2vec-rs",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "maplit"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9463,6 +9477,7 @@ dependencies = [
  "mailimport",
  "mailsmtp",
  "mailsync",
+ "mailvec",
  "memchr",
  "model2vec-rs",
  "rusqlite",

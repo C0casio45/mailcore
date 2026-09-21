@@ -87,9 +87,9 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 |---|---|---|---|
 | 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **référence mesurée le 2026-09-15** — 22 requêtes écrites sur le corpus réel, `cargo xtask measure-recall`. Tantivy seul : **0,0 %** sur les 10 requêtes sans mot commun, **58,3 %** sur les 12 autres, **31,8 %** sur le jeu entier. Le moteur reste à écrire |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
-| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | à faire |
+| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu le 2026-09-21** — `cargo xtask measure-vectors` sur les 73 658 messages : **339 s**, soit **217 messages/s**, 0 blob absent et 13 textes vides. Reprenable, drapeau par ligne (`SCHEMA_V14`) et écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
-| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | à faire |
+| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **tenu le 2026-09-21** — **117 Mio** de crête sur la passe complète : 8,7 au démarrage, 12,7 store ouvert, 69,5 modèle chargé, 117 passe finie. Quatre fois sous le seuil, après l'avoir crevé à 655 Mio le 2026-09-15 |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | à faire |
 | 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | à faire |
 | 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | à faire |
@@ -124,7 +124,11 @@ utilisable.
    n'attend pas le moteur. **6,2 ms de p95**, et le pire cas du tas borné à 10,2. Voir le
    journal.
 
-5. **La passe complète et sa reprise** — critères 3 et 5.
+5. ~~**La passe complète et sa reprise** — critères 3 et 5.~~ Fait le 2026-09-21 : le crate
+   `mailvec` — modèle, extraction du texte, passe — plus `SCHEMA_V14` et
+   `cargo xtask measure-vectors`. **339 s pour 73 658 messages, 117 Mio de crête.** Et le défaut
+   que l'étape a trouvé au passage : les citations en texte brut n'étaient reconnues **nulle
+   part**, ni pour la vectorisation ni pour l'affichage. Voir le journal.
 
 6. **La fusion avec tantivy**, et le critère 1 mesuré pour de bon.
 
@@ -594,3 +598,131 @@ Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targe
 deux, le magasin d'une autre dimension refusé des deux côtés, le vecteur écrit deux fois qui n'en
 laisse qu'un, la limite qui garde les meilleurs et non les premiers vus, et le message dont aucun
 token n'est connu qui rend des zéros et non des `NaN`.
+
+### 2026-09-21 — la passe complète, et la citation que personne ne reconnaissait
+
+L'étape 5 : le crate `mailvec` — le modèle, l'extraction du texte, la passe —, la colonne
+`messages.vectorised` (`SCHEMA_V14`) et le banc `measure-vectors`. Les critères 3 et 5 tombent
+tous les deux, et l'étape a trouvé un défaut qui ne parle pas de vecteurs.
+
+#### Le défaut : une citation en texte brut n'en était une pour personne
+
+`docs/PHASE-4.md` posait la règle avant la première ligne de code : la citation se retire au
+**même endroit** que celui qui la reconnaît pour l'affichage, sinon les deux divergent. Le chemin
+d'affichage est `mail-parser::body_html` → `sanitize` → `blocks`, et `blocks` marque les
+`<blockquote>`. Il suffisait donc de jeter ces blocs-là.
+
+Le test écrit pour le vérifier — sur de vrais octets RFC 5322, pas sur du HTML fabriqué — est
+tombé :
+
+```
+la citation en texte brut est entrée dans le vecteur :
+Re: chaudiere. Plomberie Martin. Bien recu, merci. > Voici le devis pour la chaudiere.
+```
+
+**La conversion de `mail-parser` remplace `\n` par `<br/>` et rien d'autre.** Les `>` de citation
+survivent comme texte ordinaire, donc `blocks` n'y voit aucune citation. Et la conséquence
+dépasse la phase : **la coquille ne les distinguait pas non plus**, depuis toujours. Il n'existait
+aucun reconnaisseur de citation en texte brut dans le projet — ce qui rendait la règle de la
+phase inapplicable, puisque l'endroit qu'elle désignait n'existait pas.
+
+Le remède est `mailhtml::plain`, appelé par `Mailbox::render` **et** par `mailvec::text` : les
+parties texte y sont converties par nous, les lignes `>` deviennent des `<blockquote>` imbriqués,
+et il n'y a toujours qu'un seul détecteur. Le lecteur y gagne au passage, ce qui n'était pas le
+but.
+
+Deux choses à ne pas défaire :
+
+- **une ligne blanche ferme le paragraphe, pas la citation.** Une citation réelle en contient ;
+  les traiter comme une sortie découperait un fil en une dizaine de blocs alternés ;
+- **`&` est échappé, et il ne l'était pas.** Un `&amp;` écrit en toutes lettres dans un mail en
+  texte brut ressortait en `&`. C'est le symétrique exact du piège que le commentaire de `render`
+  relevait déjà pour `<script>` : là l'échappement sauvait le texte, ici son absence le mangeait.
+
+Ce que le remède ne fait **pas**, délibérément : reconnaître « Le 12 mars, Untel a écrit : ». Il
+faudrait une liste de tournures par langue, elle serait fausse pour quelqu'un, et se tromper
+efface un paragraphe légitime. Une citation non reconnue est un défaut mineur ; un texte effacé à
+tort ne l'est pas.
+
+Et la leçon de méthode : **aucun test existant n'est tombé sur ce changement de rendu.** Le
+chemin texte brut n'était couvert par rien. La couverture vient des tests neufs, pas d'une
+non-régression — et c'est l'aveu qu'il faut écrire plutôt que de compter 1 388 verts comme une
+preuve que rien n'a bougé.
+
+#### Un trait pour que la passe soit testable du tout
+
+Le modèle n'est pas dans le dépôt : il s'installe. Une passe qui l'exigerait n'aurait **aucun
+test** — et c'est la fonction du projet où une coupure mal gérée perd des messages en silence,
+donc la dernière à laisser sans contrôle négatif. D'où `pass::Encoder`, deux méthodes, et un
+encodeur déterministe côté test qui compte ce qu'on lui demande d'encoder.
+
+Ce que ce compteur rend visible, et qu'aucune assertion sur le résultat ne verrait : le travail
+**refait**. Une reprise qui recalculerait tout donne exactement le même magasin.
+
+#### Le relevé
+
+Trois exécutions, la première jetée, sur les 73 658 messages du corpus réel :
+
+| | passe | débit | chargement | RSS crête |
+|---|---:|---:|---:|---:|
+| exécution 1 | 392,07 s | 188 /s | 296 ms | 117,1 Mio |
+| exécution 2 | **339,60 s** | **217 /s** | 68,6 ms | 117,7 Mio |
+| exécution 3 | **339,11 s** | **217 /s** | 68,4 ms | 117,0 Mio |
+
+**Le biais du `CLAUDE.md`, pour la cinquième fois.** La première exécution s'écarte de 15 % et les
+deux suivantes s'accordent à 0,14 % près ; le chargement du modèle y est quatre fois plus lent,
+ce qui désigne le cache de fichiers. La parade — trois exécutions dont on jette la première —
+marche encore, et c'est la dispersion, lue avant la médiane, qui l'a rendue lisible.
+
+Décomposition de la mémoire, que le critère 5 exige : 8,7 Mio au démarrage, 12,7 store ouvert,
+69,5 modèle chargé, **117 passe finie**. Quatre fois sous le seuil — le même critère était crevé à
+655 Mio le 2026-09-15, avant la taille du vocabulaire et du tokeniseur.
+
+Et le contrôle de reprise, à l'échelle du corpus — `measure-vectors --resume` :
+
+```
+Première passe    73658 vecteurs
+Seconde passe     0 vecteurs, 119.23ms
+Verdict           rien à refaire — la reprise ne recalcule pas
+```
+
+Les 119 ms sont le **contrôle de cohérence du critère 9** : `update_with` relit le magasin pour
+voir s'il contredit les drapeaux, et relire 72 Mio coûte ça. Le chemin réel, `update`, ne les paie
+pas — son `COUNT` sur colonne indexée répond avant, et c'est exactement ce que ce raccourci est là
+pour éviter. Le banc appelle la variante sans raccourci parce que c'est celle qui exerce le
+contrôle ; le dire évite de lire ces 119 ms comme le coût d'une moisson.
+
+#### Le chiffre qui compte n'est pas celui du critère
+
+L'étape 3 avait mesuré l'encodage seul à **5 700 messages/s**. La passe complète tourne à
+**217**. Les 73 658 messages coûtent donc **13 s d'encodage sur 339** : le modèle, qui était tout
+le sujet de la phase jusqu'ici, pèse **4 %** du coût de la passe. Le reste est la relecture des
+blobs, le parsing MIME, l'assainissement HTML et le découpage en blocs.
+
+C'est la même forme que la leçon des fils du 2026-09-13 — « ce qui coûte n'est pas l'algorithme
+mais la relecture des blobs » — et ça vaut d'être noté avant l'étape 6 : optimiser le modèle
+n'aurait presque aucun effet sur cette passe, et l'échanger contre un modèle plus lourd en
+coûterait beaucoup moins qu'on ne le croirait. La marge est du côté qu'on ne regardait pas.
+
+À dire aussi : `mailvec::text` passe par `sanitize` puis `blocks`, ce qui est **plus cher**
+qu'aplatir le HTML comme le fait l'index plein texte. Le choix était écrit comme assumé avant la
+mesure, au nom de l'unicité du détecteur de citation. Il est maintenant chiffré, et il reste
+assumé : 339 s pour un corpus entier est une passe qu'on lance une fois.
+
+#### Ce que la passe compte et ne cache pas
+
+`Stats` porte `missing_blobs` et `empty` à côté de `vectorised`, et les trois sont distincts. Un
+blob absent est **marqué quand même** — sinon la ligne revient à chaque passe pour toujours, et le
+raccourci du `COUNT` qui évite de charger le modèle ne servirait plus jamais — mais il n'est pas
+compté comme vectorisé : annoncer un bilan complet sur des messages qui n'ont pas de vecteur
+serait le genre de faux qui rassure.
+
+Sur ce corpus : **0 blob absent, 13 textes vides** sur 73 658. Le second chiffre est celui qui
+aurait pu accuser l'extraction, et treize sur soixante-treize mille dit qu'elle ne perd rien.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 388 tests verts**, soit 35 de plus. Les quatre qui portent l'étape :
+une passe annulée qui repart où elle s'est arrêtée sans réencoder ce qui était fait, des vecteurs
+écrits mais non marqués qui sont réécrits **sans doubler** le magasin, un magasin disparu détecté
+au point d'usage — avec son contrôle inverse, qui vérifie qu'un magasin présent ne déclenche
+**pas** de passe complète —, et un changement de dimension refusé plutôt qu'ajouté derrière.

@@ -530,16 +530,25 @@ impl Mailbox {
         // messages composés — une signature dans une partie séparée, par exemple — et les
         // concaténer est ce que fait un client mail.
         //
-        // **`mail-parser` compte aussi les parties `text/plain` ici**, converties en HTML
-        // avec les `<br>` qui vont bien. Vérifié : la conversion échappe, `<script>` écrit
-        // en toutes lettres dans un mail en texte ressort en `&lt;script&gt;` et survit donc
-        // à l'assainissement au lieu d'être mangé. C'est le comportement qu'on veut — un
-        // seul chemin de rendu côté front, et rien de perdu — mais il fallait le mesurer :
-        // une conversion qui n'échapperait pas ferait disparaître du texte légitime.
+        // **`mail-parser` compte aussi les parties `text/plain` ici**, et c'est pourquoi la
+        // conversion est faite par [`mailhtml::plain`] au lieu d'être laissée à `body_html`.
+        // Celle de `mail-parser` remplace `\n` par `<br/>` et s'arrête là : une citation en
+        // texte brut — des lignes préfixées de `>` — en ressort en texte ordinaire, donc
+        // invisible à `mailhtml::blocks`, donc affichée comme le reste. Trouvé le 2026-09-21
+        // en écrivant la passe de vectorisation, qui avale ces citations pour la même raison.
+        // Un seul détecteur de citation dans le projet, et il est ici.
+        //
+        // Elle n'échappe pas non plus `&` : un `&amp;` écrit en toutes lettres ressortait en
+        // `&`. Le symétrique du piège que la version précédente de ce commentaire relevait
+        // pour `<script>` — là l'échappement sauvait le texte, ici son absence le mangeait.
         let mut source = String::new();
-        for index in 0..parsed.html_body_count() {
-            if let Some(part) = parsed.body_html(index) {
-                source.push_str(&part);
+        for id in &parsed.html_body {
+            match parsed.part(*id).map(|part| &part.body) {
+                Some(mail_parser::PartType::Text(text)) => {
+                    source.push_str(&mailhtml::plain::to_html(text));
+                }
+                Some(mail_parser::PartType::Html(html)) => source.push_str(html),
+                _ => {}
             }
         }
 
