@@ -85,11 +85,11 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, mesuré le 2026-09-21** sur les 73 658 messages : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras. Le signal sémantique est pourtant réel — rang médian **1 992 sur 73 658**, dix-huit fois mieux que le hasard — mais il lui manque **deux ordres de grandeur**. Ni le budget de texte (balayé de 0 à 2 000) ni le réglage de fusion (K de 5 à 200) n'y changent quoi que ce soit. Seul point acquis : sur le sous-ensemble facile, la fusion bat ses deux bras — rang médian **30** contre 57 et 182 |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, remesuré le 2026-09-22** avec un transformeur (`multilingual-e5-small`) après l'avoir été le 2026-09-21 avec un embedding statique : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras et **pour les deux familles de modèles**. Ce que le second relevé ajoute est le **partage** que la médiane du sous-ensemble cachait : sur les 3 cibles au sujet **français**, le transformeur est à **1 304** contre 3 680 au statique — trois fois mieux ; sur les 7 cibles au sujet **anglais**, les deux sont à égalité dans le bruit (11 236 contre 8 872, le plancher de bruit valant 1,5). Le transformeur **améliore la synonymie et n'améliore pas l'interlangue**, et comme 7 requêtes sur 10 sont interlangues, l'agrégat rapporte l'échec et masque le gain. Acquis par ailleurs : sur le sous-ensemble facile, le transformeur porte le rappel à **50,0 %** et la fusion à un rang médian de **14** (contre 53 au statique) |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
-| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu le 2026-09-21** — `cargo xtask measure-vectors` sur les 73 658 messages : **339 s**, soit **217 messages/s**, 0 blob absent et 13 textes vides. Reprenable, drapeau par ligne (`SCHEMA_V14`) et écriture idempotente |
+| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **5,0 msg/s** mesuré sur 36 186 messages, soit **≈ 4,1 h** extrapolées sur le corpus. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
-| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **tenu le 2026-09-21** — **117 Mio** de crête sur la passe complète : 8,7 au démarrage, 12,7 store ouvert, 69,5 modèle chargé, 117 passe finie. Quatre fois sous le seuil, après l'avoir crevé à 655 Mio le 2026-09-15 |
+| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **tenu avec l'embedding statique, NON TENU avec le transformeur (2026-09-22)**. Statique : **117 Mio** de crête — 8,7 au démarrage, 12,7 store ouvert, 69,5 modèle chargé, 117 passe finie. Transformeur : **1 304 Mio** de crête et 985 de résident, soit **2,6 fois le seuil**. Le remède est celui du 2026-09-15 — tailler le vocabulaire — et il porte ici sur deux fichiers, le `tokenizer.json` de 17 Mo et `embeddings.word_embeddings.weight`. Le relevé du 2026-09-22 établit au passage que **ce rognage ne coûte rien en rappel** : taillé contre brut, 3 680 contre 3 901 sur les cibles françaises, l'écart est du côté du bruit |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | à faire |
 | 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | à faire |
 | 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | à faire |
@@ -135,9 +135,37 @@ utilisable.
    **Le critère 1 n'est pas tenu** — 0,0 % sur le sous-ensemble dur, pour les trois moteurs. Le
    modèle est la limite, et la mesure dit de combien. Voir le journal, et l'étape 6 bis.
 
-6 bis. **Changer de modèle, et remesurer.** Décidé par le relevé ci-dessus et rendu abordable par
-   celui de l'étape 5 : le modèle pèse **4 %** du coût de la passe, donc un modèle trente fois
-   plus lent la ferait passer de 6 à 12 minutes. C'est le prix d'un vrai transformeur.
+6 bis. ~~**Changer de modèle, et remesurer.**~~ Fait le 2026-09-22 : `mailvec::bert`, `candle` et
+   `multilingual-e5-small`. **Le critère 1 n'est toujours pas tenu**, et le relevé dit pourquoi —
+   le modèle améliore la synonymie d'un facteur trois et n'améliore pas l'interlangue, là où sept
+   des dix requêtes dures sont interlangues. Le critère 5 est crevé au passage (1 304 Mio). Voir
+   le journal, et les étapes 6 ter et 6 quater.
+
+   Le pari qui autorisait cette étape — « un modèle trente fois plus lent ferait passer la passe
+   de 6 à 12 minutes » — était faux d'un facteur trente-cinq : elle passe à **≈ 4,1 h**. Les 4 %
+   étaient mesurés, le « trente fois » ne l'était pas.
+
+6 ter. **Scinder le jeu de requêtes en « synonymie » et « interlangue », et rejouer les deux
+   modèles sur les deux.** Le sous-ensemble « aucun mot commun » est un critère **syntaxique** :
+   il sélectionne deux problèmes différents, parce qu'une requête française ne partage jamais un
+   mot avec un sujet anglais. Tant qu'il les mélange, aucune comparaison de modèles n'est
+   lisible — et choisir un modèle de plus sur ce banc-là reviendrait à le choisir au hasard.
+   Rien n'interdit de conclure ensuite que l'interlangue sort du périmètre de la phase, mais ce
+   sera une décision écrite.
+
+   À faire dans la foulée, parce que c'est ce qui rend les relevés défendables : **le magasin de
+   vecteurs doit porter sa provenance** — modèle, dimension, budget, date — et `measure-recall`
+   doit l'imprimer. Le 2026-09-22 a montré qu'un chiffre du journal ne se reproduit pas, et que
+   personne ne peut plus dire quel modèle avait écrit les vecteurs qu'il a lus.
+
+6 quater. **Le texte des pièces jointes, en amont des deux index.** Décidé le 2026-09-22, et placé
+   **devant** les étapes 7 et 8. Le contenu d'une pièce jointe n'entre dans aucun index : une
+   facture en PDF ne se trouve ni par son montant ni par sa référence, et aucun modèle ne le
+   rattrapera puisque le texte n'est nulle part. C'est le premier cas d'usage de `docs/VISION.md`.
+
+   Pourquoi devant : le critère 1 a échoué avec deux familles de modèles, donc la suite de la
+   piste sémantique est un pari. Ce manque-ci est **certain, borné, et il sert les deux moteurs** —
+   le plein texte en profite autant que le sémantique, et sans dépendre d'un modèle.
 
 7. **La passe incrémentale** — critère 4 — sur le modèle des trois dérivés existants, et une
    quatrième ligne dans `measure-followup`.
@@ -727,6 +755,13 @@ serait le genre de faux qui rassure.
 Sur ce corpus : **0 blob absent, 13 textes vides** sur 73 658. Le second chiffre est celui qui
 aurait pu accuser l'extraction, et treize sur soixante-treize mille dit qu'elle ne perd rien.
 
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 388 tests verts**, soit 35 de plus. Les quatre qui portent l'étape :
+une passe annulée qui repart où elle s'est arrêtée sans réencoder ce qui était fait, des vecteurs
+écrits mais non marqués qui sont réécrits **sans doubler** le magasin, un magasin disparu détecté
+au point d'usage — avec son contrôle inverse, qui vérifie qu'un magasin présent ne déclenche
+**pas** de passe complète —, et un changement de dimension refusé plutôt qu'ajouté derrière.
+
 ### 2026-09-21 (suite) — le critère 1 mesuré, et il n'est pas tenu
 
 L'étape 6 : la règle de fusion, la recherche hybride, le banc à trois bras. Elle répond à la
@@ -917,9 +952,242 @@ recherche hybride. Ceux qui portent l'étape : « un message que seul un moteur 
 liste » et son inverse « l'accord des deux bat une première place isolée » ; « sans modèle, la
 recherche répond quand même, et elle répond ce que le plein texte répondait ».
 
+### 2026-09-22 — l'étape 6 bis : le transformeur mesuré, et le banc qui mélangeait deux problèmes
+
+Le modèle décidé le 2026-09-21 est en place, le corpus entier est revectorisé, et **le critère 1
+n'est toujours pas tenu** : 0,0 % sur le sous-ensemble dur, pour les trois bras, comme avec
+l'embedding statique.
+
+Ce n'est pas la partie intéressante. La partie intéressante est que le rang médian, lui, a bougé
+dans les **deux sens à la fois** — et que la raison en était écrite dans le journal de la veille,
+noir sur blanc, sans que personne en ait tiré le chiffre.
+
+#### Deux hypothèses écartées avant d'écrire quoi que ce soit
+
+Le 2026-09-21 s'est fait prendre à conclure sur un composant avant d'être descendu d'un cran. La
+même discipline a donc été appliquée avant d'écrire « le transformeur est moins bon ».
+
+**La normalisation.** Un `e5` sort d'une moyenne pondérée, donc des vecteurs **non unitaires**, là
+où `model2vec` en rendait déjà de norme proche de 1. Si le balayage avait comparé par produit
+scalaire brut, les vecteurs de grande norme auraient gagné et le classement aurait été corrompu
+**par le changement de famille**, pas par le modèle. Coût de la vérification : deux lectures.
+`VectorWriter::append` normalise à l'écriture, `Scan::search` normalise la requête, le cosinus est
+un vrai cosinus. Écartée gratuitement.
+
+**La dilution, de nouveau.** Le balayage du budget du 2026-09-21 l'avait réfutée — pour
+**l'embedding statique**. Il ne dit rien du transformeur, parce que les deux ne voient pas le même
+texte : le statique **moyenne** les 2 000 caractères du budget, le transformeur en **tronque** la
+moitié à 256 jetons et met de l'attention sur ce qui reste. Et les cibles du sous-ensemble dur sont
+des courriels de notification dont les premiers jetons sont surtout du gabarit.
+
+L'hypothèse était sérieuse et bon marché à trancher : une passe à `--budget 0`, sujet et expéditeur
+seuls, exactement le régime court où la sonde marche.
+
+| sous-ensemble dur, rang médian sémantique | budget 2 000 | budget 0 |
+|---|---:|---:|
+| transformeur | **7 039** | 29 612 |
+
+**Quatre fois pire sans le corps.** La dilution n'explique rien, et elle est réfutée dans le sens
+**opposé** à celui qu'on cherchait : c'est le corps qui porte le signal. À noter pour la suite — le
+réflexe « le sujet est l'essentiel d'un courriel » est faux sur ce corpus, et c'est mesuré.
+
+#### Le relevé
+
+Tous les chiffres ci-dessous viennent d'**une seule session, un seul store, une seule profondeur**
+— 73 658, c'est-à-dire le corpus entier, donc aucun rang n'est tronqué. C'est ce qui les rend
+comparables entre eux, et c'est la seule comparaison qui vaille ici.
+
+| | plein texte | statique | transformeur |
+|---|---:|---:|---:|
+| **dur (10) — rappel @10** | 0,0 % | 0,0 % | 0,0 % |
+| **dur (10) — rang médian** | absente | **4 111** | 7 039 |
+| facile (12) — rappel @10 | 41,7 % | 41,7 % | **50,0 %** |
+| facile (12) — rang médian | 57 | 467 | **40** |
+| facile (12) — hybride, rang médian | — | 53 | **14** |
+
+Lu comme le 2026-09-21 le lisait — la médiane du sous-ensemble dur — le transformeur est **1,7 fois
+pire**. Lu sur le sous-ensemble facile, il est **onze fois meilleur** en sémantique seul, il trouve
+une requête de plus, et la fusion passe de 53 à 14.
+
+Un modèle ne peut pas être meilleur partout et pire là où ça compte sans qu'une variable cachée s'en
+mêle. Il fallait la trouver avant de conclure.
+
+#### La variable cachée était écrite dans le journal depuis la veille
+
+Le 2026-09-21 notait déjà que **sept des dix requêtes du sous-ensemble dur visent un message dont le
+sujet est en anglais**, et que le sous-ensemble « confond donc deux problèmes : la synonymie et le
+passage d'une langue à l'autre ». C'était juste, et c'est resté une remarque. En séparant les dix
+rangs selon la langue du sujet visé — et en ajoutant le modèle statique **non taillé**, qui sert de
+plancher de bruit :
+
+| sous-ensemble dur, rang médian sémantique | transformeur | statique taillé | statique brut |
+|---|---:|---:|---:|
+| cible au sujet **français** (3 requêtes) | **1 304** | 3 680 | 3 901 |
+| cible au sujet **anglais** (7 requêtes) | 11 236 | 8 872 | 13 731 |
+| les dix ensemble | 7 039 | 4 111 | 6 581 |
+| pour mémoire, le hasard | 36 829 | 36 829 | 36 829 |
+
+**Le plancher de bruit se lit dans les deux dernières colonnes.** Ce sont deux versions du *même*
+modèle, l'une étant l'autre au vocabulaire rogné : elles devraient donner la même chose. Elles
+donnent 3 680 contre 3 901 en français — 6 % d'écart, soit rien — et 8 872 contre 13 731 en anglais,
+un facteur 1,5. À n = 7, un facteur 1,5 est donc du bruit et ne se commente pas.
+
+Ce qui dépasse ce plancher : le transformeur est **environ trois fois meilleur** que les deux
+statiques sur les cibles françaises, et il ne se distingue d'eux sur les cibles anglaises ni dans un
+sens ni dans l'autre. Autrement dit : **il améliore la synonymie, il n'améliore pas l'interlangue**,
+et comme sept des dix requêtes sont interlangues, la médiane du sous-ensemble **rapporte l'échec
+interlangue et masque le gain de synonymie**.
+
+C'est la même faute de forme que celle du 2026-09-21, d'un cran plus haut. Là, un indicateur binaire
+écrasait un continuum et ne diagnostiquait rien. Ici, **une médiane agrège deux populations qui ne
+répondent pas à la même question**, et le chiffre qu'elle rend ne décrit aucune des deux.
+
+La règle : **avant de comparer deux moteurs sur un sous-ensemble, vérifier que le sous-ensemble est
+homogène pour la propriété qu'on teste.** « Aucun mot commun » est un critère **syntaxique** ; il
+sélectionne la synonymie *et* l'interlangue, parce qu'une requête française ne partage jamais un mot
+avec un sujet anglais — par construction, sans que la synonymie y soit pour rien. Un sous-ensemble
+est un instrument comme un autre : il mesure ce que sa définition sélectionne, pas ce que son nom
+promet.
+
+Et le corollaire de méthode, qui resservira : **quand deux variantes d'un même modèle sont
+disponibles, les mesurer toutes les deux donne le plancher de bruit gratuitement.** Sans la colonne
+« statique brut », l'écart de 8 872 à 11 236 sur les cibles anglaises se serait lu comme un résultat.
+
+#### Une mesure du journal qui ne se reproduit pas
+
+Le 2026-09-21 annonce un rang médian de **1 992** sur le sous-ensemble dur pour le statique. Il n'a
+pas été retrouvé, et ça a été cherché :
+
+| ce qui a été essayé | rang médian obtenu |
+|---|---|
+| statique taillé, profondeur 73 658 | 4 111 |
+| statique taillé, profondeur 5 000 | 4 111 |
+| statique brut, profondeur 73 658 | 6 581 |
+| statique brut, profondeur 5 000 | absente |
+| statique brut, profondeur 50 | absente |
+
+Le jeu de requêtes n'a pas bougé depuis le 2026-09-21, `mailvec::text` non plus. Le débit désigne le
+modèle employé ce jour-là — 225 msg/s aujourd'hui pour le brut contre 217 au journal, le taillé étant
+à 78 — mais le brut donne 6 581, pas 1 992.
+
+Ce qui manque pour trancher est ce qui aurait dû être enregistré : **`vectors.bin` est un artefact
+mutable que chaque passe écrase, et rien n'y dit quel modèle ni quel budget l'a produit.** Le
+2026-09-21 a enchaîné un balayage de budget à 2 000, 400, 150 et 0 ; le relevé de profondeur qui a
+suivi a lu le magasin **laissé par le dernier essai**, et personne ne peut plus dire lequel.
+
+C'est la même famille de défaut que celui du 2026-09-21 — le jeu de requêtes qui désignait ses cibles
+par `messages.id` — et la même leçon d'un cran plus loin : **un instrument dont l'état n'est pas
+capturé rend des chiffres qu'on ne peut pas défendre.** Le remède est symétrique de celui des cibles :
+le magasin de vecteurs doit porter sa provenance — modèle, dimension, budget, date — et
+`measure-recall` doit l'imprimer en tête de son relevé, à côté du nombre de vecteurs qu'il affiche
+déjà. Tant que ce n'est pas fait, **aucun chiffre de rappel de cette phase n'est reproductible**, y
+compris ceux d'aujourd'hui — ceux de ce relevé-ci ne valent que parce qu'ils ont été pris d'affilée,
+dans une session dont le journal ci-dessus dit l'ordre exact.
+
+#### Le coût : une prédiction fausse, et pourquoi elle l'était
+
+Le 2026-09-21 autorisait ce changement de modèle par un calcul : le modèle pèse 4 % du coût de la
+passe, donc « un modèle **trente fois plus lent** ferait passer la passe complète de six à douze
+minutes ». L'arithmétique était juste. Le « trente » était un chiffre en l'air, et il est faux d'un
+facteur trente-cinq.
+
+| passe complète, budget 2 000 | statique | transformeur |
+|---|---:|---:|
+| débit | 78 msg/s | **5,0 msg/s** |
+| durée sur 73 658 messages | 948 s | **≈ 4,1 h** (extrapolée) |
+
+L'encodage seul du statique avait été mesuré à 5 700 msg/s ; le transformeur tient la passe entière à
+5,0, donc il **est** la passe. Le modèle est passé de 4 % à environ 95 % du coût, et le rapport des
+deux encodeurs est de l'ordre de **mille**, pas de trente.
+
+La leçon n'est pas « le calcul était mauvais » — il était bon. Elle est que **le calcul reposait sur
+une mesure et sur une devinette, et que seule la mesure était signalée comme telle.** Les 4 % étaient
+chiffrés, le « trente fois » ne l'était pas, et c'est le second qui portait toute la conclusion. Un
+produit n'est jamais mieux mesuré que son facteur le moins mesuré : écrire un nombre supposé à côté
+d'un nombre mesuré lui prête une autorité qu'il n'a pas.
+
+Deux précisions honnêtes sur ces chiffres :
+
+- la durée du transformeur est **extrapolée** : la passe a été mesurée sur 36 186 messages en
+  7 224,7 s, la première moitié ayant été faite la veille. Le débit, lui, est mesuré ;
+- les 78 msg/s du statique taillé ont été **remesurés aujourd'hui**. La comparaison n'emploie que des
+  chiffres du jour : un rapport entre deux mesures prises dans des états de machine différents ne
+  mesure pas ce qu'il prétend.
+
+#### Le débit suit la longueur des textes, pas leur nombre
+
+Un échantillonnage du magasin de vecteurs toutes les minutes pendant la passe donne une courbe qui
+n'est pas plate :
+
+```
+3,2 → 4,0 msg/s   (les deux premiers tiers)
+9,3 → 11,3 msg/s  (le dernier tiers)
+```
+
+Un facteur 3,5 à l'intérieur d'une seule passe, sur une machine qui ne fait rien d'autre. La moyenne
+de 5,0 msg/s ne décrit aucun des deux régimes.
+
+La cause est dans `Bert::encode_as` : `PaddingStrategy::BatchLongest` complète tous les textes d'un
+lot à la longueur du plus long, et l'attention est **quadratique** en cette longueur. Un lot de seize
+messages courts contenant un seul message long coûte seize messages longs. Le débit suit donc la
+**distribution des longueurs**, pas le compte des messages.
+
+Ce qui en découle et qui n'est pas pris : trier par longueur avant de constituer les lots
+regrouperait les textes courts entre eux. C'est un gain gratuit, et il attend que le choix du modèle
+soit tranché — optimiser la vitesse d'un modèle qu'on s'apprête peut-être à remplacer serait le
+travail deux fois.
+
+C'est aussi, une fois de plus, la dispersion qui parle avant la médiane. Cinquième récidive de la
+série ouverte le 2026-09-02, sauf que cette fois la dispersion n'était pas un biais de mesure :
+c'était le phénomène.
+
+#### Le critère 5 est crevé, et de loin
+
+| | statique (2026-09-21) | transformeur |
+|---|---:|---:|
+| crête RSS de la passe | 117 Mio | **1 304 Mio** |
+| accordé | 500 Mo | 500 Mo |
+
+985 Mio de résident en régime, 1 304 de crête. Le remède connu — tailler le vocabulaire — est ce qui
+avait ramené 655 Mio à 100 le 2026-09-15, et il porte ici sur **deux** fichiers : le `tokenizer.json`
+de 17 Mo et la matrice `embeddings.word_embeddings.weight` du safetensors.
+
+Une bonne nouvelle pour ce remède, tombée du tableau du plancher de bruit : **le rognage du
+vocabulaire ne coûte rien en rappel.** Taillé contre brut, 3 680 contre 3 901 sur les cibles
+françaises et 4 111 contre 6 581 sur les dix — l'écart est du côté du bruit, et il penche plutôt en
+faveur du taillé. C'était une question ouverte que personne n'avait posée le 2026-09-15, où seule la
+mémoire avait été mesurée.
+
+Le rognage du transformeur n'est pas fait aujourd'hui, pour la même raison que le tri par longueur :
+le modèle n'est pas choisi.
+
+#### Ce qui est décidé pour la suite
+
+Deux décisions prises avec l'utilisateur au vu de ces chiffres.
+
+**Le banc se scinde avant qu'un modèle de plus soit téléchargé.** « Synonymie » et « interlangue »
+deviennent deux sous-ensembles nommés, les deux modèles déjà mesurés sont rejoués sur les deux, et le
+choix se fait ensuite. Rien n'interdit de conclure que l'interlangue sort du périmètre de la phase —
+mais ce sera une décision écrite, pas un chiffre subi. Et la phase se l'était déjà interdit dans son
+ordre de travail : « un jeu de requêtes écrit après le choix du modèle ressemble toujours au choix ».
+Un jeu qui mélange deux problèmes est pire — il ressemble à n'importe quoi.
+
+**L'extraction du texte des pièces jointes passe devant les étapes 7 et 8.** Le manque a été trouvé
+hors plan, en cherchant une facture dans le corpus réel avec `mail attach` : le contenu des pièces
+jointes n'entre dans **aucun** des deux index. Une facture en PDF ne se trouve donc ni par son montant
+ni par sa référence, et **aucun modèle ne le rattrapera, puisque le texte n'est nulle part**. C'est le
+cas d'usage que `docs/VISION.md` met en tête.
+
+Le raisonnement qui le met devant le reste de la phase : le critère 1 a maintenant échoué avec **deux
+familles de modèles**, et chaque tentative suivante est un pari sur un gain incertain. Le manque des
+pièces jointes, lui, est **certain, borné, et il sert les deux moteurs** — le plein texte en profite
+autant que le sémantique, et sans dépendre d'un modèle. Entre une amélioration incertaine du rappel
+sur du texte qu'on indexe déjà et l'indexation d'un texte qu'on n'indexe pas du tout, l'ordre se
+déduit tout seul.
+
 Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace` — **1 388 tests verts**, soit 35 de plus. Les quatre qui portent l'étape :
-une passe annulée qui repart où elle s'est arrêtée sans réencoder ce qui était fait, des vecteurs
-écrits mais non marqués qui sont réécrits **sans doubler** le magasin, un magasin disparu détecté
-au point d'usage — avec son contrôle inverse, qui vérifie qu'un magasin présent ne déclenche
-**pas** de passe complète —, et un changement de dimension refusé plutôt qu'ajouté derrière.
+`cargo test --workspace` — **1 406 tests verts**, soit 3 de plus, tous sur l'assainissement du nom
+d'une pièce jointe : un nom qui remonte l'arborescence est réduit à son dernier segment, un nom
+ordinaire — accents compris — traverse intact, et un nom qui ne laisse rien en reçoit un. Le
+transformeur lui-même n'ajoute pas de test unitaire : ce qu'il fallait vérifier de lui est un
+classement sur 73 658 messages, et c'est le banc qui le fait.
