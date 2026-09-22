@@ -85,6 +85,13 @@ toml       = "0.9"
 safetensors = "0.6"
 model2vec-rs = { version = "0.2", default-features = false, features = ["local-only", "onig"] }
 tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+# `candle` pour un vrai transformeur, la branche écartée le 2026-09-15 et reprise le 2026-09-21
+# quand la mesure a dit de combien l'embedding statique manquait. Aucune feature d'accélérateur :
+# le calcul est sur le processeur, il n'y a pas de dépendance CUDA à installer, et le projet ne
+# suppose rien de la machine.
+candle-core = { version = "0.9", default-features = false }
+candle-nn = { version = "0.9", default-features = false }
+candle-transformers = { version = "0.9", default-features = false }
 
 # --- transverse ---
 thiserror          = "2.0"

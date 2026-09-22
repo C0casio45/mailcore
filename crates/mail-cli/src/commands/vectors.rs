@@ -21,6 +21,23 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use mailcore::{Progress, Store};
 
+/// Traduit une erreur de `mailvec` en phrase utilisable.
+///
+/// Le modèle absent est le cas nominal d'une installation qui n'a pas fait l'étape, pas un
+/// incident. Il a droit à une phrase qui dit quoi faire — critère 8 de la phase 3 — et non à un
+/// message d'erreur de bibliothèque.
+fn explain(error: mailvec::Error) -> anyhow::Error {
+    match error {
+        mailvec::Error::Model { path, reason } => anyhow::anyhow!(
+            "aucun modèle utilisable dans {path} ({reason}).\n\
+             La recherche sémantique a besoin d'un modèle local ; le plein texte, lui, marche \
+             sans.\n\
+             Installez-en un dans ce répertoire, ou désignez-en un autre avec `--model`."
+        ),
+        other => anyhow::Error::new(other).context("vectorisation"),
+    }
+}
+
 /// Point d'entrée de la sous-commande.
 ///
 /// # Errors
@@ -32,6 +49,7 @@ pub fn run(
     model: Option<&Utf8PathBuf>,
     rebuild: bool,
     budget: Option<usize>,
+    bert: bool,
 ) -> Result<()> {
     let root = crate::store_root(store_root)?;
     let store = Store::open(&root).with_context(|| format!("ouverture du store {root}"))?;
@@ -63,26 +81,28 @@ pub fn run(
     // coupée repart où elle en était, ce qui est précisément ce que le critère 3 garantit.
     let progress = Progress::new();
     let started = Instant::now();
-    let stats = if rebuild {
+    // Le choix de la famille est explicite et non deviné du contenu du répertoire : deux
+    // modèles y ressemblent de loin, et charger le mauvais rendrait des vecteurs de la bonne
+    // taille et du mauvais sens.
+    let stats = if bert {
+        let encoder = match mailvec::bert::Bert::load(&model) {
+            Ok(encoder) => encoder,
+            Err(error) => return Err(explain(error)),
+        };
+        if rebuild {
+            mailvec::pass::rebuild_with(&store, &encoder, budget, &progress)
+        } else {
+            mailvec::pass::update_with(&store, &encoder, budget, &progress)
+        }
+    } else if rebuild {
         mailvec::pass::rebuild(&store, &model, budget, &progress)
     } else {
         mailvec::pass::update(&store, &model, budget, &progress)
     };
 
-    // Le modèle absent est le cas nominal d'une installation qui n'a pas fait l'étape, pas un
-    // incident. Il a droit à une phrase qui dit quoi faire — critère 8 de la phase 3 — et non à
-    // un message d'erreur de bibliothèque.
     let stats = match stats {
         Ok(stats) => stats,
-        Err(mailvec::Error::Model { path, reason }) => {
-            anyhow::bail!(
-                "aucun modèle utilisable dans {path} ({reason}).\n\
-                 La recherche sémantique a besoin d'un modèle local ; le plein texte, lui, \
-                 marche sans.\n\
-                 Installez-en un dans ce répertoire, ou désignez-en un autre avec `--model`."
-            );
-        }
-        Err(other) => return Err(other).context("vectorisation"),
+        Err(error) => return Err(explain(error)),
     };
     let elapsed = started.elapsed();
 

@@ -400,6 +400,12 @@ enum Command {
         /// `--rebuild`.
         #[arg(long)]
         budget: Option<usize>,
+        /// Employer un transformeur (candle) plutôt qu'un embedding statique.
+        ///
+        /// Les deux familles produisent des vecteurs de dimensions différentes et
+        /// incomparables : changer de famille impose --rebuild.
+        #[arg(long)]
+        bert: bool,
     },
     /// La source d'un message : les octets tels qu'ils sont.
     ///
@@ -649,9 +655,10 @@ fn main() -> Result<()> {
                 model,
                 rebuild,
                 budget,
+                bert,
             },
             None,
-        ) => commands::vectors::run(store, model.as_ref(), *rebuild, *budget),
+        ) => commands::vectors::run(store, model.as_ref(), *rebuild, *budget, *bert),
         (Command::Search { query, limit }, None) => {
             commands::search::run(store, &query.join(" "), *limit)
         }

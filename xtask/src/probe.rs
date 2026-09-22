@@ -54,18 +54,39 @@ const PAIRS: &[(&str, &str, &str)] = &[
 /// # Errors
 ///
 /// Si le modèle n'est pas chargeable.
-pub fn model(dir: &Utf8PathBuf) -> Result<()> {
-    let model = mailvec::model::Model::load(dir).context("chargement du modèle")?;
-    println!("Modèle             {dir}");
-    println!("Dimension          {}\n", model.dim());
-
+pub fn model(dir: &Utf8PathBuf, bert: bool) -> Result<()> {
     let mut texts = Vec::new();
     for (word, near, control) in PAIRS {
         texts.push((*word).to_owned());
         texts.push((*near).to_owned());
         texts.push((*control).to_owned());
     }
-    let vectors = model.encode(&texts).context("encodage de la sonde")?;
+
+    // Les deux familles derrière la même sonde, pour que les chiffres se comparent ligne à ligne.
+    // Le transformeur encode ici en rôle **passage** des deux côtés de chaque paire : la sonde
+    // compare des textes entre eux, pas une requête à un document.
+    let (dim, vectors) = if bert {
+        let model = mailvec::bert::Bert::load(dir).context("chargement du transformeur")?;
+        let vectors = model
+            .encode_as(&texts, mailvec::bert::Role::Passage)
+            .context("encodage de la sonde")?;
+        (model.dim(), vectors)
+    } else {
+        let model = mailvec::model::Model::load(dir).context("chargement du modèle")?;
+        let vectors = model.encode(&texts).context("encodage de la sonde")?;
+        (model.dim(), vectors)
+    };
+
+    println!("Modèle             {dir}");
+    println!(
+        "Famille            {}",
+        if bert {
+            "transformeur"
+        } else {
+            "embedding statique"
+        }
+    );
+    println!("Dimension          {dim}\n");
 
     println!(
         "{:<22} {:<20} {:>8}   {:<16} {:>8}   {:>8}",
@@ -82,19 +103,22 @@ pub fn model(dir: &Utf8PathBuf) -> Result<()> {
         println!("{word:<22} {near:<20} {close:>8.3}   {control:<16} {far:>8.3}   {gap:>+8.3}");
     }
 
-    let positive = gaps.iter().filter(|gap| **gap > 0.05).count();
+    let ordered = gaps.iter().filter(|gap| **gap > 0.0).count();
     #[allow(clippy::cast_precision_loss)]
     let mean = gaps.iter().sum::<f32>() / gaps.len() as f32;
 
-    println!("\nÉcart moyen        {mean:+.3}");
+    println!("\nPaires bien ordonnées  {ordered} sur {}", gaps.len());
+    println!("Écart moyen            {mean:+.3}   (voir ci-dessous)");
     println!(
-        "Paires séparées    {positive} sur {}   (écart > 0,05)",
-        gaps.len()
-    );
-    println!(
-        "\nLecture : l'écart est ce qui compte, pas le cosinus absolu. Un modèle qui porte du\n\
-         sens sépare nettement la paire proche du témoin. Un modèle qui n'en porte pas les met à\n\
-         égalité — et aucun réglage en aval ne rattrapera ça."
+        "\nLecture : **l'ordre d'abord, l'écart ensuite.** Un modèle est utile pour la recherche\n\
+         s'il place la paire proche au-dessus du témoin ; c'est la seule chose qui se compare\n\
+         d'un modèle à l'autre.\n\
+         \n\
+         L'écart, lui, **ne se compare pas entre familles**. Les modèles de type `e5` sont\n\
+         anisotropes : tous leurs vecteurs tiennent dans un cône étroit, donc tous leurs cosinus\n\
+         sont hauts et tous leurs écarts petits. Lire un écart de +0,05 comme « moins bon » qu'un\n\
+         écart de +0,33 sur un autre modèle serait l'erreur qu'on a refusé de faire en fusionnant\n\
+         un BM25 et un cosinus. Seul le classement final sur le corpus tranche."
     );
     Ok(())
 }

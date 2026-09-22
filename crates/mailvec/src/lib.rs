@@ -27,6 +27,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bert;
 pub mod model;
 pub mod pass;
 pub mod search;

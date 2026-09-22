@@ -37,15 +37,79 @@ use crate::{Error, Result};
 /// lieu, assez peu pour que le balayage reste au budget du critère 2.
 pub const DEPTH: usize = 50;
 
+/// Ce qui sait encoder une **requête**.
+///
+/// ## Pourquoi ce n'est pas le trait de la passe
+///
+/// [`crate::pass::Encoder`] encode des **documents**. Pour un embedding statique la distinction
+/// n'existe pas ; pour un `e5` elle est capitale — les deux rôles portent un préfixe différent,
+/// et les intervertir dégrade sans rien signaler. Deux traits distincts sont ce qui empêche
+/// d'appeler l'un à la place de l'autre, et ils sont implémentés séparément par chaque modèle.
+pub trait QueryEncoder {
+    /// La dimension des vecteurs produits.
+    fn dim(&self) -> usize;
+
+    /// Encode une requête telle que l'utilisateur l'a tapée.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Encode`] si la requête n'est pas encodable.
+    fn encode_query(&self, query: &str) -> Result<Vec<f32>>;
+}
+
+impl QueryEncoder for Model {
+    fn dim(&self) -> usize {
+        Self::dim(self)
+    }
+
+    /// ## La requête est encodée telle qu'elle est tapée
+    ///
+    /// Pas de préfixe : ce modèle est distillé de `bge-m3`, qui n'en demande pas, et en ajouter
+    /// un « au cas où » serait un réglage inventé de plus.
+    fn encode_query(&self, query: &str) -> Result<Vec<f32>> {
+        let encoded = Self::encode(self, std::slice::from_ref(&query.to_owned()))?;
+        encoded
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Encode("la requête n'a produit aucun vecteur".to_owned()))
+    }
+}
+
+impl QueryEncoder for crate::bert::Bert {
+    fn dim(&self) -> usize {
+        Self::dim(self)
+    }
+
+    /// Le préfixe `query: ` que l'entraînement de `e5` attend — voir [`crate::bert`].
+    fn encode_query(&self, query: &str) -> Result<Vec<f32>> {
+        let encoded = self.encode_as(
+            std::slice::from_ref(&query.to_owned()),
+            crate::bert::Role::Query,
+        )?;
+        encoded
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Encode("la requête n'a produit aucun vecteur".to_owned()))
+    }
+}
+
 /// Le moteur sémantique : un modèle et un magasin de vecteurs, tous deux ouverts.
-#[derive(Debug)]
 pub struct Semantic {
-    model: Model,
+    model: Box<dyn QueryEncoder + Send + Sync>,
     vectors: Vectors,
 }
 
+impl std::fmt::Debug for Semantic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Semantic")
+            .field("dim", &self.model.dim())
+            .field("vectors", &self.vectors.len())
+            .finish()
+    }
+}
+
 impl Semantic {
-    /// Ouvre le moteur sur un store.
+    /// Ouvre le moteur sur un store, avec l'embedding statique.
     ///
     /// # Errors
     ///
@@ -53,7 +117,29 @@ impl Semantic {
     /// modèle, et l'appelant doit pouvoir continuer sans, ce que le critère 7 exige.
     /// [`Error::Core`] si le magasin de vecteurs est illisible ou d'une autre dimension.
     pub fn open(store: &mailcore::Store, model_dir: &camino::Utf8Path) -> Result<Self> {
-        let model = Model::load(model_dir)?;
+        Self::with(store, Box::new(Model::load(model_dir)?))
+    }
+
+    /// Ouvre le moteur avec le transformeur.
+    ///
+    /// # Errors
+    ///
+    /// Les mêmes que [`Self::open`].
+    pub fn open_bert(store: &mailcore::Store, model_dir: &camino::Utf8Path) -> Result<Self> {
+        Self::with(store, Box::new(crate::bert::Bert::load(model_dir)?))
+    }
+
+    /// Ouvre le moteur avec un encodeur déjà construit.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] si le magasin de vecteurs est illisible ou d'une autre dimension — et
+    /// c'est le contrôle qui compte : changer de modèle sans refaire la passe donnerait un
+    /// magasin dont la dimension ne correspond plus, et il est refusé plutôt que lu de travers.
+    pub fn with(
+        store: &mailcore::Store,
+        model: Box<dyn QueryEncoder + Send + Sync>,
+    ) -> Result<Self> {
         let vectors = Vectors::load(store.vectors_path(), model.dim())?;
         Ok(Self { model, vectors })
     }
@@ -72,12 +158,9 @@ impl Semantic {
 
     /// Les messages les plus proches d'une requête, du plus proche au moins.
     ///
-    /// ## La requête est encodée telle qu'elle est tapée
-    ///
-    /// Pas de préfixe, pas de reformulation. Certaines familles de modèles en demandent un
-    /// — « query: » pour les `e5` — et en ajouter un ici « au cas où » serait un réglage inventé
-    /// de plus. Celui-ci est distillé de `bge-m3`, qui n'en demande pas ; si une mesure montre
-    /// qu'un préfixe aide, il s'ajoutera **avec** cette mesure.
+    /// L'encodage de la requête appartient au modèle — voir [`QueryEncoder`] — parce que c'est là
+    /// que vit la différence entre les familles : un `e5` veut un préfixe `query: `, un embedding
+    /// statique n'en veut pas.
     ///
     /// Le texte des messages, lui, est composé par [`crate::text::compose`] : sujet, expéditeur,
     /// corps. L'asymétrie est assumée — une requête n'a pas de sujet ni d'expéditeur, et lui en
@@ -88,13 +171,8 @@ impl Semantic {
     /// [`Error::Encode`] si la requête n'est pas encodable, [`Error::Core`] si le balayage
     /// refuse la dimension.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<mailcore::vectors::Hit>> {
-        let encoded = self.model.encode(std::slice::from_ref(&query.to_owned()))?;
-        let Some(vector) = encoded.first() else {
-            return Err(Error::Encode(
-                "la requête n'a produit aucun vecteur".to_owned(),
-            ));
-        };
-        Ok(self.vectors.search(vector, limit)?)
+        let vector = self.model.encode_query(query)?;
+        Ok(self.vectors.search(&vector, limit)?)
     }
 }
 

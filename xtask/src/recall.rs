@@ -159,6 +159,7 @@ pub fn measure(
     limit: usize,
     model: Option<&Utf8PathBuf>,
     k: f32,
+    bert: bool,
 ) -> Result<()> {
     let raw = std::fs::read_to_string(queries)
         .with_context(|| format!("lecture du jeu de requêtes {queries}"))?;
@@ -183,8 +184,12 @@ pub fn measure(
     // chiffre avec le code d'aujourd'hui plutôt que de le recopier depuis le journal.
     let semantic = match model {
         Some(dir) => {
-            let engine = mailvec::search::Semantic::open(mailbox.store(), dir)
-                .with_context(|| format!("ouverture du moteur sémantique sur {dir}"))?;
+            let engine = if bert {
+                mailvec::search::Semantic::open_bert(mailbox.store(), dir)
+            } else {
+                mailvec::search::Semantic::open(mailbox.store(), dir)
+            }
+            .with_context(|| format!("ouverture du moteur sémantique sur {dir}"))?;
             anyhow::ensure!(
                 !engine.is_empty(),
                 "le magasin de vecteurs est vide : lancez la passe de vectorisation d'abord"

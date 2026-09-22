@@ -30,14 +30,17 @@ use mailcore::{Progress, Store};
 use crate::model::Model;
 use crate::{Error, Result};
 
-/// Combien de messages sont lus, encodés et écrits d'un coup.
+/// Combien de messages sont lus, encodés et écrits d'un coup, par défaut.
 ///
 /// Le lot sert deux choses opposées, d'où l'arbitrage. Trop petit, on paie un appel de
 /// bibliothèque et une transaction SQLite par message. Trop grand, on garde en mémoire autant de
 /// textes de deux mille caractères — et le critère 5 compte la mémoire de la passe, pas
 /// seulement celle du modèle. Cinq cents textes font au pire un mébioctet, ce qui ne pèse rien à
 /// côté des cent du modèle.
-const BATCH: usize = 500;
+///
+/// **Cette valeur suppose un modèle sans attention**, et c'est pour ça que [`Encoder::batch`]
+/// existe — voir la leçon qui l'accompagne.
+pub const BATCH: usize = 500;
 
 /// Ce que la passe attend de ce qui fabrique les vecteurs.
 ///
@@ -54,6 +57,27 @@ const BATCH: usize = 500;
 pub trait Encoder {
     /// La dimension des vecteurs produits.
     fn dim(&self) -> usize;
+
+    /// Combien de textes cet encodeur veut recevoir d'un coup.
+    ///
+    /// ## Pourquoi c'est au modèle de le dire, et pas à la passe
+    ///
+    /// Trouvé le 2026-09-21 en lançant la première passe transformeur : **4 557 Mio de mémoire
+    /// résidente avant le premier vecteur écrit**, contre 117 pour l'embedding statique.
+    ///
+    /// Le lot de cinq cents avait été dimensionné pour un modèle **sans attention**, où le coût
+    /// d'un texte est celui de ses jetons — linéaire, minuscule. Un transformeur calcule en plus,
+    /// à chacune de ses douze couches, une matrice d'attention de `jetons × jetons` **par texte
+    /// du lot**. Cinq cents textes de 256 jetons font quatre milliards de flottants
+    /// d'intermédiaires.
+    ///
+    /// La leçon générale : **une constante de lot porte une hypothèse sur ce qu'elle nourrit.**
+    /// Celle-ci était juste et elle est devenue fausse le jour où le modèle a changé de famille,
+    /// sans qu'aucun test ne puisse le voir — les tests emploient un encodeur jouet dont le coût
+    /// est linéaire, comme l'était l'ancien modèle.
+    fn batch(&self) -> usize {
+        BATCH
+    }
 
     /// Encode un lot de textes, dans l'ordre.
     ///
@@ -212,6 +236,7 @@ fn advance(
 ) -> Result<Stats> {
     let mut stats = Stats::default();
     let parser = mail_parser::MessageParser::default();
+    let batch = model.batch().max(1);
     let mut writer = VectorWriter::open(store.vectors_path(), model.dim())?;
 
     let pending = store.unvectorised_total()?;
@@ -219,7 +244,7 @@ fn advance(
     let mut remaining = pending;
 
     while remaining > 0 {
-        let rows = store.unvectorised(BATCH.min(usize::try_from(remaining).unwrap_or(BATCH)))?;
+        let rows = store.unvectorised(batch.min(usize::try_from(remaining).unwrap_or(batch)))?;
         if rows.is_empty() {
             break;
         }

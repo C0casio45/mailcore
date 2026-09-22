@@ -318,6 +318,12 @@ enum Command {
         /// valeur reprise d'un article et jamais éprouvée sur ce corpus.
         #[arg(long, default_value_t = mailcore::fusion::K)]
         k: f32,
+        /// Le modèle est un transformeur (`candle`) et non un embedding statique.
+        ///
+        /// La famille doit correspondre à celle qui a écrit le magasin de vecteurs : les
+        /// dimensions diffèrent, et le magasin refuse une dimension qui n'est pas la sienne.
+        #[arg(long)]
+        bert: bool,
     },
 
     /// Mesure le critère 2 de la phase 4 : la latence d'un balayage vectoriel complet.
@@ -354,6 +360,9 @@ enum Command {
         /// Le répertoire du modèle à sonder.
         #[arg(long, default_value = "measurements/models/potion-taille")]
         model: Utf8PathBuf,
+        /// Sonder un transformeur (candle) plutôt qu'un embedding statique.
+        #[arg(long)]
+        bert: bool,
     },
 
     /// Relie un jeu de requêtes à un store par le **contenu** des messages, pas par leur
@@ -617,14 +626,15 @@ fn main() -> Result<()> {
             limit,
             model,
             k,
-        } => recall::measure(&store, &queries, limit, model.as_ref(), k),
+            bert,
+        } => recall::measure(&store, &queries, limit, model.as_ref(), k, bert),
         Command::MeasureScan {
             messages,
             dim,
             limit,
             queries,
         } => scan::measure(messages, dim, limit, queries),
-        Command::ModelProbe { model } => probe::model(&model),
+        Command::ModelProbe { model, bert } => probe::model(&model, bert),
         Command::QueriesRebind {
             store,
             queries,
