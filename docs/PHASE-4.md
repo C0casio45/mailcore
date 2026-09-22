@@ -172,6 +172,26 @@ utilisable.
    piste sémantique est un pari. Ce manque-ci est **certain, borné, et il sert les deux moteurs** —
    le plein texte en profite autant que le sémantique, et sans dépendre d'un modèle.
 
+   - ~~**Compter avant d'écrire.**~~ Fait le 2026-09-22 : `cargo xtask attachment-census`. 7 094
+     messages à pièce jointe, et un ordre de travail qui n'était pas celui qu'on croyait — les
+     images dominent en nombre et ne portent pas de texte, les invitations en valent plus que
+     les PDF et se lisent avec du code déjà écrit.
+   - ~~**Les formats gratuits** : invitations et `text/*`.~~ Fait le 2026-09-23 :
+     `mailcore::attachtext`, partagé par les deux index. **1 363 messages** gagnent un mot que le
+     reste du message n'a pas, sans une ligne de dépendance nouvelle. Aucune régression sur le
+     banc, et aucun gain non plus — le jeu de requêtes ne vise aucune pièce jointe, ce qui est une
+     limite de l'instrument et non un résultat.
+   - **Le PDF**, 1 222 messages, en attente d'une décision : il demande une dépendance qui
+     analysera 1,1 Gio de fichiers écrits par des inconnus. Le gain attendu est du même ordre que
+     ce que les formats gratuits viennent de rapporter.
+   - **Hors périmètre, écrit pour ne pas le redécouvrir** : l'OCR des images (4 659 messages, donc
+     un second modèle à installer) et `application/ms-tnef` (738 messages), qui est un conteneur
+     et se traitera après les formats qu'il contient, jamais avant.
+
+   Et ce que l'étape impose au jeu de requêtes : il doit grossir **dans deux directions** — la
+   synonymie française (étape 6 ter) et le contenu des pièces jointes, faute de quoi le banc reste
+   muet sur ce qu'on vient de livrer.
+
 7. **La passe incrémentale** — critère 4 — sur le modèle des trois dérivés existants, et une
    quatrième ligne dans `measure-followup`.
 
@@ -1453,3 +1473,146 @@ arbitrage d'implémentation. Il est posé à l'utilisateur plutôt que décidé 
 Ce qui est acquis quel qu'en soit le verdict : `application/ms-tnef` (738 messages) est un
 conteneur Outlook dont le contenu est lui-même des pièces jointes, donc il se traitera *après*
 les formats qu'il contient, et jamais avant.
+
+### 2026-09-23 — l'étape 6 quater : 1 363 messages de plus, et un raccourci qui vivait en trois exemplaires
+
+Le recensement de la veille avait changé l'ordre de l'étape : avant la première ligne d'extracteur
+PDF, il y avait 1 880 messages à rendre trouvables avec du code déjà écrit. C'est fait, et le
+chiffre réel n'est pas celui-là.
+
+#### Ce qui est extrait, et où ça vit
+
+`mailcore::attachtext` lit deux familles, et rien d'autre :
+
+- **les invitations** — `text/calendar`, `application/ics` — par `mailcal`, qui les analyse déjà
+  depuis la phase 3 et n'a aucune dépendance. Ce qu'on en garde est ce qu'un humain cherche : le
+  titre, le lieu, la description, et les **noms** des participants. Pas les dates, qui sont déjà
+  des colonnes et ne se cherchent pas en toutes lettres ; pas les adresses, qui sont déjà indexées
+  par les en-têtes ; pas les URL, que `docs/PRIVACY.md` interdit de suivre et que personne ne tape
+  dans une recherche ;
+- **les pièces `text/*`** — `html`, `plain`, `x-amp-html`… — par `mailhtml`, le même dégraissage
+  que pour un corps.
+
+Le module est dans `mailcore` et non dans chacun des deux index, parce qu'il y en a deux :
+`index::writer` compose le document tantivy, `mailvec::text` compose le texte à vectoriser, et les
+deux doivent voir **le même** texte. Deux extractions divergeraient, et la divergence se verrait
+seulement à l'usage — un message trouvable en plein texte et pas en sémantique, sans explication.
+C'est la règle du carnet d'adresses : deux chemins vers la même donnée partagent leur code.
+
+Et un plafond, parce qu'une pièce jointe est écrite par l'expéditeur : 256 Kio de texte extrait par
+message. Il ne mord jamais en régime ordinaire — la moyenne mesurée est de 35 Kio — et il empêche
+un expéditeur de décider combien de mémoire une moisson consomme.
+
+#### Le chiffre, et pourquoi ce n'est pas celui qu'on annonçait
+
+| | messages |
+|---|---:|
+| estimation de la veille (1 286 ICS + 594 `text/*`) | 1 880 |
+| **texte effectivement récupéré** | **1 520** |
+| **dont la pièce jointe apporte un mot que le reste du message n'a pas** | **1 363** |
+
+L'estimation était **24 % trop haute**, pour une raison bête et instructive : les colonnes du
+recensement comptent des messages **par type**, et un message qui porte une invitation *et* une
+pièce HTML était compté deux fois. Additionner des colonnes qui ne sont pas disjointes donne un
+total qui n'existe pas. C'est la même famille d'erreur que la médiane de la veille — un résumé
+qu'on lit sans vérifier ce qu'il agrège.
+
+Le second chiffre est celui qui compte, et il a été ajouté pour ça. « Du texte en plus » ne veut
+pas dire « un message de plus trouvable » : une invitation dont le titre reprend le sujet du
+message n'apporte rien à l'index. **1 363 messages sur 1 520 apportent au moins un mot nouveau**,
+soit 90 % — le gain est donc réel, et on le sait plutôt que de l'espérer.
+
+#### Ce que le banc dit, et ce qu'il ne peut pas dire
+
+L'index plein texte a été reconstruit — 389,8 s, 292,8 Mio de texte indexé — et le jeu de requêtes
+rejoué :
+
+| sous-ensemble facile, plein texte | avant | après |
+|---|---:|---:|
+| rappel @10 | 41,7 % | 41,7 % |
+| rang médian | 43 | 42 |
+| rangs | 1 1 1 1 8 29 57 97 245 | 1 1 1 1 7 29 56 95 242 |
+
+**Aucun gain, et aucune régression.** Il faut dire les deux, et le second compte autant : ajouter
+292,8 Mio de texte à un index aurait pu enfoncer des cibles sous du bruit, et ça n'arrive pas — les
+quelques rangs qui bougent s'améliorent d'un ou deux crans.
+
+L'absence de gain n'est pas un échec de l'extraction, c'est une **limite de l'instrument** :
+aucune des 22 requêtes du jeu ne vise le contenu d'une pièce jointe. Le banc a été écrit à
+l'étape 1 pour mesurer la synonymie, pas ça. Il ne pouvait donc rien montrer, et le savoir d'avance
+valait mieux que de lire son silence comme un résultat.
+
+Ce qui se conclut malgré tout : **1 363 messages sont maintenant atteignables par un mot qui ne
+menait à rien hier.** C'est une mesure directe, elle ne dépend d'aucun jeu de requêtes, et elle
+suffit à justifier l'étape. Ce qui manque pour aller plus loin — et qui rejoint ce que l'étape
+6 ter demandait déjà — ce sont **des requêtes qui visent des pièces jointes**. Le jeu doit grossir
+dans deux directions maintenant : la synonymie française, et le contenu des pièces.
+
+#### Le défaut du jour, et il est meilleur que l'étape
+
+Changer la composition du texte change les vecteurs. La provenance écrite la veille retenait le
+modèle et le budget — **tout ce qui changeait les vecteurs ce jour-là**. Il a donc fallu lui
+ajouter un cinquième champ, une révision de la composition, et ça mérite d'être noté tel quel :
+**une garantie qui énumère ce qui compte doit être relue chaque fois qu'on ajoute quelque chose qui
+compte.** L'énumération ne se met pas à jour toute seule, et celle-ci a tenu exactement une
+journée.
+
+Mais le vrai défaut est en dessous. Avec le champ ajouté et le refus de `VectorWriter::open` en
+place, `mail vectors` annonçait toujours :
+
+```
+À vectoriser       0 messages
+Rien à faire — tout le corpus a déjà son vecteur.
+```
+
+sur un magasin périmé. Parce que **le raccourci « y a-t-il du travail » existait en trois
+exemplaires** :
+
+1. `pass::update` court-circuitait sur un `COUNT` — la question la moins chère, ajoutée le
+   2026-09-11 pour ne pas charger le modèle à chaque moisson ;
+2. `mail vectors` refaisait le même `COUNT` pour son affichage, et **retournait avant d'appeler la
+   passe** ;
+3. le contrôle de provenance vivait dans l'ouverture du magasin en écriture.
+
+Le troisième ne pouvait jamais être atteint, puisque les deux premiers rendaient la main. Corriger
+le premier n'a rien corrigé : la commande n'y arrivait pas. Il a fallu le voir échouer **deux fois
+sur le corpus réel** avant de comprendre que le problème n'était pas où je regardais.
+
+La forme de la faute est l'inverse de celle du carnet d'adresses. Là-bas, deux chemins vers la même
+donnée devaient partager leur **code** plutôt que leur intention. Ici, deux endroits posaient la
+même **question** et l'un des deux ignorait la moitié de la réponse. D'où `pass::Pending`, qui est
+maintenant la seule porte : elle rend le compte **et** la péremption, et son `is_empty` exige les
+deux. La commande la pose au lieu d'y répondre elle-même.
+
+Un magasin périmé est **refait**, pas refusé. Le refus existait déjà à l'ouverture en écriture et il
+reste — c'est la barrière de dernier recours, au niveau où elle vit — mais l'appelant n'a rien à
+comprendre : la passe remet les drapeaux à zéro, retire le magasin et recommence, exactement comme
+elle le fait depuis le 2026-09-11 quand le magasin a **disparu**. Les deux divergences ont la même
+conséquence — des drapeaux qui mentent — donc elles ont la même réponse.
+
+Un test l'a suivi : celui qui vérifiait qu'un changement de budget **échoue** a changé de
+conclusion. Son motif écrit était « deux budgets ne doivent pas partager un magasin » ; ce motif est
+maintenant mieux tenu qu'avant, puisque la passe détecte et refait au lieu de rendre une erreur.
+La garantie est la même, le remède est meilleur, donc c'est le test qui bouge — et il vérifie
+désormais ce que l'ancien ne disait pas : qu'après un changement de budget le magasin porte
+**exactement** les nouveaux vecteurs, sans garder les anciens à côté.
+
+#### Ce qui reste pour le PDF
+
+Rien n'a changé à la question posée la veille, et le chiffre du jour l'éclaire un peu : les formats
+gratuits ont rapporté 1 363 messages. Les PDF en promettent 1 222 de plus, au prix d'une dépendance
+qui analysera 1,1 Gio de fichiers écrits par des inconnus. L'ordre de grandeur du gain est donc
+**le même** que ce qu'on vient d'obtenir sans rien risquer — ce qui ne tranche pas la question,
+mais la pose enfin avec ses deux plateaux chargés.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 443 tests verts**, soit 17 de plus. Ceux qui portent l'étape : une
+invitation qui rend son titre et son lieu, `application/ics` lu comme `text/calendar`, un PDF et
+une image qui ne rendent **rien** plutôt que leurs octets bruts, un HTML de pièce jointe dégraissé
+comme un corps, une pièce énorme plafonnée, un plafond qui ne coupe jamais au milieu d'un
+caractère, une invitation cassée qui ne fait pas paniquer, de l'UTF-8 invalide qui dégrade sans
+perdre la pièce, le corps ordinaire qui n'est **pas** repris ici, le texte de la pièce jointe placé
+**avant** le corps dans le vecteur, une pièce bavarde qui ne prend jamais plus de la moitié de la
+place, un budget nul qui ne prend pas de pièce jointe non plus, une révision de composition refusée
+comme un changement de modèle, un magasin périmé refait plutôt qu'annoncé à jour — et son contrôle
+inverse, sans lequel la passe revectoriserait le corpus entier à chaque moisson.

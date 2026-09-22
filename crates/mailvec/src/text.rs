@@ -52,6 +52,31 @@ use mailhtml::blocks::Kind;
 /// est la signature d'un réglage qui a un optimum et pas une monotonie.
 pub const BUDGET: usize = 2_000;
 
+/// La révision de **ce qui compose le texte**, à incrémenter quand la composition change.
+///
+/// ## Pourquoi un numéro à la main plutôt que rien
+///
+/// La provenance du magasin de vecteurs, écrite le 2026-09-22, retient le modèle et le budget —
+/// les deux choses qui changeaient les vecteurs **à ce moment-là**. Le lendemain, l'extraction du
+/// texte des pièces jointes en a changé un troisième : à modèle et budget identiques, le même
+/// message ne rend plus le même vecteur.
+///
+/// Sans ce champ, un magasin écrit avant et une passe lancée après se seraient trouvés
+/// « comparables », et la passe aurait ajouté derrière sans rien dire. C'est exactement le défaut
+/// du 2026-09-21 revenu sous une autre forme, une journée après avoir été bouché — ce qui dit
+/// quelque chose d'utile : **une garantie qui énumère ce qui compte doit être relue chaque fois
+/// qu'on ajoute quelque chose qui compte.** L'énumération ne se met pas à jour toute seule.
+///
+/// Un numéro à la main est grossier et c'est assumé : l'alternative — hacher le code de
+/// composition — n'existe pas en Rust sans macro de compilation, et un hachage du texte produit
+/// coûterait une passe pour le connaître.
+///
+/// | révision | ce qui a changé |
+/// |---|---|
+/// | 1 | sujet, expéditeur, corps sans citation (2026-09-21) |
+/// | 2 | le texte des pièces jointes s'y ajoute, avant le corps (2026-09-23) |
+pub const REVISION: u32 = 2;
+
 /// Ce qu'on garde d'un message, et jusqu'où.
 ///
 /// Un paramètre et non une constante depuis le 2026-09-21 : le relevé du critère 1 a rendu 0 %
@@ -92,11 +117,27 @@ impl Budget {
 /// La question est ouverte et appartient à l'étape 6.
 #[must_use]
 pub fn compose(subject: &str, from_name: Option<&str>, body: &str) -> String {
+    compose_with(subject, from_name, "", body)
+}
+
+/// [`compose`] avec le texte des pièces jointes, placé entre l'expéditeur et le corps.
+///
+/// La place n'est pas indifférente — voir [`attachments`] — et elle est ici plutôt que chez
+/// l'appelant pour que les deux façons de composer un texte ne puissent pas en donner deux
+/// ordres différents.
+#[must_use]
+pub fn compose_with(
+    subject: &str,
+    from_name: Option<&str>,
+    attachments: &str,
+    body: &str,
+) -> String {
     let mut out = String::with_capacity(BUDGET + 128);
     push_part(&mut out, subject.trim());
     if let Some(name) = from_name {
         push_part(&mut out, name.trim());
     }
+    push_part(&mut out, attachments.trim());
     push_part(&mut out, body);
     out
 }
@@ -153,7 +194,39 @@ pub fn from_message(
             _ => {}
         }
     }
-    compose(subject, from_name, &body(&html, budget))
+    compose_with(
+        subject,
+        from_name,
+        &attachments(parsed, budget),
+        &body(&html, budget),
+    )
+}
+
+/// Le texte des pièces jointes, ramené à la part qui leur revient dans le budget.
+///
+/// ## Pourquoi **avant** le corps, et pourquoi seulement la moitié
+///
+/// Les deux moitiés de la règle ont chacune leur défaut à éviter.
+///
+/// **Avant**, parce que les messages que cette extraction vise sont ceux dont le corps ne dit
+/// rien : une invitation porte « Vous avez été invité à un événement » dans son corps et
+/// « Signature chez le notaire » dans son fichier. Mettre la pièce jointe après le corps la
+/// ferait sortir du budget précisément pour les messages où elle est le seul contenu — le gain
+/// serait nul là où il est tout l'intérêt.
+///
+/// **La moitié au plus**, parce que l'inverse est vrai aussi : une pièce jointe de texte de
+/// cinquante mille caractères chasserait le corps entier du vecteur. Le plafond garantit qu'un
+/// message garde toujours de quoi être lui-même, quoi que l'expéditeur y ait accroché. C'est la
+/// même forme que le plafond de [`mailcore::attachtext::BUDGET`], un cran plus bas : là-bas il
+/// borne ce qu'un expéditeur fait consommer, ici il borne ce qu'il fait **oublier**.
+fn attachments(parsed: &mail_parser::Message<'_>, budget: Budget) -> String {
+    let room = budget.body / 2;
+    if room == 0 {
+        return String::new();
+    }
+    let mut text = String::new();
+    mailcore::attachtext::attachment_text(parsed, &mut text);
+    truncate(text, room)
 }
 
 /// Le corps d'un message, cité retiré et tronqué au budget.
@@ -400,5 +473,106 @@ mod tests {
             body("<script>secret</script><p>visible</p>", Budget::default()).contains("visible"),
             "le texte légitime a disparu avec le script"
         );
+    }
+
+    /// Un message porteur d'une invitation, dont le corps ne dit rien et le fichier tout.
+    ///
+    /// C'est le cas que l'étape 6 quater vise : « Vous avez été invité » dans le corps,
+    /// « Signature chez le notaire » dans la pièce jointe.
+    fn with_invitation() -> Vec<u8> {
+        "From: a@exemple.invalid\r\n\
+         Subject: Invitation\r\n\
+         Content-Type: multipart/mixed; boundary=SEP\r\n\
+         \r\n\
+         --SEP\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         \r\n\
+         Vous avez ete invite a un evenement.\r\n\
+         --SEP\r\n\
+         Content-Type: text/calendar; charset=utf-8\r\n\
+         \r\n\
+         BEGIN:VCALENDAR\r\n\
+         BEGIN:VEVENT\r\n\
+         SUMMARY:Signature chez le notaire\r\n\
+         LOCATION:14 rue des Lilas\r\n\
+         END:VEVENT\r\n\
+         END:VCALENDAR\r\n\
+         --SEP--\r\n"
+            .as_bytes()
+            .to_vec()
+    }
+
+    fn composed(raw: &[u8], budget: Budget) -> String {
+        let parser = mail_parser::MessageParser::default();
+        let parsed = parser.parse(raw).unwrap();
+        from_message(&parsed, "Invitation", Some("Le notaire"), budget)
+    }
+
+    #[test]
+    fn what_an_invitation_carries_enters_the_text_to_vectorise() {
+        let found = composed(&with_invitation(), Budget::default());
+        assert!(found.contains("Signature chez le notaire"), "{found}");
+        assert!(found.contains("rue des Lilas"), "{found}");
+        // Le corps reste : la pièce jointe s'ajoute, elle ne remplace pas.
+        assert!(found.contains("invite a un evenement"), "{found}");
+    }
+
+    /// **L'ordre compte**, et c'est toute la raison de la place choisie. Les messages visés sont
+    /// ceux dont le corps est du gabarit ; mettre la pièce jointe après le corps la ferait sortir
+    /// du budget précisément là où elle est le seul contenu.
+    #[test]
+    fn the_attachment_text_comes_before_the_body() {
+        let found = composed(&with_invitation(), Budget::default());
+        let notaire = found.find("Signature chez le notaire").expect("présent");
+        let corps = found.find("invite a un evenement").expect("présent");
+        assert!(notaire < corps, "la pièce jointe est passée après le corps");
+    }
+
+    /// Et le contrôle inverse : une pièce jointe bavarde ne chasse pas le message.
+    #[test]
+    fn a_talkative_attachment_never_takes_more_than_half_the_room() {
+        let mut raw = String::from(
+            "From: a@exemple.invalid\r\n\
+             Subject: gros\r\n\
+             Content-Type: multipart/mixed; boundary=SEP\r\n\
+             \r\n\
+             --SEP\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             corpsdistinctif\r\n\
+             --SEP\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Disposition: attachment; filename=\"gros.txt\"\r\n\
+             \r\n\
+             ",
+        );
+        raw.push_str(&"bavard ".repeat(5_000));
+        raw.push_str("\r\n--SEP--\r\n");
+
+        let budget = Budget::default();
+        let found = composed(raw.as_bytes(), budget);
+        let bavard = found.matches("bavard").count() * "bavard ".len();
+        assert!(
+            bavard <= budget.body / 2 + 16,
+            "la pièce jointe a pris {bavard} octets sur {}",
+            budget.body
+        );
+        assert!(
+            found.contains("corpsdistinctif"),
+            "le corps a été chassé par la pièce jointe : {found}"
+        );
+    }
+
+    /// Un budget nul veut dire « pas de corps », donc pas de pièce jointe non plus : c'est le
+    /// régime « sujet et expéditeur seuls » du balayage du 2026-09-22, et y laisser entrer une
+    /// pièce jointe le rendrait impossible à interpréter.
+    #[test]
+    fn a_zero_budget_takes_no_attachment_either() {
+        let found = composed(&with_invitation(), Budget::of(0));
+        assert!(
+            !found.contains("notaire") || found.contains("Le notaire"),
+            "{found}"
+        );
+        assert!(!found.contains("rue des Lilas"), "{found}");
     }
 }

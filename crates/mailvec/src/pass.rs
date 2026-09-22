@@ -197,7 +197,21 @@ pub fn update(
     // millisecondes et une centaine de mébioctets ; le `COUNT` qui dit s'il y a du travail coûte
     // des microsecondes. La passe tourne après chaque moisson, et la grande majorité des
     // moissons n'apportent rien.
-    if store.unvectorised_total()? == 0 {
+    //
+    // **Mais il y a plus urgent que « y a-t-il du nouveau » : « ce qui est là est-il encore
+    // valable ».** Trouvé le 2026-09-23, en changeant la composition du texte : tous les messages
+    // étaient marqués vectorisés, donc ce `COUNT` rendait zéro, donc la passe annonçait « rien à
+    // faire » sur un magasin devenu périmé. Le refus de `VectorWriter::open` ne servait à rien —
+    // il n'était jamais atteint.
+    //
+    // C'est la forme exacte du défaut du critère 9 : un drapeau qui dit « fait » à côté d'une
+    // donnée qui ne correspond plus, et rien pour le signaler. Le contrôle est donc **avant** le
+    // raccourci, et il reste bon marché : lire un en-tête de vingt octets, pas cent treize
+    // mébioctets de vecteurs.
+    // Le raccourci ne s'applique que si ce qui est là est encore valable — voir [`Pending`]. La
+    // remise à zéro, elle, est faite par `update_with` : c'est le passage obligé des deux
+    // chemins, celui-ci et celui du transformeur que `mail vectors --bert` appelle directement.
+    if pending(store, budget)?.is_empty() {
         return Ok(Stats::default());
     }
 
@@ -239,6 +253,33 @@ pub fn update_with(
         store.reset_vectorised()?;
     }
     drop(stored);
+
+    // **Le second cas de divergence, trouvé le 2026-09-23.** Le premier est un magasin *disparu*
+    // pendant que les drapeaux disent « fait » ; celui-ci est un magasin *présent* mais écrit par
+    // une autre composition de texte. Les deux ont la même conséquence — des drapeaux qui
+    // mentent — et la même réponse.
+    //
+    // Il est traité ici plutôt que dans `update` parce que c'est le passage obligé des deux
+    // chemins, celui du modèle statique et celui du transformeur. Le mettre en amont n'aurait
+    // couvert que le premier, et c'est le second qui avait le magasin périmé.
+    if stale(store, budget)? {
+        tracing::warn!(
+            "le magasin de vecteurs a été écrit par une autre composition de texte ou un autre \
+             budget : passe complète"
+        );
+        store.reset_vectorised()?;
+        // Le magasin est retiré, sinon `VectorWriter::open` refuserait d'y ajouter — à juste
+        // titre : ses records et ceux qu'on s'apprête à écrire ne se comparent pas. C'est le
+        // même geste que `rebuild`, déclenché par une divergence au lieu d'une demande.
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|source| {
+                Error::Core(mailcore::Error::Io {
+                    path: path.clone(),
+                    source,
+                })
+            })?;
+        }
+    }
 
     advance(store, model, budget, progress)
 }
@@ -291,6 +332,74 @@ pub fn rebuild_with(
     advance(store, model, budget, progress)
 }
 
+/// Ce qu'une passe aurait à faire si on la lançait maintenant.
+///
+/// ## Pourquoi cette question a une seule réponse, et une seule porte
+///
+/// Elle en avait **trois** avant le 2026-09-23, et c'est ce qui a laissé passer le défaut du jour :
+/// `update` court-circuitait sur un `COUNT`, `mail vectors` refaisait le même `COUNT` pour son
+/// affichage — et retournait avant même d'appeler la passe —, et la vérification de provenance
+/// vivait encore ailleurs. Corriger la première n'a rien corrigé du tout, parce que la commande
+/// n'y arrivait jamais.
+///
+/// C'est la leçon du carnet d'adresses, dans l'autre sens : là-bas, deux chemins vers la même
+/// donnée devaient partager leur **code** et pas seulement leur intention ; ici, deux endroits
+/// posaient la même **question** et l'un des deux ignorait la moitié de la réponse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pending {
+    /// Combien de messages n'ont pas encore de vecteur.
+    pub messages: u64,
+    /// Le magasin a-t-il été écrit par une autre composition de texte, ou un autre budget ?
+    ///
+    /// Quand c'est vrai, `messages` ne dit plus rien d'utile : la passe remettra tous les
+    /// drapeaux à zéro, donc le travail réel est le corpus entier.
+    pub stale: bool,
+}
+
+impl Pending {
+    /// Vrai s'il n'y a rien à faire — **les deux** conditions, pas seulement le compte.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.messages == 0 && !self.stale
+    }
+}
+
+/// Ce qu'une passe aurait à faire, sans rien charger de cher.
+///
+/// Un `COUNT` sur colonne indexée et un en-tête de vingt octets. C'est ce qui permet de la poser
+/// après chaque moisson sans payer le chargement d'un modèle — la leçon du 2026-09-11, et elle
+/// tient toujours : ce contrôle-ci ne l'a pas rendue plus chère.
+///
+/// # Errors
+///
+/// [`Error::Core`] si le store ou l'en-tête du magasin est illisible.
+pub fn pending(store: &Store, budget: crate::text::Budget) -> Result<Pending> {
+    Ok(Pending {
+        messages: store.unvectorised_total()?,
+        stale: stale(store, budget)?,
+    })
+}
+
+/// Le magasin existant a-t-il été écrit par autre chose que ce que cette passe écrirait ?
+///
+/// Ne compare que **ce qui se sait sans charger le modèle** — le budget et la révision de la
+/// composition. Le nom et l'empreinte du modèle demanderaient de lire 470 Mo de poids, ce qui
+/// coûterait plus cher que le raccourci qu'on cherche à protéger ; ils restent vérifiés au moment
+/// d'ouvrir le magasin en écriture, où le modèle est de toute façon chargé.
+///
+/// Autrement dit : le contrôle bon marché attrape le cas bon marché, le contrôle cher attrape le
+/// reste, et aucun des deux ne dispense de l'autre.
+///
+/// Un magasin absent ou sans provenance n'est **pas** périmé : le premier n'existe pas encore, le
+/// second est un magasin de version 1 qu'on ne peut pas juger. Les déclarer périmés déclencherait
+/// une passe complète de quatre heures à chaque démarrage sur une installation ancienne.
+fn stale(store: &Store, budget: crate::text::Budget) -> Result<bool> {
+    let Some(found) = mailcore::vectors::provenance_of(&store.vectors_path())? else {
+        return Ok(false);
+    };
+    Ok(found.budget != budget.body || found.revision != crate::text::REVISION)
+}
+
 /// Ce qui sera écrit dans l'en-tête du magasin.
 ///
 /// Le budget en fait partie parce qu'il change les vecteurs autant que le modèle : c'est le
@@ -306,6 +415,7 @@ fn provenance_of(
         family: identity.family,
         digest: identity.digest,
         budget: budget.body,
+        revision: crate::text::REVISION,
         written: today(),
     }
 }
@@ -682,22 +792,84 @@ mod tests {
 
     /// Et le champ dont l'absence a rendu quatre magasins indiscernables le 2026-09-21.
     ///
-    /// Le budget de texte change les vecteurs autant que le modèle : le balayage à 2 000, 400,
-    /// 150 et 0 a écrit quatre magasins que ni la dimension ni le nom du modèle ne séparaient.
+    /// ## Ce test a changé de conclusion le 2026-09-23, et pourquoi
+    ///
+    /// Il vérifiait que la passe **échoue** quand le budget change. Son motif écrit était « le
+    /// budget change les vecteurs autant que le modèle, et le balayage à 2 000, 400, 150 et 0 a
+    /// écrit quatre magasins que rien ne séparait » — c'est-à-dire : *deux budgets ne doivent pas
+    /// partager un magasin*.
+    ///
+    /// Ce motif est maintenant mieux tenu qu'avant : la passe **détecte** la divergence et refait
+    /// le magasin, au lieu de rendre une erreur que l'appelant devait comprendre. La garantie est
+    /// la même, le remède est meilleur, donc c'est le test qui bouge. La barrière d'origine, elle,
+    /// n'a pas disparu — `mailcore::vectors::store` la vérifie toujours à son niveau, qui est
+    /// celui où elle vit.
+    ///
+    /// Ce qu'on vérifie ici est donc ce que l'ancien test ne disait pas : après un changement de
+    /// budget, le magasin porte **exactement** les nouveaux vecteurs, sans garder les anciens à
+    /// côté.
     #[test]
-    fn changing_the_text_budget_is_refused_like_changing_the_model() {
-        let (_dir, store) = corpus(2);
+    fn changing_the_text_budget_replaces_the_store_rather_than_mixing_two() {
+        let (_dir, store) = corpus(4);
         let progress = Progress::new();
         let fake = Fake::new(8);
 
         update_with(&store, &fake, crate::text::Budget::of(2_000), &progress).unwrap();
-        store.reset_vectorised().unwrap();
-        let found = update_with(&store, &fake, crate::text::Budget::of(150), &progress);
+        let redone = update_with(&store, &fake, crate::text::Budget::of(150), &progress).unwrap();
 
-        assert!(
-            found.is_err(),
-            "deux budgets ont écrit dans le même magasin sans que rien ne le dise"
+        assert_eq!(redone.vectorised, 4, "le changement de budget a été ignoré");
+        assert_eq!(
+            Vectors::load(store.vectors_path(), 8).unwrap().len(),
+            4,
+            "les vecteurs des deux budgets cohabitent dans le magasin"
         );
+        let provenance = mailcore::vectors::provenance_of(&store.vectors_path())
+            .unwrap()
+            .expect("le magasin refait porte sa provenance");
+        assert_eq!(provenance.budget, 150, "la provenance dit l'ancien budget");
+    }
+
+    /// Le défaut du 2026-09-23 : un magasin périmé que le raccourci du `COUNT` rendait invisible.
+    ///
+    /// Tous les messages étaient marqués vectorisés, donc `unvectorised_total` rendait zéro, donc
+    /// `update` annonçait « rien à faire » — sur des vecteurs écrits par une autre composition de
+    /// texte. Le refus de `VectorWriter::open` existait déjà et ne servait à rien : il n'était
+    /// jamais atteint.
+    #[test]
+    fn a_store_written_by_another_composition_is_redone_and_not_declared_up_to_date() {
+        let (_dir, store) = corpus(3);
+        let progress = Progress::new();
+        let fake = Fake::new(8);
+
+        update_with(&store, &fake, crate::text::Budget::of(2_000), &progress).unwrap();
+        assert_eq!(
+            store.unvectorised_total().unwrap(),
+            0,
+            "la passe a tout fait"
+        );
+
+        // Un budget différent tient lieu de composition différente : c'est le même champ de
+        // provenance, et il se règle sans toucher à la constante du crate.
+        let redone = update_with(&store, &fake, crate::text::Budget::of(150), &progress).unwrap();
+        assert_eq!(
+            redone.vectorised, 3,
+            "le magasin périmé a été annoncé à jour"
+        );
+    }
+
+    /// Le contrôle inverse du précédent, et il compte autant : une passe qui se croirait toujours
+    /// périmée revectoriserait le corpus entier à chaque moisson — quatre heures, en boucle.
+    #[test]
+    fn a_store_written_by_the_same_composition_is_left_alone() {
+        let (_dir, store) = corpus(3);
+        let progress = Progress::new();
+        let fake = Fake::new(8);
+        let budget = crate::text::Budget::of(2_000);
+
+        update_with(&store, &fake, budget, &progress).unwrap();
+        let again = update_with(&store, &fake, budget, &progress).unwrap();
+
+        assert_eq!(again.vectorised, 0, "une passe à jour a tout refait");
     }
 
     /// Le contrôle inverse des deux précédents : sans lui, un refus systématique les tiendrait.

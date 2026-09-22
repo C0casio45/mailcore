@@ -375,6 +375,7 @@ mod tests {
             family: "jouet".to_owned(),
             digest: format!("{model:_<16}"),
             budget: 2_000,
+            revision: 1,
             written: "2026-09-22".to_owned(),
         }
     }
@@ -615,6 +616,35 @@ mod tests {
         again.sync().unwrap();
 
         assert_eq!(Vectors::load(&path, 3).unwrap().len(), 2);
+    }
+
+    /// Le champ ajouté le 2026-09-23, quand l'extraction des pièces jointes a changé le texte.
+    ///
+    /// À modèle, budget et dimension identiques, un message ne rend plus le même vecteur. Sans
+    /// ce refus, un magasin de la veille et une passe du lendemain se seraient trouvés
+    /// comparables, et la seconde aurait ajouté derrière sans rien dire — le défaut du
+    /// 2026-09-21 revenu une journée après avoir été bouché.
+    #[test]
+    fn changing_what_composes_the_text_is_refused_like_changing_the_model() {
+        let (_dir, path) = scratch();
+        let avant = named("e5-small");
+        let apres = Provenance {
+            revision: avant.revision + 1,
+            ..named("e5-small")
+        };
+
+        let mut writer = VectorWriter::open(&path, 3, &avant).unwrap();
+        writer.append(MessageId(1), &[1.0, 0.0, 0.0]).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        assert!(
+            matches!(
+                VectorWriter::open(&path, 3, &apres),
+                Err(Error::VectorFormat { .. })
+            ),
+            "une autre composition de texte a été ajoutée derrière la première"
+        );
     }
 
     /// La date ne fait pas partie de l'identité, et c'est le critère 3 qui l'exige.

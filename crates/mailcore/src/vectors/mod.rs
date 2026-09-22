@@ -64,6 +64,35 @@ mod store;
 pub use scan::{Hit, Vectors};
 pub use store::VectorWriter;
 
+/// La provenance d'un magasin, lue **sans** charger les vecteurs.
+///
+/// ## Pourquoi elle a sa propre porte
+///
+/// [`Vectors::load`] rend la même chose, et lit les 113 Mio de records pour y arriver. La passe a
+/// besoin de la provenance **avant** de décider s'il y a du travail — c'est la question la moins
+/// chère, et la payer au prix d'une relecture complète reviendrait à ne pas la poser.
+///
+/// Rend `Ok(None)` pour un magasin absent comme pour un magasin de version 1 : dans les deux cas
+/// on ne sait pas ce qui l'a écrit, et l'appelant doit traiter les deux pareil.
+///
+/// # Errors
+///
+/// [`crate::Error::Io`] si le fichier existe et n'est pas lisible, [`crate::Error::VectorFormat`]
+/// si son en-tête n'est pas celui d'un magasin.
+pub fn provenance_of(path: &camino::Utf8Path) -> crate::Result<Option<Provenance>> {
+    let mut file = match std::fs::File::open(path.as_std_path()) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(crate::Error::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    Ok(store::read_header(&mut file, path)?.provenance)
+}
+
 /// Ce qui a écrit un magasin de vecteurs.
 ///
 /// Elle répond à une seule question, celle que le 2026-09-22 n'a pas pu trancher :
@@ -93,6 +122,20 @@ pub struct Provenance {
     /// Le champ qui manquait le 2026-09-21 : le balayage à 2 000, 400, 150 et 0 a laissé quatre
     /// magasins indiscernables.
     pub budget: usize,
+    /// La révision de ce qui **compose** le texte donné au modèle.
+    ///
+    /// ## Le champ qui manquait le lendemain
+    ///
+    /// Les quatre précédents ont été écrits le 2026-09-22 parce qu'ils étaient, ce jour-là, tout
+    /// ce qui changeait les vecteurs. Le 2026-09-23, l'extraction du texte des pièces jointes en
+    /// a changé un cinquième : à modèle et budget identiques, un message ne rend plus le même
+    /// vecteur. Sans ce champ, un magasin d'hier et une passe d'aujourd'hui se seraient trouvés
+    /// comparables, et la seconde aurait ajouté derrière le premier sans rien dire.
+    ///
+    /// La leçon, qui vaut au-delà d'ici : **une garantie qui énumère ce qui compte doit être
+    /// relue chaque fois qu'on ajoute quelque chose qui compte.** Une énumération ne se met pas à
+    /// jour toute seule, et celle-ci a tenu exactement une journée.
+    pub revision: u32,
     /// Le jour où la passe a écrit ce magasin, en `AAAA-MM-JJ`.
     pub written: String,
 }
@@ -116,11 +159,12 @@ impl Provenance {
                 .collect::<String>()
         };
         format!(
-            "model={}\nfamily={}\ndigest={}\nbudget={}\nwritten={}\n",
+            "model={}\nfamily={}\ndigest={}\nbudget={}\nrevision={}\nwritten={}\n",
             clean(&self.model),
             clean(&self.family),
             clean(&self.digest),
             self.budget,
+            self.revision,
             clean(&self.written),
         )
     }
@@ -139,6 +183,7 @@ impl Provenance {
             family: String::new(),
             digest: String::new(),
             budget: 0,
+            revision: 0,
             written: String::new(),
         };
         for line in raw.lines() {
@@ -150,6 +195,7 @@ impl Provenance {
                 "family" => found.family = value.to_owned(),
                 "digest" => found.digest = value.to_owned(),
                 "budget" => found.budget = value.parse().unwrap_or(0),
+                "revision" => found.revision = value.parse().unwrap_or(0),
                 "written" => found.written = value.to_owned(),
                 _ => {}
             }
@@ -169,14 +215,15 @@ impl Provenance {
             && self.family == other.family
             && self.digest == other.digest
             && self.budget == other.budget
+            && self.revision == other.revision
     }
 
     /// Une ligne pour un relevé.
     #[must_use]
     pub fn summary(&self) -> String {
         format!(
-            "{} ({}, {}) budget {} — écrit le {}",
-            self.model, self.family, self.digest, self.budget, self.written
+            "{} ({}, {}) budget {}, texte r{} — écrit le {}",
+            self.model, self.family, self.digest, self.budget, self.revision, self.written
         )
     }
 }

@@ -116,6 +116,7 @@ fn fill(path: &Utf8PathBuf, messages: usize, dim: usize, shape: Shape) -> Result
         family: "vecteurs fabriqués".to_owned(),
         digest: "aucun-modele___".to_owned(),
         budget: 0,
+        revision: 0,
         written: "banc".to_owned(),
     };
     let mut writer = VectorWriter::open(path, dim, &provenance).context("ouverture du magasin")?;

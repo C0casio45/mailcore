@@ -53,6 +53,12 @@ pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
     let mut with_attachments = 0u64;
     let mut unreadable = 0u64;
     let mut total_parts = 0u64;
+    // Ce que l'extraction rapporte réellement, et non ce qu'elle pourrait rapporter. Le
+    // recensement des types dit ce qui **existe** ; ces deux compteurs disent ce qui **entre dans
+    // l'index**, ce qui est la seule question à laquelle l'étape 6 quater doit répondre.
+    let mut gained_messages = 0u64;
+    let mut gained_bytes = 0u64;
+    let mut newly_findable = 0u64;
 
     let total = rows.len();
     for (seen, row) in rows.iter().enumerate() {
@@ -79,6 +85,20 @@ pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
                 kinds_here.push(kind);
             }
         }
+        let mut gained = String::new();
+        mailcore::attachtext::attachment_text(&parsed, &mut gained);
+        if !gained.trim().is_empty() {
+            gained_messages += 1;
+            gained_bytes += gained.len() as u64;
+            // **Le chiffre qui compte vraiment.** « Du texte en plus » ne veut pas dire « un
+            // message de plus trouvable » : une invitation dont le titre reprend le sujet du
+            // message n'apporte rien à l'index. Ce compteur ne retient que les messages où la
+            // pièce jointe apporte **un mot que le reste du message n'a pas**.
+            if brings_a_new_word(&parsed, &gained, row) {
+                newly_findable += 1;
+            }
+        }
+
         if !kinds_here.is_empty() {
             with_attachments += 1;
             // Un message ne compte qu'une fois par type, même s'il porte douze PDF : la colonne
@@ -110,6 +130,16 @@ pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
     if unreadable > 0 {
         println!("Illisibles         {unreadable}  (blob absent ou en-têtes cassés)");
     }
+    println!(
+        "Texte récupéré     {gained_messages} messages, {}  ({:.1} % de ceux à pièce jointe)",
+        mailapi::human::bytes(gained_bytes),
+        share(gained_messages, with_attachments)
+    );
+    println!(
+        "Mot nouveau        {newly_findable} messages  ({:.1} % de ceux à pièce jointe) — la pièce
+                   jointe y apporte au moins un mot que le reste du message n'a pas",
+        share(newly_findable, with_attachments)
+    );
     println!();
 
     println!(
@@ -137,6 +167,49 @@ pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// La pièce jointe apporte-t-elle un mot que le reste du message n'a pas ?
+///
+/// ## Pourquoi ce n'est pas la même question que « a-t-elle du texte »
+///
+/// Une invitation dont le titre reprend le sujet du message n'apporte rien à l'index : le message
+/// était déjà trouvable par ces mots-là. Compter ces cas ferait passer l'étape pour plus rentable
+/// qu'elle n'est, et c'est exactement le genre de chiffre flatteur que le projet refuse — même
+/// forme que le rappel binaire qui confondait « manqué de peu » et « pas du tout ».
+///
+/// Les mots d'un caractère sont ignorés, et la comparaison est repliée en minuscules **Unicode** :
+/// `to_ascii_lowercase` ne replie pas « Éloïse », et sur un corpus français c'est la plupart des
+/// noms — la leçon du carnet d'adresses, le 2026-09-11.
+fn brings_a_new_word(
+    parsed: &mail_parser::Message<'_>,
+    gained: &str,
+    row: &mailcore::store::read::IndexRow,
+) -> bool {
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for source in [row.subject.as_str(), row.from_name.as_deref().unwrap_or("")] {
+        known.extend(words(source));
+    }
+    for index in 0..parsed.text_body_count() {
+        if let Some(part) = parsed.body_text(index) {
+            known.extend(words(&part));
+        }
+    }
+    for index in 0..parsed.html_body_count() {
+        if let Some(part) = parsed.body_html(index) {
+            let mut text = String::new();
+            mailhtml::text::html_to_text(&part, &mut text);
+            known.extend(words(&text));
+        }
+    }
+    words(gained).any(|word| !known.contains(&word))
+}
+
+/// Les mots d'un texte, repliés en minuscules Unicode.
+fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.chars().count() > 1)
+        .map(str::to_lowercase)
 }
 
 /// Le pourcentage, sans division par zéro.

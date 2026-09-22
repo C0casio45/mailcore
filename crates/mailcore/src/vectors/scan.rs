@@ -296,6 +296,7 @@ mod tests {
             family: "jouet".to_owned(),
             digest: "jouet___________".to_owned(),
             budget: 0,
+            revision: 1,
             written: "2026-09-22".to_owned(),
         };
         let mut writer = VectorWriter::open(&path, dim, &provenance).unwrap();

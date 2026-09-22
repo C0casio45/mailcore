@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attachtext;
 pub mod contacts;
 pub mod dedup;
 pub mod error;

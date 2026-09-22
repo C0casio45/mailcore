@@ -62,14 +62,28 @@ pub fn run(
     // l'aide de --budget, et --rebuild est là pour ça.
     let budget = budget.map_or_else(mailvec::text::Budget::default, mailvec::text::Budget::of);
 
-    let pending = store.unvectorised_total().context("compte des messages")?;
+    // **La question est posée à `mailvec`, pas refaite ici.** Cette commande comptait elle-même
+    // les messages sans vecteur et retournait sur zéro — donc elle n'atteignait jamais le
+    // contrôle de péremption ajouté dans la passe le 2026-09-23, et continuait d'annoncer « rien
+    // à faire » sur un magasin écrit par une autre composition de texte. Deux endroits qui
+    // répondent à la même question finissent par ne pas y répondre pareil.
+    let pending = mailvec::pass::pending(&store, budget)
+        .map_err(explain)
+        .context("état du magasin de vecteurs")?;
     println!("Store              {root}");
     println!("Modèle             {model}");
     if rebuild {
         println!("Mode               reconstruction complète");
     } else {
-        println!("À vectoriser       {pending} messages");
-        if pending == 0 {
+        if pending.stale {
+            println!(
+                "Magasin périmé     écrit par une autre composition de texte ou un autre budget"
+            );
+            println!("                   — le corpus entier est revectorisé");
+        } else {
+            println!("À vectoriser       {} messages", pending.messages);
+        }
+        if pending.is_empty() {
             println!("\nRien à faire — tout le corpus a déjà son vecteur.");
             println!("Pour refaire après un changement de modèle : `mail vectors --rebuild`.");
             return Ok(());

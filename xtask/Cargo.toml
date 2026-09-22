@@ -22,6 +22,7 @@ mailcore.workspace   = true
 mailcal.workspace    = true
 # Le parcours MIME, pour trouver les pièces `text/calendar` là où elles sont.
 mail-parser.workspace = true
+mailhtml.workspace    = true
 mailsmtp.workspace   = true
 mailimport.workspace = true
 sysinfo.workspace    = true

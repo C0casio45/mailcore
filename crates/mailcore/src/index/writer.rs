@@ -318,6 +318,11 @@ fn body_text(parsed: &mail_parser::Message<'_>, out: &mut String) {
             mailhtml::text::html_to_text(&part, out);
         }
     }
+    // **Et ce que portent les pièces jointes**, depuis le 2026-09-23. Une invitation ne se
+    // trouvait pas par le nom de son lieu, et le contenu d'une pièce jointe n'entrait dans aucun
+    // des deux index — voir [`crate::attachtext`], qui est **partagé** avec la vectorisation
+    // pour que les deux voient exactement le même texte.
+    crate::attachtext::attachment_text(parsed, out);
 }
 
 /// Ajoute les adresses et les noms d'un en-tête à `out`.

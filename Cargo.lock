@@ -9820,6 +9820,7 @@ dependencies = [
  "mailcal",
  "mailcore",
  "mailfake",
+ "mailhtml",
  "mailimport",
  "mailsmtp",
  "mailsync",
