@@ -87,7 +87,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 |---|---|---|---|
 | 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, remesuré le 2026-09-22** avec un transformeur (`multilingual-e5-small`) après l'avoir été le 2026-09-21 avec un embedding statique : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras et **pour les deux familles de modèles**. Ce que les relevés ajoutent est le **partage** que l'agrégat cachait, mesuré à l'étape 6 ter sur un sous-ensemble dur scindé en **synonymie** (cible française, 3 requêtes), **interlangue** (cible anglaise, 6) et un message mixte indécidable : rang médian sémantique **1 304** contre 3 680 au statique sur la synonymie — trois fois mieux, pour un plancher de bruit de 1,06 — et **17 331** contre 5 583 sur l'interlangue, où il est donc **deux à trois fois pire** pour un plancher de 1,65. Le transformeur **améliore la synonymie et perd probablement en interlangue** ; comme 6 requêtes sur 10 sont interlangues, l'agrégat (6 531 contre 3 895) tombe **dans son propre bruit** et ne distingue rien. Acquis par ailleurs : sur le sous-ensemble facile, le transformeur porte le rappel à **50,0 %** et la fusion à un rang médian de **10** (contre 30 au statique). Les lots sont trop petits pour départager moins d'un facteur deux : le jeu doit grossir côté synonymie avant qu'un modèle de plus soit essayé |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
-| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **5,0 msg/s** mesuré sur 36 186 messages, soit **≈ 4,1 h** extrapolées sur le corpus. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
+| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
 | 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **tenu avec l'embedding statique, NON TENU avec le transformeur (2026-09-22)**. Statique : **117 Mio** de crête — 8,7 au démarrage, 12,7 store ouvert, 69,5 modèle chargé, 117 passe finie. Transformeur : **1 304 Mio** de crête et 985 de résident, soit **2,6 fois le seuil**. Le remède est celui du 2026-09-15 — tailler le vocabulaire — et il porte ici sur deux fichiers, le `tokenizer.json` de 17 Mo et `embeddings.word_embeddings.weight`. Le relevé du 2026-09-22 établit au passage que **ce rognage ne coûte rien en rappel** : taillé contre brut, 3 680 contre 3 901 sur les cibles françaises, l'écart est du côté du bruit |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | à faire |
@@ -142,7 +142,7 @@ utilisable.
    le journal, et les étapes 6 ter et 6 quater.
 
    Le pari qui autorisait cette étape — « un modèle trente fois plus lent ferait passer la passe
-   de 6 à 12 minutes » — était faux d'un facteur trente-cinq : elle passe à **≈ 4,1 h**. Les 4 %
+   de 6 à 12 minutes » — était faux d'un facteur trente-cinq : elle passe à **4,37 h**. Les 4 %
    étaient mesurés, le « trente fois » ne l'était pas.
 
 6 ter. ~~**Scinder le jeu de requêtes en « synonymie » et « interlangue », et rejouer les deux
@@ -1117,6 +1117,17 @@ facteur trente-cinq.
 | débit | 78 msg/s | **5,0 msg/s** |
 | durée sur 73 658 messages | 948 s | **≈ 4,1 h** (extrapolée) |
 
+> **Mesurée depuis.** La passe transformeur a été refaite entièrement le soir même, pour que le
+> magasin porte la provenance de l'étape 6 ter : **15 747 s, soit 4,37 h et 4,68 msg/s** sur les
+> 73 658 messages. L'extrapolation ci-dessus était juste à 6 % près, ce qui est une chance et non
+> une méthode — elle supposait que la seconde moitié du corpus ressemble à la première, alors que
+> le débit varie d'un facteur 3,5 à l'intérieur d'une passe.
+>
+> Et un fait acquis gratuitement : cette seconde passe complète rend **exactement les mêmes rangs**
+> que la première (1 304 en synonymie, 17 331 en interlangue, au message près). La passe est donc
+> déterministe — ce qui n'allait pas de soi avec un lot dont le remplissage dépend des voisins, et
+> ce qui rend les relevés rejouables une fois la provenance connue.
+
 L'encodage seul du statique avait été mesuré à 5 700 msg/s ; le transformeur tient la passe entière à
 5,0, donc il **est** la passe. Le modèle est passé de 4 % à environ 95 % du coût, et le rapport des
 deux encodeurs est de l'ordre de **mille**, pas de trente.
@@ -1371,3 +1382,74 @@ qu'une cible absente ne s'y moyenne pas.
 
 Le contrôle négatif du refus de provenance a été joué : neutralisé, il fait tomber
 `a_pass_refuses_to_continue_a_store_that_another_model_began` et **elle seule**.
+
+### 2026-09-22 (suite) — l'étape 6 quater commence par compter, et le compte réoriente l'étape
+
+Le manque est réel et il a été vérifié à la main : le contenu d'une pièce jointe n'entre dans
+aucun des deux index. Ce que ça ne disait pas, c'est **combien de messages sont concernés** et
+**quels formats il faudrait savoir lire**. Écrire un extracteur PDF avant de le savoir, ce serait
+choisir la réponse avant la question — la faute que cette phase a déjà payée trois fois.
+
+`cargo xtask attachment-census` est en lecture seule et coûte une passe sur le corpus.
+
+```
+Messages           73 658
+Avec pièce jointe   7 094  (9,6 %)
+Pièces jointes     18 586
+```
+
+| type MIME | messages | pièces | octets | part des messages à pièce jointe |
+|---|---:|---:|---:|---:|
+| `image/png` | 2 932 | 8 899 | 870,4 Mio | 41,3 % |
+| `image/jpeg` | 1 441 | 3 555 | 566,7 Mio | 20,3 % |
+| **`application/pdf`** | **1 222** | 1 639 | **1,1 Gio** | **17,2 %** |
+| `text/calendar` | 922 | 925 | 3,4 Mio | 13,0 % |
+| `application/ms-tnef` | 738 | 738 | 410,0 Mio | 10,4 % |
+| `text/x-amp-html` | 378 | 378 | 11,0 Mio | 5,3 % |
+| `application/ics` | 364 | 364 | 791,8 Kio | 5,1 % |
+| `image/gif` | 286 | 768 | 31,6 Mio | 4,0 % |
+| OOXML (`docx`, `xlsx`, `pptx`) | 286 | 354 | 359,7 Mio | 4,0 % |
+| `application/octet-stream` | 175 | 265 | 126,1 Mio | 2,5 % |
+
+Soixante types suivent, pour 198 pièces au total.
+
+#### Trois choses que ce tableau change
+
+**Le format qui domine en nombre ne porte pas de texte.** Images : 4 659 messages en comptant
+`png`, `jpeg` et `gif`, soit plus que tout le reste réuni. Les rendre trouvables demanderait de
+l'OCR — une dépendance lourde, un coût par message sans commune mesure avec le reste, et une
+question de vie privée différente puisqu'un modèle d'OCR est un second modèle à installer. C'est
+**hors périmètre**, et il vaut mieux l'écrire ici que de le redécouvrir à mi-chemin.
+
+**Le PDF est bien la cible, et le chiffre est modeste.** 1 222 messages, soit 1,7 % du corpus et
+17 % des messages à pièce jointe. C'est peu en proportion et c'est exactement la bonne cible :
+ce sont les factures, les relevés, les contrats — la catégorie que `docs/VISION.md` met en tête,
+et celle où l'utilisateur sait qu'il a reçu quelque chose sans savoir le nommer. Un manque qui ne
+touche que 1,7 % du corpus peut valoir plus qu'un gain de rappel sur les 98 autres, parce que ces
+1,7 % sont ce qu'on cherche vraiment.
+
+**Deux gisements se lisent sans aucune dépendance nouvelle**, et ils n'avaient pas été vus :
+
+- `text/calendar` et `application/ics` font **1 286 messages** à eux deux — plus que les PDF.
+  `mailcal` les analyse déjà, sans aucune dépendance, depuis la phase 3 ; leur `SUMMARY`,
+  `LOCATION` et `DESCRIPTION` ne sont simplement jamais donnés à l'indexation ;
+- les pièces `text/*` — `x-amp-html`, `html`, `plain`, `rfc822-headers`, `x-watch-html` —
+  font 594 messages et passent par `mailhtml`, qui est déjà là. Avec une réserve honnête :
+  `x-amp-html` et `x-watch-html` sont des **doublons** du corps par construction, donc les
+  indexer n'ajoutera probablement rien. À vérifier plutôt qu'à supposer.
+
+Autrement dit : **avant la première ligne d'extracteur PDF, il y a 1 286 messages à rendre
+trouvables avec du code déjà écrit.** Le recensement n'a pas changé la cible, il a changé
+l'ordre — et c'est précisément ce qu'on lui demandait.
+
+#### Ce qui reste à trancher, et qui ne se tranche pas tout seul
+
+Lire un PDF veut dire **analyser une entrée hostile écrite par l'expéditeur**, dans un format qui
+est historiquement une des plus belles sources de vulnérabilités de l'informatique. Le projet a
+une règle pour ça — tout parseur d'entrée hostile a ses tests de cas malformés — mais le choix
+d'ajouter une dépendance qui fera ce travail sur 1,1 Gio de fichiers venus d'inconnus dépasse un
+arbitrage d'implémentation. Il est posé à l'utilisateur plutôt que décidé ici.
+
+Ce qui est acquis quel qu'en soit le verdict : `application/ms-tnef` (738 messages) est un
+conteneur Outlook dont le contenu est lui-même des pièces jointes, donc il se traitera *après*
+les formats qu'il contient, et jamais avant.

@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod api;
+mod attach;
 mod browser;
 mod calendar;
 mod client;
@@ -410,6 +411,22 @@ enum Command {
         resume: bool,
     },
 
+    /// Recense les pièces jointes du corpus : types, nombres, volumes.
+    ///
+    /// L'étape 6 quater de `docs/PHASE-4.md`, **avant** d'écrire un extracteur. Combien de
+    /// messages sont concernés et quels formats il faudrait savoir lire est ce qui décide de ce
+    /// qu'on écrit ; l'ignorer reviendrait à choisir la réponse avant la question.
+    ///
+    /// **Ne fait que lire.**
+    AttachmentCensus {
+        /// Racine du store à lire.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Combien de types montrer.
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+    },
+
     /// Sort un échantillon de messages réels, étalé sur toute la période du corpus.
     ///
     /// Sert l'étape 1 de `docs/PHASE-4.md` : écrire des requêtes en français avec la réponse
@@ -645,6 +662,7 @@ fn main() -> Result<()> {
             model,
             resume,
         } => vectors::measure(&store, &model, resume),
+        Command::AttachmentCensus { store, top } => attach::census(&store, top),
         Command::CorpusSample {
             store,
             count,
