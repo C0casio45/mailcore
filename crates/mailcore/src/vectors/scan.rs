@@ -45,6 +45,8 @@ pub struct Vectors {
     /// Les vecteurs bout à bout, `ids.len() × dim`. Contigus, parce que c'est ce qui permet au
     /// processeur de lire en avant pendant le balayage.
     data: Vec<f32>,
+    /// Ce que l'en-tête déclare de son auteur. `None` pour un magasin de version 1.
+    provenance: Option<crate::vectors::Provenance>,
 }
 
 impl Vectors {
@@ -79,12 +81,13 @@ impl Vectors {
         };
 
         let found = read_header(&mut file, &path)?;
-        if found != dim {
+        if found.dim != dim {
             return Err(Error::VectorFormat {
                 path,
-                reason: format!("dimension {found} sur disque, {dim} demandée"),
+                reason: format!("dimension {} sur disque, {dim} demandée", found.dim),
             });
         }
+        let provenance = found.provenance;
 
         let mut reader = BufReader::new(file);
         let mut record = vec![0u8; record_len(dim) as usize];
@@ -125,7 +128,12 @@ impl Vectors {
         }
 
         tracing::debug!(path = %path, vecteurs = ids.len(), dim, "magasin de vecteurs relu");
-        Ok(Self { dim, ids, data })
+        Ok(Self {
+            dim,
+            ids,
+            data,
+            provenance,
+        })
     }
 
     /// Un magasin vide de cette dimension.
@@ -135,7 +143,18 @@ impl Vectors {
             dim,
             ids: Vec::new(),
             data: Vec::new(),
+            provenance: None,
         }
+    }
+
+    /// Ce qui a écrit ce magasin, si le format le dit.
+    ///
+    /// `None` a deux causes qu'il ne distingue pas — un magasin absent, et un magasin écrit
+    /// avant que le format porte sa provenance. Les deux appellent la même phrase dans un
+    /// relevé : on ne sait pas d'où viennent ces nombres.
+    #[must_use]
+    pub const fn provenance(&self) -> Option<&crate::vectors::Provenance> {
+        self.provenance.as_ref()
     }
 
     /// La dimension des vecteurs.
@@ -272,7 +291,14 @@ mod tests {
     fn store(dim: usize, rows: &[(i64, Vec<f32>)]) -> (tempfile::TempDir, Vectors) {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("vectors.bin")).unwrap();
-        let mut writer = VectorWriter::open(&path, dim).unwrap();
+        let provenance = crate::vectors::Provenance {
+            model: "jouet".to_owned(),
+            family: "jouet".to_owned(),
+            digest: "jouet___________".to_owned(),
+            budget: 0,
+            written: "2026-09-22".to_owned(),
+        };
+        let mut writer = VectorWriter::open(&path, dim, &provenance).unwrap();
         for (id, vector) in rows {
             writer.append(MessageId(*id), vector).unwrap();
         }

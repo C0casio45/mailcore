@@ -156,6 +156,16 @@ impl Semantic {
         self.vectors.is_empty()
     }
 
+    /// Ce qui a écrit le magasin sur lequel ce moteur répond.
+    ///
+    /// Exposée pour que les bancs l'impriment. Un relevé de rappel qui ne dit pas quel modèle,
+    /// quel budget et quel jour ont produit les vecteurs qu'il a lus n'est pas défendable — le
+    /// 2026-09-22 l'a appris en ne retrouvant pas un chiffre du journal.
+    #[must_use]
+    pub const fn provenance(&self) -> Option<&mailcore::vectors::Provenance> {
+        self.vectors.provenance()
+    }
+
     /// Les messages les plus proches d'une requête, du plus proche au moins.
     ///
     /// L'encodage de la requête appartient au modèle — voir [`QueryEncoder`] — parce que c'est là

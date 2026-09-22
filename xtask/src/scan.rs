@@ -108,7 +108,17 @@ enum Shape {
 
 /// Remplit un magasin, et rend son chemin.
 fn fill(path: &Utf8PathBuf, messages: usize, dim: usize, shape: Shape) -> Result<Utf8PathBuf> {
-    let mut writer = VectorWriter::open(path, dim).context("ouverture du magasin")?;
+    // Le banc de latence fabrique ses vecteurs : ils ne viennent d'aucun modèle, et la
+    // provenance le dit plutôt que d'emprunter le nom d'un vrai. Un magasin de mesure qu'on
+    // retrouverait par erreur doit s'annoncer comme tel — c'est l'intérêt même du champ.
+    let provenance = mailcore::vectors::Provenance {
+        model: "measure-scan".to_owned(),
+        family: "vecteurs fabriqués".to_owned(),
+        digest: "aucun-modele___".to_owned(),
+        budget: 0,
+        written: "banc".to_owned(),
+    };
+    let mut writer = VectorWriter::open(path, dim, &provenance).context("ouverture du magasin")?;
     let mut noise = Noise::new(0x5EED_4EC7_0000_0001);
     let mut vector = vec![0f32; dim];
 

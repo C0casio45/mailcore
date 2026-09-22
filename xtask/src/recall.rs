@@ -135,6 +135,12 @@ struct Outcome {
     ranks: Vec<(Engine, Option<usize>)>,
     /// La requête partage-t-elle un mot porteur avec sa cible ?
     shares_a_word: bool,
+    /// La langue des cibles, qui dit si les atteindre franchit une frontière.
+    ///
+    /// **La plus favorable de toutes les cibles acceptables**, de la même façon que
+    /// `shares_a_word` prend le `any` : si l'une des bonnes réponses est en français, la requête
+    /// peut être satisfaite sans franchir de frontière, donc elle ne mesure pas l'interlangue.
+    lang: Lang,
 }
 
 impl Outcome {
@@ -195,6 +201,19 @@ pub fn measure(
                 "le magasin de vecteurs est vide : lancez la passe de vectorisation d'abord"
             );
             println!("Vecteurs           {} messages", engine.len());
+            // **Ce que le relevé du 2026-09-21 ne disait pas, et qui l'a rendu indéfendable.**
+            // Un rappel se lit sur des vecteurs, et des vecteurs viennent d'un modèle et d'un
+            // budget. Sans cette ligne, deux relevés du même jour sur deux magasins différents
+            // se ressemblent — c'est exactement ce qui est arrivé.
+            match engine.provenance() {
+                Some(provenance) => println!("Provenance         {}", provenance.summary()),
+                None => println!(
+                    "Provenance         INCONNUE — magasin au format de version 1.\n\
+                     \x20                  Les chiffres ci-dessous ne disent pas quel modèle ni \
+                     quel budget les a produits,\n\x20                  donc ils ne se comparent à \
+                     rien. Relancer `mail vectors --rebuild` pour les dater."
+                ),
+            }
             Some(engine)
         }
         None => None,
@@ -288,17 +307,158 @@ pub fn measure(
         // que le sémantique apporte, jamais le gonfler.
         let shares = details.iter().any(|it| shares_a_word(&query.text, it));
 
+        // Le français l'emporte dès qu'une cible acceptable est française — voir le champ.
+        let langs: Vec<Lang> = details.iter().map(language_of).collect();
+        let lang = if langs.contains(&Lang::French) {
+            Lang::French
+        } else if langs.contains(&Lang::English) {
+            Lang::English
+        } else {
+            Lang::Undetermined
+        };
+
         outcomes.push(Outcome {
             text: query.text.clone(),
             targets,
             subject: detail.item.subject.clone(),
             ranks,
             shares_a_word: shares,
+            lang,
         });
     }
 
     report(store_root, queries, &engines, k, &outcomes);
     Ok(())
+}
+
+/// Les mots-outils qui ne se disent que dans une langue.
+///
+/// Ils servent à répondre à une seule question : **la requête doit-elle franchir une frontière de
+/// langue pour atteindre sa cible ?** Le corpus est français et les requêtes le sont toutes ; ce
+/// qui varie est la langue du message visé.
+///
+/// Le choix est conservateur, et il faut l'être : un mot qui existe dans les deux langues avec
+/// des sens différents — « on », « a », « son », « car », « but », « or », « en » — est **exclu
+/// des deux listes**, parce qu'un marqueur ambigu ne déplace pas une requête d'un sous-ensemble à
+/// l'autre, il la déplace au hasard.
+const FRENCH_MARKERS: &[&str] = &[
+    "le",
+    "la",
+    "les",
+    "des",
+    "une",
+    "vous",
+    "votre",
+    "vos",
+    "nous",
+    "notre",
+    "nos",
+    "pour",
+    "avec",
+    "dans",
+    "est",
+    "sont",
+    "cette",
+    "ces",
+    "aux",
+    "du",
+    "au",
+    "qui",
+    "que",
+    "sur",
+    "ses",
+    "être",
+    "avez",
+    "leur",
+    "sera",
+    "ont",
+    "été",
+    "plus",
+    "mais",
+    "tout",
+    "tous",
+    "toute",
+    "déjà",
+    "vers",
+    "chez",
+    "sans",
+    "sous",
+    "entre",
+    "depuis",
+    "merci",
+    "bonjour",
+    "cordialement",
+];
+
+/// Le pendant anglais. Voir [`FRENCH_MARKERS`] pour la règle d'exclusion.
+const ENGLISH_MARKERS: &[&str] = &[
+    "the", "your", "you", "this", "that", "with", "from", "have", "will", "been", "are", "and",
+    "for", "not", "can", "has", "was", "were", "their", "our", "its", "all", "new", "now", "here",
+    "please", "thanks", "hello", "click", "account", "free", "get", "more", "about", "would",
+];
+
+/// La langue d'un texte, telle qu'un comptage de mots-outils la voit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    /// La langue des requêtes : atteindre cette cible ne franchit aucune frontière.
+    French,
+    /// Une autre langue : l'atteindre demande au modèle de relier deux langues.
+    English,
+    /// Trop peu de marqueurs pour trancher. **Elle n'est pas rangée d'office avec l'une des
+    /// deux** : un sous-ensemble qui absorbe ses cas douteux mesure ses doutes.
+    Undetermined,
+}
+
+impl Lang {
+    /// Ce qu'on affiche dans le détail par requête, pour qu'un humain puisse contredire.
+    const fn mark(self) -> &'static str {
+        match self {
+            Self::French => "fr",
+            Self::English => "en",
+            Self::Undetermined => "??",
+        }
+    }
+}
+
+/// La langue du texte **que l'indexation voit** — sujet, expéditeur, corps.
+///
+/// Le sujet seul aurait laissé une cible du sous-ensemble dur sans le moindre mot-outil :
+/// « Entry confirmed: … Giveaway » n'en porte aucun. Le texte complet n'a pas ce problème, et il
+/// est **le bon texte** de toute façon — c'est celui que le modèle encode, donc celui dont la
+/// langue décide si le modèle doit franchir une frontière.
+fn language_of(detail: &mailcore::MessageDetail) -> Lang {
+    let mut french = 0usize;
+    let mut english = 0usize;
+    for source in [
+        detail.item.subject.as_str(),
+        detail.item.from_name.as_deref().unwrap_or_default(),
+        detail.body.as_str(),
+    ] {
+        for word in source
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .map(str::to_lowercase)
+        {
+            if FRENCH_MARKERS.contains(&word.as_str()) {
+                french += 1;
+            } else if ENGLISH_MARKERS.contains(&word.as_str()) {
+                english += 1;
+            }
+        }
+    }
+
+    // Une marge, et pas une simple majorité. Un courriel français cite souvent un mot anglais, et
+    // l'inverse aussi ; départager douze contre onze par le signe reviendrait à tirer à pile ou
+    // face sur les cas mixtes, qui sont exactement ceux où la question est intéressante.
+    let (high, low) = (french.max(english), french.min(english));
+    if high < 3 || high < low * 2 {
+        return Lang::Undetermined;
+    }
+    if french > english {
+        Lang::French
+    } else {
+        Lang::English
+    }
 }
 
 /// La requête partage-t-elle un mot porteur avec ce que le moteur indexe de la cible ?
@@ -348,16 +508,59 @@ fn report(
     let (hard, easy): (Vec<_>, Vec<_>) = outcomes.iter().partition(|it| !it.shares_a_word);
     let all: Vec<&Outcome> = outcomes.iter().collect();
 
+    // **Le sous-ensemble dur se scinde**, et c'est l'étape 6 ter.
+    //
+    // « Aucun mot commun » est un critère **syntaxique** : il retient à la fois la synonymie —
+    // paquet/colis — et le passage d'une langue à l'autre, parce qu'une requête française ne
+    // partage par construction aucun mot avec un sujet anglais. Les deux problèmes n'ont ni la
+    // même difficulté ni la même réponse, et le 2026-09-22 a mesuré qu'un modèle peut être trois
+    // fois meilleur sur le premier et indistinct sur le second. Une médiane qui les agrège ne
+    // décrit aucun des deux.
+    let synonymy: Vec<&Outcome> = hard
+        .iter()
+        .copied()
+        .filter(|it| it.lang == Lang::French)
+        .collect();
+    let crosslingual: Vec<&Outcome> = hard
+        .iter()
+        .copied()
+        .filter(|it| it.lang == Lang::English)
+        .collect();
+    let undetermined: Vec<&Outcome> = hard
+        .iter()
+        .copied()
+        .filter(|it| it.lang == Lang::Undetermined)
+        .collect();
+
     // **Le sous-ensemble dur en premier**, parce que c'est lui qui décide. Le rappel global peut
     // être gonflé par des requêtes qui reprennent les mots du sujet ; celui-ci ne peut pas.
-    for (label, set) in [
-        ("aucun mot commun avec la cible", &hard),
-        ("au moins un mot commun", &easy),
-        ("tout le jeu", &all),
-    ] {
+    let mut sets: Vec<(String, &Vec<&Outcome>)> = vec![
+        (
+            "aucun mot commun — SYNONYMIE (cible française)".to_owned(),
+            &synonymy,
+        ),
+        (
+            "aucun mot commun — INTERLANGUE (cible anglaise)".to_owned(),
+            &crosslingual,
+        ),
+    ];
+    // Le lot indéterminé n'est imprimé que s'il existe. L'afficher vide à chaque relevé le ferait
+    // devenir du décor, et c'est précisément la ligne qu'il faut remarquer quand elle apparaît.
+    if !undetermined.is_empty() {
+        sets.push((
+            "aucun mot commun — langue INDÉTERMINÉE, à trancher à la main".to_owned(),
+            &undetermined,
+        ));
+    }
+    sets.push(("aucun mot commun — les deux ensemble".to_owned(), &hard));
+    sets.push(("au moins un mot commun".to_owned(), &easy));
+    sets.push(("tout le jeu".to_owned(), &all));
+
+    for (label, set) in sets {
+        let label = label.as_str();
         println!("--- {label} — {} requêtes ---", set.len());
         println!(
-            "{:<30} {:>13} {:>9} {:>12}",
+            "{:<30} {:>13} {:>9} {:>12}   rangs triés",
             "moteur", "dans le top", "rappel", "rang médian"
         );
         for engine in engines {
@@ -385,9 +588,14 @@ fn report(
                 None => "—".to_owned(),
             })
             .collect();
+        // Deux marques et non une : l'étoile dit « aucun mot commun », la langue dit **lequel des
+        // deux problèmes** cette requête pose. La seconde est calculée par un comptage de
+        // mots-outils, donc elle peut se tromper — elle est imprimée pour qu'un humain puisse la
+        // contredire, comme `queries-rebind` imprime la règle qui a relié chaque cible.
         let mark = if outcome.shares_a_word { " " } else { "*" };
+        let lang = outcome.lang.mark();
         println!(
-            "{mark} {:<8} {:<8} {:<8}  « {} »",
+            "{mark}{lang} {:<8} {:<8} {:<8}  « {} »",
             cells.first().cloned().unwrap_or_default(),
             cells.get(1).cloned().unwrap_or_default(),
             cells.get(2).cloned().unwrap_or_default(),
@@ -410,6 +618,11 @@ fn report(
         }
     }
     println!("\n  * = aucun mot commun avec la cible.  (n) = trouvée, mais hors du top {TOP}.");
+    println!(
+        "  fr / en / ?? = langue du texte visé, comptée sur ses mots-outils. Une requête est\n  \
+         française : « fr » pose un problème de synonymie, « en » y ajoute le passage d'une\n  \
+         langue à l'autre. Les deux ne se comparent pas et ne se moyennent pas."
+    );
 }
 
 /// Un libellé court pour la colonne du détail.
@@ -424,7 +637,13 @@ const fn short_label(engine: Engine) -> &'static str {
 /// Une ligne du tableau.
 fn print_row(engine: Engine, set: &[&Outcome]) {
     if set.is_empty() {
-        println!("{:<30} {:>13} {:>9} {:>12}", engine.label(), 0, "—", "—");
+        println!(
+            "{:<30} {:>13} {:>9} {:>12}   []",
+            engine.label(),
+            0,
+            "—",
+            "—"
+        );
         return;
     }
     let found = set
@@ -441,17 +660,66 @@ fn print_row(engine: Engine, set: &[&Outcome]) {
         .map(|it| it.rank(engine).unwrap_or(usize::MAX))
         .collect();
     ranks.sort_unstable();
-    let median = ranks[ranks.len() / 2];
-    let median = if median == usize::MAX {
-        "absente".to_owned()
-    } else {
-        median.to_string()
-    };
 
     println!(
-        "{:<30} {found:>13} {share:>8.1} % {median:>12}",
-        engine.label()
+        "{:<30} {found:>13} {share:>8.1} % {:>12}   {}",
+        engine.label(),
+        median(&ranks),
+        sorted_ranks(&ranks),
     );
+}
+
+/// Le rang médian, au sens ordinaire du terme.
+///
+/// ## Pourquoi ce n'est plus `ranks[len / 2]`
+///
+/// Ça l'était jusqu'au 2026-09-22, et c'est le **plus grand** des deux rangs du milieu quand le
+/// lot est pair. Tant que les lots faisaient vingt-deux et dix requêtes, le biais passait
+/// inaperçu ; la scission du sous-ensemble dur a fait des lots de trois et six, et sur six rangs
+/// valant 1 277, 6 023, 7 039, 27 623, 34 252 et 35 428, l'ancienne règle annonçait **27 623**
+/// comme médiane. La moitié des valeurs sont sous 7 039 : le chiffre décrivait le contraire de ce
+/// qu'il prétendait.
+///
+/// La leçon est celle du 2026-09-21, encore d'un cran plus loin : **un résumé statistique est un
+/// instrument, et un instrument se vérifie sur les lots qu'on va vraiment lui donner.** Celui-ci
+/// avait été écrit pour n = 22.
+///
+/// Une cible absente vaut `usize::MAX`, et on ne la moyenne pas : si le rang supérieur du milieu
+/// est absent, la médiane l'est aussi, et c'est ce que la ligne dit.
+fn median(sorted: &[usize]) -> String {
+    if sorted.is_empty() {
+        return "—".to_owned();
+    }
+    let middle = sorted.len() / 2;
+    if sorted[middle] == usize::MAX {
+        return "absente".to_owned();
+    }
+    if sorted.len() % 2 == 1 {
+        return sorted[middle].to_string();
+    }
+    // Les deux du milieu sont présents : la moyenne est la médiane ordinaire.
+    ((sorted[middle - 1] + sorted[middle]) / 2).to_string()
+}
+
+/// Les rangs eux-mêmes, triés.
+///
+/// Sur des lots de trois à six requêtes, une médiane résume trop peu de chose pour qu'on la
+/// croie sur parole. Les imprimer à côté **rend le résumé vérifiable** : c'est la même exigence
+/// que le détail par requête, appliquée à la ligne qui prétend le condenser.
+fn sorted_ranks(sorted: &[usize]) -> String {
+    let shown: Vec<String> = sorted
+        .iter()
+        .take(12)
+        .map(|rank| {
+            if *rank == usize::MAX {
+                "—".to_owned()
+            } else {
+                rank.to_string()
+            }
+        })
+        .collect();
+    let suite = if sorted.len() > 12 { " …" } else { "" };
+    format!("[{}{suite}]", shown.join(" "))
 }
 
 /// Un sujet raccourci, coupé sur une frontière de caractère.
@@ -461,4 +729,55 @@ fn short(subject: &str) -> String {
     }
     let kept: String = subject.chars().take(57).collect();
     format!("{kept}…")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Le défaut trouvé le 2026-09-22, sur les lots que la scission a créés.
+    ///
+    /// Les six rangs sont ceux du sous-ensemble interlangue. L'ancienne règle — `sorted[len / 2]`
+    /// — rendait 27 623 alors que la moitié des valeurs sont sous 7 039.
+    #[test]
+    fn the_median_of_an_even_set_is_between_the_two_middle_ranks() {
+        let ranks = [1_277, 6_023, 7_039, 27_623, 34_252, 35_428];
+        assert_eq!(median(&ranks), "17331");
+        assert_ne!(median(&ranks), "27623", "l'ancienne règle est revenue");
+    }
+
+    #[test]
+    fn the_median_of_an_odd_set_is_the_middle_rank() {
+        assert_eq!(median(&[78, 1_304, 1_834]), "1304");
+        assert_eq!(median(&[5]), "5");
+    }
+
+    /// Une cible absente ne se moyenne pas.
+    ///
+    /// Si le rang supérieur du milieu manque, la moitié du lot est introuvable : la médiane l'est
+    /// aussi. La moyenner avec un rang présent fabriquerait un nombre à partir d'une absence.
+    #[test]
+    fn an_absent_target_makes_the_median_absent_rather_than_averaged() {
+        assert_eq!(median(&[10, 20, usize::MAX, usize::MAX]), "absente");
+        assert_eq!(median(&[usize::MAX; 3]), "absente");
+        // Mais une seule absence sur quatre laisse les deux du milieu présents.
+        assert_eq!(median(&[10, 20, 30, usize::MAX]), "25");
+    }
+
+    #[test]
+    fn an_empty_set_has_no_median() {
+        assert_eq!(median(&[]), "—");
+    }
+
+    /// Les rangs triés sont ce qui rend la médiane vérifiable, donc ils doivent être lisibles.
+    #[test]
+    fn the_sorted_ranks_show_absences_and_say_when_they_are_cut() {
+        assert_eq!(sorted_ranks(&[1, 2, usize::MAX]), "[1 2 —]");
+        let many: Vec<usize> = (1..=15).collect();
+        let shown = sorted_ranks(&many);
+        assert!(shown.ends_with("…]"), "une liste coupée doit le dire");
+        assert!(shown.contains("12"));
+        assert!(!shown.contains("13"));
+    }
 }

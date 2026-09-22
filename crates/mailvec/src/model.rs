@@ -29,6 +29,8 @@ use crate::{Error, Result};
 pub struct Model {
     inner: model2vec_rs::model::StaticModel,
     dim: usize,
+    /// Ce qui le nomme et le distingue dans la provenance d'un magasin.
+    identity: crate::pass::Identity,
 }
 
 // `StaticModel` ne porte pas `Debug`, et le dériver ici afficherait de toute façon une table de
@@ -82,8 +84,24 @@ impl Model {
             });
         }
 
-        tracing::info!(dir = %dir, dim, "modèle chargé");
-        Ok(Self { inner, dim })
+        let identity = crate::pass::Identity {
+            name: crate::pass::Identity::name_of(&dir),
+            family: "embedding statique".to_owned(),
+            digest: crate::pass::Identity::digest_of(&dir.join("model.safetensors")),
+        };
+
+        tracing::info!(dir = %dir, dim, digest = %identity.digest, "modèle chargé");
+        Ok(Self {
+            inner,
+            dim,
+            identity,
+        })
+    }
+
+    /// Ce qui nomme et distingue ce modèle.
+    #[must_use]
+    pub const fn identity(&self) -> &crate::pass::Identity {
+        &self.identity
     }
 
     /// La dimension des vecteurs de ce modèle.

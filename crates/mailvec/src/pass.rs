@@ -42,6 +42,56 @@ use crate::{Error, Result};
 /// existe — voir la leçon qui l'accompagne.
 pub const BATCH: usize = 500;
 
+/// Comment un modèle se nomme et se reconnaît.
+///
+/// Trois champs, et pas un chemin : un chemin est une propriété de la machine, et deux machines
+/// qui rangent le même modèle ailleurs doivent pouvoir se passer un magasin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// Le dernier segment du répertoire du modèle.
+    pub name: String,
+    /// Sa famille, telle qu'un lecteur la comprend.
+    pub family: String,
+    /// L'empreinte de ses poids, tronquée à seize caractères hexadécimaux.
+    pub digest: String,
+}
+
+impl Identity {
+    /// L'empreinte du fichier de poids d'un modèle.
+    ///
+    /// Elle lit le fichier par morceaux : celui du transformeur fait 470 Mo, et le charger
+    /// entier pour le hacher doublerait la crête mémoire d'une passe qui crève déjà le
+    /// critère 5.
+    ///
+    /// Un fichier illisible rend `inconnue` plutôt qu'une erreur. Refuser de vectoriser parce
+    /// qu'on n'a pas pu calculer une **étiquette** serait disproportionné — le modèle, lui, est
+    /// déjà chargé et fonctionne. La provenance dit alors qu'elle ne sait pas, ce qui est le
+    /// comportement juste d'un champ dont tout l'intérêt est l'honnêteté.
+    #[must_use]
+    pub fn digest_of(path: &camino::Utf8Path) -> String {
+        let Ok(file) = std::fs::File::open(path.as_std_path()) else {
+            return "inconnue".to_owned();
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buffer) {
+                Ok(0) => break,
+                Ok(read) => hasher.update(&buffer[..read]),
+                Err(_) => return "inconnue".to_owned(),
+            };
+        }
+        hasher.finalize().to_hex()[..16].to_owned()
+    }
+
+    /// Le dernier segment d'un répertoire, ou son chemin s'il n'en a pas.
+    #[must_use]
+    pub fn name_of(dir: &camino::Utf8Path) -> String {
+        dir.file_name().unwrap_or(dir.as_str()).to_owned()
+    }
+}
+
 /// Ce que la passe attend de ce qui fabrique les vecteurs.
 ///
 /// ## Pourquoi un trait plutôt que [`Model`] en dur
@@ -57,6 +107,20 @@ pub const BATCH: usize = 500;
 pub trait Encoder {
     /// La dimension des vecteurs produits.
     fn dim(&self) -> usize;
+
+    /// Ce qui identifie ce modèle dans la provenance du magasin.
+    ///
+    /// ## Pourquoi c'est l'encodeur qui le dit
+    ///
+    /// La passe ne reçoit pas toujours un répertoire — `update_with` prend un encodeur déjà
+    /// construit — et elle n'a de toute façon aucun moyen de savoir ce qui distingue deux
+    /// modèles. Seul celui qui a lu les fichiers peut le dire.
+    ///
+    /// Le nom **et** l'empreinte des poids, parce que les deux répondent à des questions
+    /// différentes : le nom sert à lire un relevé, l'empreinte sert à refuser. Un répertoire
+    /// dont on remplace le contenu garde son nom, et c'est exactement le genre de chose qui a
+    /// rendu un chiffre indéfendable le 2026-09-21.
+    fn identity(&self) -> Identity;
 
     /// Combien de textes cet encodeur veut recevoir d'un coup.
     ///
@@ -90,6 +154,10 @@ pub trait Encoder {
 impl Encoder for Model {
     fn dim(&self) -> usize {
         Self::dim(self)
+    }
+
+    fn identity(&self) -> Identity {
+        Self::identity(self).clone()
     }
 
     fn encode(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -223,6 +291,60 @@ pub fn rebuild_with(
     advance(store, model, budget, progress)
 }
 
+/// Ce qui sera écrit dans l'en-tête du magasin.
+///
+/// Le budget en fait partie parce qu'il change les vecteurs autant que le modèle : c'est le
+/// champ dont l'absence a rendu un relevé indéfendable le 2026-09-21, quand quatre passes de
+/// budgets différents ont laissé quatre magasins indiscernables.
+fn provenance_of(
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+) -> mailcore::vectors::Provenance {
+    let identity = model.identity();
+    mailcore::vectors::Provenance {
+        model: identity.name,
+        family: identity.family,
+        digest: identity.digest,
+        budget: budget.body,
+        written: today(),
+    }
+}
+
+/// La date du jour en `AAAA-MM-JJ`.
+///
+/// Sans dépendance de calendrier : le crate n'en a pas et n'en veut pas pour cinq champs. Le
+/// calcul civil part de l'ère grégorienne proleptique, et il est testé sur des dates connues —
+/// dont un 29 février, qui est la seule ligne où ce genre de code se trompe.
+fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (year, month, day) = civil_from_days(i64::try_from(secs / 86_400).unwrap_or(0));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Le jour civil correspondant à un nombre de jours depuis 1970-01-01.
+///
+/// Algorithme de Howard Hinnant, `civil_from_days`. Il est recopié plutôt qu'importé parce
+/// qu'une dépendance de calendrier pour une ligne de provenance coûterait plus cher que ces
+/// douze lignes — et il est testé, ce qui est la condition pour le dire.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        if m <= 2 { y + 1 } else { y },
+        u32::try_from(m).unwrap_or(1),
+        u32::try_from(d).unwrap_or(1),
+    )
+}
+
 /// La boucle partagée par [`update`] et [`rebuild`].
 ///
 /// Partagée et non recopiée : c'est la leçon du carnet, où deux boucles auraient divergé et où
@@ -237,7 +359,8 @@ fn advance(
     let mut stats = Stats::default();
     let parser = mail_parser::MessageParser::default();
     let batch = model.batch().max(1);
-    let mut writer = VectorWriter::open(store.vectors_path(), model.dim())?;
+    let provenance = provenance_of(model, budget);
+    let mut writer = VectorWriter::open(store.vectors_path(), model.dim(), &provenance)?;
 
     let pending = store.unvectorised_total()?;
     progress.set_total(pending);
@@ -346,13 +469,26 @@ mod tests {
         /// Combien de textes ont été encodés depuis le début. C'est ce compteur qui rend visible
         /// le travail **refait** : une reprise qui recalculerait tout le ferait grimper.
         encoded: std::cell::Cell<usize>,
+        /// Ce que la provenance du magasin retiendra de lui. Réglable, parce que la moitié de
+        /// ce que la provenance garantit est un **refus**, et qu'un refus ne se teste qu'avec
+        /// deux encodeurs différents.
+        identity: Identity,
     }
 
     impl Fake {
         fn new(dim: usize) -> Self {
+            Self::named(dim, "jouet")
+        }
+
+        fn named(dim: usize, name: &str) -> Self {
             Self {
                 dim,
                 encoded: std::cell::Cell::new(0),
+                identity: Identity {
+                    name: name.to_owned(),
+                    family: "jouet".to_owned(),
+                    digest: format!("{name:_<16}"),
+                },
             }
         }
     }
@@ -360,6 +496,10 @@ mod tests {
     impl Encoder for Fake {
         fn dim(&self) -> usize {
             self.dim
+        }
+
+        fn identity(&self) -> Identity {
+            self.identity.clone()
         }
 
         fn encode(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -517,5 +657,101 @@ mod tests {
         let found = update_with(&store, &Fake::new(16), budget(), &progress);
 
         assert!(found.is_err(), "un magasin de dimension 8 a accepté du 16");
+    }
+
+    /// Le cas que la dimension ne couvrait pas, et qui a coûté un chiffre indéfendable.
+    ///
+    /// Deux modèles **de même dimension** — les deux `potion` du corpus — passaient le contrôle
+    /// précédent sans encombre. Rien ne l'aurait dit : la passe aurait ajouté ses records
+    /// derrière ceux de l'autre, et le magasin aurait rendu un classement dont chaque moitié
+    /// vient d'un espace différent.
+    #[test]
+    fn changing_the_model_at_equal_dimension_is_refused_too() {
+        let (_dir, store) = corpus(2);
+        let progress = Progress::new();
+
+        update_with(&store, &Fake::named(8, "premier"), budget(), &progress).unwrap();
+        store.reset_vectorised().unwrap();
+        let found = update_with(&store, &Fake::named(8, "second"), budget(), &progress);
+
+        assert!(
+            found.is_err(),
+            "un autre modèle à dimension égale a été ajouté derrière le premier"
+        );
+    }
+
+    /// Et le champ dont l'absence a rendu quatre magasins indiscernables le 2026-09-21.
+    ///
+    /// Le budget de texte change les vecteurs autant que le modèle : le balayage à 2 000, 400,
+    /// 150 et 0 a écrit quatre magasins que ni la dimension ni le nom du modèle ne séparaient.
+    #[test]
+    fn changing_the_text_budget_is_refused_like_changing_the_model() {
+        let (_dir, store) = corpus(2);
+        let progress = Progress::new();
+        let fake = Fake::new(8);
+
+        update_with(&store, &fake, crate::text::Budget::of(2_000), &progress).unwrap();
+        store.reset_vectorised().unwrap();
+        let found = update_with(&store, &fake, crate::text::Budget::of(150), &progress);
+
+        assert!(
+            found.is_err(),
+            "deux budgets ont écrit dans le même magasin sans que rien ne le dise"
+        );
+    }
+
+    /// Le contrôle inverse des deux précédents : sans lui, un refus systématique les tiendrait.
+    #[test]
+    fn the_same_model_and_the_same_budget_continue_the_same_store() {
+        let (_dir, store) = corpus(4);
+        let progress = Progress::new();
+        let fake = Fake::new(8);
+
+        update_with(&store, &fake, budget(), &progress).unwrap();
+        store.reset_vectorised().unwrap();
+        let again = update_with(&store, &fake, budget(), &progress);
+
+        assert!(again.is_ok(), "une passe a refusé de continuer la sienne");
+    }
+
+    /// La provenance écrite est celle qu'on relit.
+    #[test]
+    fn the_store_records_what_the_pass_used() {
+        let (_dir, store) = corpus(3);
+        let progress = Progress::new();
+
+        update_with(
+            &store,
+            &Fake::named(8, "e5-jouet"),
+            crate::text::Budget::of(400),
+            &progress,
+        )
+        .unwrap();
+
+        let found = Vectors::load(store.vectors_path(), 8).unwrap();
+        let provenance = found.provenance().expect("la passe écrit sa provenance");
+        assert_eq!(provenance.model, "e5-jouet");
+        assert_eq!(provenance.budget, 400);
+        // La date n'est pas comparée à une valeur fixe — elle serait fausse demain — mais sa
+        // forme l'est, parce qu'un champ de date vide passerait sans ça.
+        assert_eq!(provenance.written.len(), 10);
+        assert_eq!(provenance.written.matches('-').count(), 2);
+    }
+
+    /// Le calcul de date est recopié, donc il se teste.
+    ///
+    /// Les trois lignes choisies sont celles où ce genre de code se trompe : le jour zéro, un
+    /// 29 février, et le lendemain d'un 28 février d'année non bissextile.
+    #[test]
+    fn the_civil_date_is_right_where_that_calculation_usually_is_not() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // 2024-02-29 : 19782 jours depuis l'époque.
+        assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+        assert_eq!(civil_from_days(19_783), (2024, 3, 1));
+        // 2023 n'est pas bissextile : le 28 février est suivi du 1er mars.
+        assert_eq!(civil_from_days(19_416), (2023, 2, 28));
+        assert_eq!(civil_from_days(19_417), (2023, 3, 1));
+        // Et un 1er janvier de siècle non bissextile, le piège classique.
+        assert_eq!(civil_from_days(11_323), (2001, 1, 1));
     }
 }

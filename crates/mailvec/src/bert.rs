@@ -75,6 +75,8 @@ pub struct Bert {
     tokenizer: tokenizers::Tokenizer,
     device: Device,
     dim: usize,
+    /// Ce qui le nomme et le distingue dans la provenance d'un magasin.
+    identity: crate::pass::Identity,
 }
 
 // Le modèle porte des dizaines de mébioctets de poids : les afficher n'aiderait personne. Même
@@ -121,12 +123,19 @@ impl Bert {
             .map_err(|source| model_error(&dir, format!("poids inexploitables : {source}")))?;
 
         let dim = config.hidden_size;
-        tracing::info!(dir = %dir, dim, "transformeur chargé");
+        let identity = crate::pass::Identity {
+            name: crate::pass::Identity::name_of(&dir),
+            family: "transformeur".to_owned(),
+            digest: crate::pass::Identity::digest_of(&weights),
+        };
+
+        tracing::info!(dir = %dir, dim, digest = %identity.digest, "transformeur chargé");
         Ok(Self {
             model,
             tokenizer,
             device,
             dim,
+            identity,
         })
     }
 
@@ -275,6 +284,10 @@ fn model_error(path: impl AsRef<Utf8Path>, reason: String) -> Error {
 impl crate::pass::Encoder for Bert {
     fn dim(&self) -> usize {
         Self::dim(self)
+    }
+
+    fn identity(&self) -> crate::pass::Identity {
+        self.identity.clone()
     }
 
     /// Seize, contre cinq cents pour un embedding statique.

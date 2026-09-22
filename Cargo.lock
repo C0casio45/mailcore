@@ -4557,6 +4557,7 @@ dependencies = [
 name = "mailvec"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "camino",
  "candle-core",
  "candle-nn",

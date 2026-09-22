@@ -85,7 +85,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, remesuré le 2026-09-22** avec un transformeur (`multilingual-e5-small`) après l'avoir été le 2026-09-21 avec un embedding statique : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras et **pour les deux familles de modèles**. Ce que le second relevé ajoute est le **partage** que la médiane du sous-ensemble cachait : sur les 3 cibles au sujet **français**, le transformeur est à **1 304** contre 3 680 au statique — trois fois mieux ; sur les 7 cibles au sujet **anglais**, les deux sont à égalité dans le bruit (11 236 contre 8 872, le plancher de bruit valant 1,5). Le transformeur **améliore la synonymie et n'améliore pas l'interlangue**, et comme 7 requêtes sur 10 sont interlangues, l'agrégat rapporte l'échec et masque le gain. Acquis par ailleurs : sur le sous-ensemble facile, le transformeur porte le rappel à **50,0 %** et la fusion à un rang médian de **14** (contre 53 au statique) |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, remesuré le 2026-09-22** avec un transformeur (`multilingual-e5-small`) après l'avoir été le 2026-09-21 avec un embedding statique : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras et **pour les deux familles de modèles**. Ce que les relevés ajoutent est le **partage** que l'agrégat cachait, mesuré à l'étape 6 ter sur un sous-ensemble dur scindé en **synonymie** (cible française, 3 requêtes), **interlangue** (cible anglaise, 6) et un message mixte indécidable : rang médian sémantique **1 304** contre 3 680 au statique sur la synonymie — trois fois mieux, pour un plancher de bruit de 1,06 — et **17 331** contre 5 583 sur l'interlangue, où il est donc **deux à trois fois pire** pour un plancher de 1,65. Le transformeur **améliore la synonymie et perd probablement en interlangue** ; comme 6 requêtes sur 10 sont interlangues, l'agrégat (6 531 contre 3 895) tombe **dans son propre bruit** et ne distingue rien. Acquis par ailleurs : sur le sous-ensemble facile, le transformeur porte le rappel à **50,0 %** et la fusion à un rang médian de **10** (contre 30 au statique). Les lots sont trop petits pour départager moins d'un facteur deux : le jeu doit grossir côté synonymie avant qu'un modèle de plus soit essayé |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **5,0 msg/s** mesuré sur 36 186 messages, soit **≈ 4,1 h** extrapolées sur le corpus. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
@@ -145,18 +145,23 @@ utilisable.
    de 6 à 12 minutes » — était faux d'un facteur trente-cinq : elle passe à **≈ 4,1 h**. Les 4 %
    étaient mesurés, le « trente fois » ne l'était pas.
 
-6 ter. **Scinder le jeu de requêtes en « synonymie » et « interlangue », et rejouer les deux
-   modèles sur les deux.** Le sous-ensemble « aucun mot commun » est un critère **syntaxique** :
-   il sélectionne deux problèmes différents, parce qu'une requête française ne partage jamais un
-   mot avec un sujet anglais. Tant qu'il les mélange, aucune comparaison de modèles n'est
-   lisible — et choisir un modèle de plus sur ce banc-là reviendrait à le choisir au hasard.
-   Rien n'interdit de conclure ensuite que l'interlangue sort du périmètre de la phase, mais ce
-   sera une décision écrite.
+6 ter. ~~**Scinder le jeu de requêtes en « synonymie » et « interlangue », et rejouer les deux
+   modèles sur les deux.**~~ Fait le 2026-09-22 : le partage est **calculé** — un comptage de
+   mots-outils propres à une langue, sur le texte que l'indexation voit — et il rend une
+   troisième réponse, **indéterminée**, plutôt que de trancher un message mixte au hasard. Le
+   magasin de vecteurs porte sa provenance (format de version 2 : modèle, famille, empreinte des
+   poids, budget, date), elle est **opposable à l'écriture**, et `measure-recall` l'imprime.
 
-   À faire dans la foulée, parce que c'est ce qui rend les relevés défendables : **le magasin de
-   vecteurs doit porter sa provenance** — modèle, dimension, budget, date — et `measure-recall`
-   doit l'imprimer. Le 2026-09-22 a montré qu'un chiffre du journal ne se reproduit pas, et que
-   personne ne peut plus dire quel modèle avait écrit les vecteurs qu'il a lus.
+   Ce que l'étape a trouvé au passage et qui déplace des chiffres déjà écrits : la fonction qui
+   calculait le rang médian rendait le **plus grand** des deux rangs du milieu sur un lot pair.
+   Elle avait été écrite pour n = 22 ; la scission a fait des lots de trois et six, et le biais
+   est devenu visible. Le relevé imprime maintenant les **rangs triés** à côté de la médiane, ce
+   qui aurait suffi à le voir sans le chercher. Voir le journal.
+
+   **Ce qui reste à faire avant qu'un modèle de plus soit téléchargé** : le jeu est trop petit là
+   où la phase se joue. Trois requêtes de synonymie ne départagent pas un facteur deux. Le jeu
+   doit grossir **du côté de la synonymie française** — du travail de vérité terrain, pas de
+   moteur, donc il passe devant, comme à l'étape 1.
 
 6 quater. **Le texte des pièces jointes, en amont des deux index.** Décidé le 2026-09-22, et placé
    **devant** les étapes 7 et 8. Le contenu d'une pièce jointe n'entre dans aucun index : une
@@ -993,6 +998,14 @@ réflexe « le sujet est l'essentiel d'un courriel » est faux sur ce corpus, et
 
 #### Le relevé
 
+> **Correction du même jour.** Les rangs médians de cette section ont été calculés avec une
+> fonction `median` qui rendait le **plus grand** des deux rangs du milieu sur un lot pair. Le
+> défaut a été trouvé quelques heures plus tard, en scindant le sous-ensemble dur — voir l'entrée
+> de l'étape 6 ter. Les valeurs corrigées sont **6 531** (transformeur), **3 895** (statique
+> taillé) et **5 628** (statique brut) sur le sous-ensemble dur, et sur le sous-ensemble facile
+> 43 / 23 / 10 au lieu de 57 / 40 / 14. Les **rapports** entre colonnes bougent peu et les
+> conclusions de cette entrée tiennent, à une exception près, signalée là où elle porte.
+
 Tous les chiffres ci-dessous viennent d'**une seule session, un seul store, une seule profondeur**
 — 73 658, c'est-à-dire le corpus entier, donc aucun rang n'est tronqué. C'est ce qui les rend
 comparables entre eux, et c'est la seule comparaison qui vaille ici.
@@ -1037,6 +1050,14 @@ statiques sur les cibles françaises, et il ne se distingue d'eux sur les cibles
 sens ni dans l'autre. Autrement dit : **il améliore la synonymie, il n'améliore pas l'interlangue**,
 et comme sept des dix requêtes sont interlangues, la médiane du sous-ensemble **rapporte l'échec
 interlangue et masque le gain de synonymie**.
+
+> **C'est l'exception annoncée plus haut.** Le partage en sept et trois a été fait à la main, et
+> l'outil de l'étape 6 ter — qui compte des mots-outils sur le texte entier plutôt que sur le
+> sujet — en trouve **six** interlangues, trois françaises et **une indécidable**, un message
+> mixte. Avec ce partage-là et la médiane corrigée, le transformeur n'est plus « indistinct » sur
+> l'interlangue : il y est **deux à trois fois pire**, pour un plancher de bruit de 1,65. Le sens
+> de la conclusion — il gagne en synonymie, il ne gagne pas en interlangue — ne change pas, mais
+> « ni dans un sens ni dans l'autre » était trop généreux. Voir l'entrée suivante.
 
 C'est la même faute de forme que celle du 2026-09-21, d'un cran plus haut. Là, un indicateur binaire
 écrasait un continuum et ne diagnostiquait rien. Ici, **une médiane agrège deux populations qui ne
@@ -1191,3 +1212,162 @@ d'une pièce jointe : un nom qui remonte l'arborescence est réduit à son derni
 ordinaire — accents compris — traverse intact, et un nom qui ne laisse rien en reçoit un. Le
 transformeur lui-même n'ajoute pas de test unitaire : ce qu'il fallait vérifier de lui est un
 classement sur 73 658 messages, et c'est le banc qui le fait.
+
+### 2026-09-22 (suite) — l'étape 6 ter : rendre le banc défendable, et ce que ça change
+
+L'entrée précédente se termine sur deux décisions. Celle-ci fait la première : **le banc avant le
+modèle**, une fois de plus, et pour la même raison qu'à l'étape 1. Trois défauts d'instrument en
+sont sortis, dont deux qui déplacent des chiffres déjà écrits.
+
+#### Le magasin de vecteurs dit maintenant d'où il vient
+
+Le format passe en version 2 : l'en-tête porte un bloc `clé=valeur` avec le **modèle**, sa
+**famille**, l'**empreinte de ses poids**, le **budget de texte** et la **date**. Trois choix
+méritent d'être écrits.
+
+**Dans le fichier, pas à côté.** Un fichier annexe ou une table SQLite se désynchronise de ce
+qu'il décrit, et le projet a déjà payé ce prix exact le 2026-09-11 avec les drapeaux d'indexation
+contre les documents tantivy. Une provenance qui peut mentir ne sert à rien : elle vit dans les
+octets qu'elle décrit.
+
+**Opposable à l'écriture, et pas seulement lisible.** `VectorWriter::open` refuse de continuer un
+magasin dont la provenance n'est pas la sienne, exactement comme il refusait déjà une autre
+dimension. C'est le refus qui **manquait** : le corpus porte deux modèles `potion` de dimension
+256, donc le contrôle existant les laissait s'empiler dans le même fichier. Le budget en fait
+partie pour la même raison — le balayage du 2026-09-21 a écrit quatre magasins à 2 000, 400, 150
+et 0 caractères que rien ne distinguait.
+
+La date, elle, est **exclue** de la comparaison. Une passe transformeur dure quatre heures ; la
+refuser au motif qu'elle a été reprise le lendemain rendrait le critère 3 intenable un jour sur
+mille. Un test le verrouille, parce que c'est le genre d'exclusion qu'on rétablit par zèle.
+
+**L'empreinte plutôt que le nom seul.** Le nom sert à lire un relevé, l'empreinte sert à refuser :
+un répertoire dont on remplace les poids garde son nom. Le projet désigne déjà ses messages et les
+cibles de son banc par leur contenu ; un modèle, qui s'exécute sur tout le corpus, mérite au moins
+autant.
+
+Un magasin de version 1 se **lit** encore — refuser à la lecture obligerait à recalculer des
+heures de vecteurs parfaitement valides — et ne s'**écrit** plus. `measure-recall` imprime alors,
+en tête de relevé :
+
+```
+Provenance         INCONNUE — magasin au format de version 1.
+                   Les chiffres ci-dessous ne disent pas quel modèle ni quel budget les a produits,
+                   donc ils ne se comparent à rien.
+```
+
+C'est exactement ce qu'il fallait pouvoir dire du magasin du 2026-09-21, et que personne n'était en
+mesure de dire.
+
+#### Le sous-ensemble dur se scinde, et la scission se calcule
+
+`Lang` sépare **synonymie** — cible française, comme la requête — et **interlangue** — cible
+anglaise. Le partage est **calculé**, jamais déclaré dans le fichier de requêtes : c'est la règle
+que `recall.rs` s'était déjà donnée pour le partage « aucun mot commun », et deux sources pour le
+même fait finissent toujours par se contredire.
+
+Trois précautions, dont deux paient tout de suite :
+
+- **un comptage de mots-outils propres à une langue**, sur le texte que l'indexation voit et non
+  sur le seul sujet. Le sujet aurait suffi pour la plupart des cibles et laissé
+  « Entry confirmed: … Giveaway » sans le moindre mot-outil ;
+- **un marqueur ambigu est exclu des deux listes.** « on », « a », « son », « car », « but »,
+  « or », « en » existent dans les deux langues avec des sens différents : ils ne déplacent pas
+  une requête d'un sous-ensemble à l'autre, ils la déplacent au hasard ;
+- **une marge, et non une majorité.** Douze marqueurs contre onze n'est pas une langue, c'est un
+  tirage. En dessous d'un facteur deux, la réponse est **indéterminée** — et une requête
+  indéterminée n'est rangée d'office nulle part. Elle a sa propre ligne, qui n'apparaît que quand
+  elle n'est pas vide, parce qu'une ligne vide affichée à chaque relevé devient du décor.
+
+Le partage manuel de l'entrée précédente donnait sept interlangues et trois françaises. L'outil en
+trouve **six**, trois et **une indécidable** — un message mixte, « 2 new comments in … refonte
+templates ». Il a raison et le comptage à la main avait tort : ce message-là ne pose pas une
+question à laquelle « français » ou « anglais » répond.
+
+#### Et la scission a trouvé un défaut dans ce qui la résume
+
+Le premier relevé scindé annonçait une médiane de **27 623** pour un lot de six rangs valant
+1 277, 6 023, 7 039, 27 623, 34 252 et 35 428. La moitié des valeurs sont sous 7 039 : le chiffre
+décrivait le contraire de ce qu'il prétendait.
+
+La cause : `ranks[len / 2]`, c'est-à-dire le **plus grand** des deux rangs du milieu quand le lot
+est pair. Sur les lots de vingt-deux et dix requêtes que le banc recevait jusqu'ici, le biais
+existait déjà et ne sautait pas aux yeux. Sur des lots de trois et six, il saute.
+
+**La leçon, qui est celle du 2026-09-21 d'un cran plus loin : un résumé statistique est un
+instrument, et un instrument se vérifie sur les lots qu'on va vraiment lui donner.** Celui-ci
+avait été écrit pour n = 22 et n'avait jamais été relu quand les lots ont changé de taille. Ce
+n'est pas un bogue de calcul — la fonction faisait ce qui était écrit — c'est un écart entre
+l'intention et le code, la même forme que le plafond du carnet d'adresses le 2026-09-11.
+
+Le remède est en deux parties, et la seconde vaut plus que la première :
+
+- la médiane est celle de tout le monde, moyenne des deux rangs du milieu sur un lot pair. Une
+  cible absente ne se moyenne pas : si le rang supérieur du milieu manque, la médiane est absente,
+  parce que fabriquer un nombre à partir d'une absence est pire que de dire qu'on ne sait pas ;
+- **le relevé imprime les rangs triés à côté de la médiane.** Sur un lot de trois, une médiane
+  résume trop peu de chose pour qu'on la croie sur parole. Les rangs bruts la rendent vérifiable
+  d'un coup d'œil — la même exigence que le détail par requête, appliquée à la ligne qui prétend
+  le condenser. Si ce remède-là avait existé, le défaut se serait vu sans qu'on le cherche.
+
+#### Le relevé corrigé
+
+Trois modèles, trois passes du jour, profondeur complète, et la médiane réparée.
+
+| rang médian sémantique | transformeur | statique taillé | statique brut |
+|---|---:|---:|---:|
+| **SYNONYMIE** — cible française (3) | **1 304** | 3 680 | 3 901 |
+| **INTERLANGUE** — cible anglaise (6) | 17 331 | **5 583** | 9 203 |
+| indéterminée — message mixte (1) | **11 236** | 44 637 | 32 096 |
+| les dix ensemble | 6 531 | **3 895** | 5 628 |
+| pour mémoire, le hasard | 36 829 | 36 829 | 36 829 |
+
+Le **plancher de bruit** reste les deux colonnes de droite, qui sont le même modèle à vocabulaire
+près : 1,06 sur la synonymie, **1,65** sur l'interlangue, 1,44 sur les dix.
+
+Ce qui se conclut, et ce qui ne se conclut pas :
+
+- **la synonymie, oui.** Le transformeur est à 0,35 et 0,33 fois les deux statiques, contre un
+  plancher de 1,06. C'est net, et les trois rangs vont dans le même sens — 78, 1 304 et 1 834
+  contre 611, 3 680 et 4 111. À n = 3 il faut le dire comme ça : le gain est cohérent, il n'est
+  pas établi ;
+- **l'interlangue, non, et l'écart penche contre lui.** 1,88 et 3,10 fois pire, pour un plancher
+  de 1,65. Le premier rapport est dans le bruit, le second en sort. Le sens est constant sur les
+  deux références, la magnitude ne l'est pas. Ce qu'on peut écrire honnêtement : **le transformeur
+  n'apporte rien en interlangue, et probablement y perd** ;
+- **les dix ensemble, rien du tout.** 1,68 et 1,16 fois, pour un plancher de 1,44. L'agrégat est
+  dans son propre bruit — ce qui est précisément la démonstration que la scission était le bon
+  geste. Le chiffre qui a porté deux entrées de journal ne distingue rien.
+
+Et le cas indéterminé, qu'on ne moyenne avec rien, mérite d'être noté pour la suite : sur le seul
+message mixte du lot, le transformeur est **trois à quatre fois meilleur** que les deux statiques.
+Un message qui parle les deux langues est peut-être ce qu'il sait faire de mieux. Une requête ne
+fait pas un résultat ; elle fait une hypothèse à mesurer, et il faudra d'autres cas mixtes pour ça.
+
+#### Ce que ça change pour le choix du modèle
+
+Rien n'est tranché, et c'est le but. La phase voulait « ne pas choisir un modèle sur un banc qui
+mélange deux problèmes » ; le banc ne les mélange plus, et il dit maintenant **lequel des deux**
+un modèle résout. Deux conséquences immédiates :
+
+- **un modèle ne se choisit plus sur « le sous-ensemble dur ».** Il se choisit sur la synonymie,
+  et séparément on décide si l'interlangue entre dans le périmètre de la phase. Les deux réponses
+  ne sont pas du même ordre : la première est un réglage de qualité, la seconde est une question
+  de portée ;
+- **les lots sont trop petits.** Trois requêtes de synonymie et six d'interlangue ne départagent
+  rien de moins qu'un facteur deux. Avant le prochain modèle, le jeu doit grossir **du côté de la
+  synonymie française**, qui est le sous-ensemble sur lequel la phase se joue réellement. C'est
+  du travail de vérité terrain, pas de moteur — et c'est, encore une fois, ce qui doit passer en
+  premier.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 424 tests verts**, soit 18 de plus. Ceux qui portent l'étape : une
+passe qui refuse de continuer un magasin qu'un autre modèle a commencé **à dimension égale**, son
+contrôle inverse qui vérifie qu'elle continue le sien, le même refus sur un changement de budget,
+une passe reprise le lendemain qui reste la même passe, un magasin de version 1 qui se lit et ne
+s'écrit pas, une longueur de provenance absurde refusée **avant** d'allouer, un retour à la ligne
+injecté dans une valeur qui ne casse pas le bloc, et la médiane d'un lot pair — avec le contrôle
+qu'une cible absente ne s'y moyenne pas.
+
+Le contrôle négatif du refus de provenance a été joué : neutralisé, il fait tomber
+`a_pass_refuses_to_continue_a_store_that_another_model_began` et **elle seule**.
