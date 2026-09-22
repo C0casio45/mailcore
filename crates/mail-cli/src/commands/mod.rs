@@ -4,6 +4,7 @@
 //! destinée à l'utilisateur. Partout ailleurs, `tracing`.
 
 pub mod account;
+pub mod attach;
 pub mod contacts;
 pub mod doctor;
 pub mod import;

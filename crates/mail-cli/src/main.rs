@@ -424,6 +424,21 @@ enum Command {
         #[arg(long)]
         headers: bool,
     },
+    /// Les pièces jointes d'un message : ce qu'il porte, et comment en enregistrer une.
+    ///
+    /// Le contenu des pièces jointes n'entre dans **aucun** index : une facture en PDF ne se
+    /// trouve pas par son montant. Cette commande est ce qui permet d'aller le lire soi-même.
+    Attach {
+        /// L'identifiant du message, tel que `mail search` le rend.
+        #[arg(long)]
+        id: i64,
+        /// Enregistrer la pièce jointe de ce rang, tel que la liste l'affiche.
+        #[arg(long)]
+        save: Option<usize>,
+        /// Où l'écrire. Par défaut, son propre nom, réduit à son dernier segment.
+        #[arg(long)]
+        out: Option<Utf8PathBuf>,
+    },
     /// Recherche dans le corpus indexé.
     Search {
         /// La requête. Syntaxe tantivy : `facture`, `"phrase exacte"`, `from:plombier`.
@@ -587,6 +602,13 @@ fn main() -> Result<()> {
         // **modèle installé sur la machine du démon**. Un `--daemon` laisserait croire qu'on
         // vectorise son propre courrier avec son propre modèle, alors qu'on déclencherait un
         // travail ailleurs, avec un modèle qu'on n'a pas choisi.
+        // Une pièce jointe vit dans le store du démon et s'enregistrerait sur **sa** machine.
+        // Le même raisonnement que `Link::stage` : un chemin de fichier ne traverse pas une
+        // frontière de processus, et une commande qui ferait croire le contraire écrirait
+        // ailleurs que là où l'utilisateur regarde.
+        (Command::Attach { .. }, Some(_)) => anyhow::bail!(
+            "les pièces jointes vivent dans le store du démon, et s'enregistreraient sur sa \n             machine. Lancer `mail attach` sur la machine du démon, sans --daemon."
+        ),
         (Command::Vectors { .. }, Some(_)) => anyhow::bail!(
             "la vectorisation vit du côté du démon : c'est son store qui porte les messages et \n             sa machine qui porte le modèle. Lancer `mail vectors` sur la machine du démon, \n             sans --daemon."
         ),
@@ -643,6 +665,9 @@ fn main() -> Result<()> {
                 "chemin du profil requis en local : --profile <chemin>, ou MAILCORE_TB_PROFILE",
             )?;
             commands::import::run(profile, store, *dry_run, *include_feeds, *include_orphans)
+        }
+        (Command::Attach { id, save, out }, None) => {
+            commands::attach::run(store, *id, *save, out.as_ref())
         }
         (Command::Index { .. }, None) => commands::index::run(store),
         (Command::Thread { .. }, None) => commands::thread::run(store),
