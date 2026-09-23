@@ -269,8 +269,9 @@ fn results(found: Vec<SearchResult>, limit: usize) -> dto::Results {
         .collect();
     dto::Results {
         // `truncated` plutôt qu'un total exact : compter tous les résultats coûterait un
-        // parcours complet de l'index, pour une information dont le modèle n'a pas besoin.
-        truncated: messages.len() >= limit,
+        // parcours complet de l'index, pour une information dont le modèle n'a pas besoin. La
+        // règle vit dans `mailcore`, à côté du plafond qu'elle doit connaître.
+        truncated: mailcore::query::truncated(messages.len(), limit),
         count: messages.len(),
         messages,
     }
@@ -355,5 +356,30 @@ mod tests {
         // Le modèle doit savoir qu'il n'a peut-être pas tout vu.
         assert!(results(Vec::new(), 0).truncated);
         assert!(!results(Vec::new(), 20).truncated);
+    }
+
+    /// Le défaut trouvé le 2026-09-23 : cinq cents résultats pour mille demandés, coupés par le
+    /// plafond du serveur, se disaient complets — le modèle croyait avoir tout vu.
+    #[test]
+    fn a_list_cut_by_the_server_ceiling_is_reported_as_truncated() {
+        let found: Vec<SearchResult> = (0..mailcore::query::MAX_RESULTS)
+            .map(|index| SearchResult {
+                item: mailcore::ListItem {
+                    id: MessageId(index as i64),
+                    blob: mailcore::BlobHash::of(format!("{index}").as_bytes()),
+                    date: 1_700_000_000,
+                    from_addr: "a@exemple.invalid".to_owned(),
+                    from_name: None,
+                    subject: format!("sujet {index}"),
+                    has_attachments: false,
+                    flags: mailcore::model::MessageFlags::empty(),
+                },
+                score: 1.0,
+            })
+            .collect();
+        assert!(
+            results(found, 1_000).truncated,
+            "la liste a été coupée par le plafond, pas par la limite"
+        );
     }
 }

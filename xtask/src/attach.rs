@@ -25,6 +25,8 @@ use camino::Utf8PathBuf;
 use mail_parser::MimeHeaders;
 use mailcore::Store;
 
+use crate::words::words;
+
 /// Ce qu'on retient d'un type de pièce jointe.
 #[derive(Debug, Default, Clone)]
 struct Tally {
@@ -94,7 +96,13 @@ pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
             // message de plus trouvable » : une invitation dont le titre reprend le sujet du
             // message n'apporte rien à l'index. Ce compteur ne retient que les messages où la
             // pièce jointe apporte **un mot que le reste du message n'a pas**.
-            if brings_a_new_word(&parsed, &gained, row) {
+            if brings_a_new_word(
+                &parsed,
+                &gained,
+                &row.subject,
+                &row.from_addr,
+                row.from_name.as_deref(),
+            ) {
                 newly_findable += 1;
             }
         }
@@ -178,17 +186,31 @@ pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
 /// qu'elle n'est, et c'est exactement le genre de chiffre flatteur que le projet refuse — même
 /// forme que le rappel binaire qui confondait « manqué de peu » et « pas du tout ».
 ///
-/// Les mots d'un caractère sont ignorés, et la comparaison est repliée en minuscules **Unicode** :
-/// `to_ascii_lowercase` ne replie pas « Éloïse », et sur un corpus français c'est la plupart des
-/// noms — la leçon du carnet d'adresses, le 2026-09-11.
+/// Le découpage est celui de [`crate::words`], **le même que celui du banc du critère 1** : mots
+/// d'un caractère et mots-outils retirés, minuscules Unicode. La première version avait son
+/// propre découpage, sans les mots-outils — un « vous » présent seulement dans une invitation y
+/// passait pour un mot nouveau, et le chiffre publié le 2026-09-23 en était gonflé.
 fn brings_a_new_word(
     parsed: &mail_parser::Message<'_>,
     gained: &str,
-    row: &mailcore::store::read::IndexRow,
+    subject: &str,
+    from_addr: &str,
+    from_name: Option<&str>,
 ) -> bool {
     let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for source in [row.subject.as_str(), row.from_name.as_deref().unwrap_or("")] {
+    for source in [subject, from_addr, from_name.unwrap_or("")] {
         known.extend(words(source));
+    }
+    // **Les destinataires aussi**, comme l'index les voit. Une relecture contradictoire a trouvé
+    // le 2026-09-23 que la première version les oubliait : le nom d'un participant d'invitation
+    // est souvent déjà un destinataire du message, donc déjà trouvable, et il comptait pourtant
+    // comme un mot nouveau apporté par la pièce jointe.
+    for header in [parsed.to(), parsed.cc()].into_iter().flatten() {
+        for address in header.iter() {
+            for value in [address.name(), address.address()].into_iter().flatten() {
+                known.extend(words(value));
+            }
+        }
     }
     for index in 0..parsed.text_body_count() {
         if let Some(part) = parsed.body_text(index) {
@@ -203,13 +225,6 @@ fn brings_a_new_word(
         }
     }
     words(gained).any(|word| !known.contains(&word))
-}
-
-/// Les mots d'un texte, repliés en minuscules Unicode.
-fn words(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|word| word.chars().count() > 1)
-        .map(str::to_lowercase)
 }
 
 /// Le pourcentage, sans division par zéro.
@@ -258,6 +273,72 @@ mod tests {
     fn a_share_of_nothing_is_zero_rather_than_a_division_by_zero() {
         assert!((share(0, 0) - 0.0).abs() < f64::EPSILON);
         assert!((share(1, 2) - 50.0).abs() < f64::EPSILON);
+    }
+
+    /// Un message à invitation, adressé à « Éloïse Martin », dont l'invitation porte `summary`.
+    fn invitation(summary: &str) -> Vec<u8> {
+        format!(
+            "From: Organisateur <orga@exemple.invalid>\r\n\
+             To: Éloïse Martin <eloise@exemple.invalid>\r\n\
+             Cc: Gaston Lagaffe <gaston@exemple.invalid>\r\n\
+             Subject: Invitation\r\n\
+             Content-Type: multipart/mixed; boundary=SEP\r\n\
+             \r\n\
+             --SEP\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             Vous avez ete invite.\r\n\
+             --SEP\r\n\
+             Content-Type: text/calendar; charset=utf-8\r\n\
+             \r\n\
+             BEGIN:VCALENDAR\r\n\
+             BEGIN:VEVENT\r\n\
+             SUMMARY:{summary}\r\n\
+             END:VEVENT\r\n\
+             END:VCALENDAR\r\n\
+             --SEP--\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn new_word(raw: &[u8]) -> bool {
+        let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let mut gained = String::new();
+        mailcore::attachtext::attachment_text(&parsed, &mut gained);
+        assert!(
+            !gained.is_empty(),
+            "la fixture doit donner du texte de pièce jointe"
+        );
+        brings_a_new_word(
+            &parsed,
+            &gained,
+            "Invitation",
+            "orga@exemple.invalid",
+            Some("Organisateur"),
+        )
+    }
+
+    /// Les trois cas qui décident du chiffre publié, et deux étaient faux avant le 2026-09-23.
+    #[test]
+    fn only_a_content_word_absent_from_the_whole_message_is_news() {
+        // Un vrai mot nouveau : l'invitation dit ce que le message ne dit pas.
+        assert!(new_word(&invitation("Signature chez le notaire")));
+        // Des mots-outils seuls : rien de trouvable n'a été ajouté. Sans le filtre partagé, c'était
+        // compté comme nouveau.
+        assert!(!new_word(&invitation("vous the your")));
+        // Le nom d'un destinataire : déjà trouvable par l'en-tête `To`. Oublié par la première
+        // version, qui ne regardait pas les destinataires.
+        assert!(!new_word(&invitation("Éloïse Martin")));
+        // Les deux autres ajouts, chacun avec son contrôle : un destinataire en copie, et
+        // l'adresse de l'expéditeur — « orga », dans orga@exemple.invalid.
+        assert!(
+            !new_word(&invitation("Gaston Lagaffe")),
+            "le Cc est déjà trouvable"
+        );
+        assert!(
+            !new_word(&invitation("orga")),
+            "l'adresse de l'expéditeur est déjà trouvable"
+        );
     }
 
     #[test]

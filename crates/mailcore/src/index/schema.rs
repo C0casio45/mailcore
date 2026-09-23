@@ -32,6 +32,25 @@ pub struct Fields {
     pub date: tantivy::schema::Field,
 }
 
+impl Fields {
+    /// Les champs qu'une requête sans champ nommé interroge : sujet, corps, expéditeur,
+    /// destinataires.
+    ///
+    /// ## Une seule liste, et c'est ce qui la rend vraie
+    ///
+    /// Elle servait à deux endroits écrits séparément : le parseur de requêtes, et les questions
+    /// « combien de messages portent ce mot » et « ce message porte-t-il ce mot » que pose le banc
+    /// du critère 1. Tant que les deux copies disaient la même chose, le banc voyait exactement ce
+    /// que la recherche voit ; le jour où un champ aurait été ajouté au parseur seulement, le banc
+    /// aurait cessé de le voir sans rien dire. Une relecture contradictoire l'a relevé le
+    /// 2026-09-23 — le commentaire affirmait « exact par construction », et ce n'était vrai que par
+    /// coïncidence.
+    #[must_use]
+    pub const fn searched(&self) -> [tantivy::schema::Field; 4] {
+        [self.subject, self.body, self.from, self.to]
+    }
+}
+
 /// Construit le schéma et ses accesseurs.
 #[must_use]
 pub fn build() -> (Schema, Fields) {

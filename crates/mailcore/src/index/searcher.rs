@@ -54,10 +54,7 @@ impl Searcher {
         // l'expéditeur pèsent plus que le corps : chercher « facture plombier » doit
         // remonter le mail intitulé « facture » avant celui qui contient le mot au détour
         // d'une signature.
-        let mut parser = QueryParser::for_index(
-            index,
-            vec![fields.subject, fields.body, fields.from, fields.to],
-        );
+        let mut parser = QueryParser::for_index(index, fields.searched().to_vec());
         parser.set_field_boost(fields.subject, 3.0);
         parser.set_field_boost(fields.from, 2.0);
 
@@ -105,7 +102,6 @@ impl Searcher {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
-
         let parsed = match self.parser.parse_query(query) {
             Ok(parsed) => parsed,
             Err(refused) => {
@@ -124,6 +120,16 @@ impl Searcher {
                 self.parser.parse_query(&plain)?
             }
         };
+        // Zéro résultat demandé, zéro rendu. Sans ce retour, `TopDocs::with_limit(0)` **panique**
+        // dans tantivy (`assert_ne!(limit, 0)`) — et la limite vient d'un client, donc d'une entrée
+        // qu'on ne maîtrise pas. Trouvé par la relecture du 2026-09-23.
+        //
+        // **Après** l'analyse et non avant : une requête mal formée reste une erreur quelle que soit
+        // la limite. La placer en tête — ce que faisait la première version — faisait taire le refus
+        // de `subject:(` dès que la limite valait zéro.
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let searcher = self.reader.searcher();
         // `.order_by_score()` : depuis tantivy 0.26, `TopDocs` est un constructeur, pas un
         // collecteur. Sans lui, ça ne compile pas — et avec un autre `order_by_*`, le tri
@@ -148,8 +154,8 @@ impl Searcher {
 
     /// Nombre de documents dans l'index.
     ///
-    /// À confronter au nombre de messages du store : un écart signale une indexation
-    /// incomplète ou interrompue, ce que `mail doctor` doit savoir dire.
+    /// À ne **pas** confronter au nombre de messages du store : un message dont le blob manque est
+    /// marqué indexé sans document. La comparaison juste est [`crate::index::Coverage`].
     #[must_use]
     pub fn document_count(&self) -> u64 {
         self.reader.searcher().num_docs()
@@ -177,31 +183,106 @@ impl Searcher {
     /// documentaire distingue les deux, et elle ne regarde le classement d'aucun moteur — donc
     /// elle ne peut pas rendre circulaire une comparaison entre moteurs.
     ///
-    /// Le maximum sur les champs plutôt que la somme : un même message qui porte le mot dans son
-    /// sujet **et** son corps serait compté deux fois par une somme, et la grandeur cesserait
-    /// d'être un nombre de documents. Le maximum la sous-estime d'au plus un facteur égal au
-    /// nombre de champs, ce qui est du bon côté — il ne fera jamais croire qu'un mot est plus
-    /// rare qu'il n'est.
+    /// ## L'union des champs, ni leur somme ni leur maximum
+    ///
+    /// Ce qu'on veut est un **nombre de documents** : combien de messages une requête réduite à ce
+    /// mot rendrait. Deux raccourcis s'offrent, et ils se trompent dans deux sens opposés :
+    ///
+    /// - la **somme** des fréquences par champ compte deux fois un message qui porte le mot dans
+    ///   son sujet et son corps — elle fait paraître un mot plus **fréquent** qu'il n'est ;
+    /// - le **maximum** oublie les messages qui ne le portent que dans un autre champ — il le fait
+    ///   paraître plus **rare**, jusqu'à un facteur égal au nombre de champs.
+    ///
+    /// La première version prenait le maximum, avec un commentaire qui affirmait qu'il « ne fera
+    /// jamais croire qu'un mot est plus rare qu'il n'est ». C'était exactement l'inverse, et une
+    /// relecture l'a trouvé le 2026-09-23. L'erreur n'était pas anodine pour ce qui s'en sert :
+    /// un mot sous-compté peut passer sous le seuil de dix du banc du critère 1, et ranger une
+    /// requête parmi celles « qu'un mot suffit à résoudre » alors qu'il ne suffit pas.
+    ///
+    /// L'union se calcule donc pour de bon : une requête booléenne `OU` d'un terme par champ,
+    /// comptée par le collecteur [`tantivy::collector::Count`]. C'est ce que ferait la vraie
+    /// recherche, restreinte à ce mot, et elle ignore au passage les documents supprimés que
+    /// `Searcher::doc_freq` de tantivy compte encore jusqu'à la prochaine fusion de segments.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Tantivy`] si l'index est illisible.
     pub fn doc_freq(&self, word: &str) -> Result<u64> {
-        let searcher = self.reader.searcher();
-        let mut most = 0u64;
-        for field in [
-            self.fields.subject,
-            self.fields.body,
-            self.fields.from,
-            self.fields.to,
-        ] {
-            // Le terme est construit sur le mot **déjà replié en minuscules** par l'appelant :
-            // `Term::from_field_text` ne passe pas par l'analyseur du champ, donc un mot capital
-            // n'y trouverait rien. C'est le genre de silence qu'on préfère écrire que découvrir.
-            let term = tantivy::Term::from_field_text(field, word);
-            most = most.max(searcher.doc_freq(&term)?);
-        }
-        Ok(most)
+        let found = self
+            .reader
+            .searcher()
+            .search(&self.word_query(word), &tantivy::collector::Count)?;
+        Ok(found as u64)
+    }
+
+    /// Ce document porte-t-il ce mot, dans l'un des champs interrogés par défaut ?
+    ///
+    /// ## Pourquoi demander à l'index plutôt que relire le message
+    ///
+    /// Le banc du critère 1 répondait à cette question en recomposant à la main « le texte que
+    /// l'index voit » — sujet, expéditeur, corps rendu. Une relecture contradictoire a trouvé le
+    /// 2026-09-23 qu'il en oubliait **quatre** sources : les destinataires, les parties HTML quand
+    /// une partie texte existe, le texte des pièces jointes indexé depuis le même jour, et la fin
+    /// des corps coupés à [`crate::query::MAX_BODY_TEXT`]. Une requête qui partageait un mot avec
+    /// sa cible par l'une de ces voies était rangée « sans mot commun » — dans le sous-ensemble
+    /// même de la comparaison que le critère 1 déclare.
+    ///
+    /// Recomposer le texte de l'index, c'est écrire une deuxième copie de l'indexeur, et elle
+    /// dérive dès que le premier change. Demander à l'index garantit deux choses : **le même
+    /// texte** — ce que l'indexeur a réellement écrit, y compris ce qu'on y ajoutera demain — et
+    /// **les mêmes champs**, puisque le parseur et cette requête lisent la même liste,
+    /// [`Fields::searched`].
+    ///
+    /// Ce qu'il ne garantit pas, et qu'il faut dire : le mot demandé arrive **déjà découpé** par
+    /// l'appelant. `Term::from_field_text` ne passe pas par l'analyseur du champ, donc un
+    /// découpage qui diffère de celui de tantivy — un mot de quarante octets ou plus, que
+    /// l'analyseur jette ; un sigma final, que son repli en minuscules ignore — rendrait « absent »
+    /// un mot qui est là. Sur du français et de l'anglais ordinaires, les deux découpages coïncident.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Tantivy`] si l'index est illisible.
+    pub fn contains(&self, id: MessageId, word: &str) -> Result<bool> {
+        use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+        use tantivy::schema::IndexRecordOption;
+
+        let this_message: Box<dyn Query> = Box::new(TermQuery::new(
+            tantivy::Term::from_field_i64(self.fields.id, id.0),
+            IndexRecordOption::Basic,
+        ));
+        let this_word: Box<dyn Query> = Box::new(self.word_query(word));
+        let query = BooleanQuery::new(vec![(Occur::Must, this_message), (Occur::Must, this_word)]);
+        let found = self
+            .reader
+            .searcher()
+            .search(&query, &tantivy::collector::Count)?;
+        Ok(found > 0)
+    }
+
+    /// Un mot dans l'un des champs interrogés par défaut : un `OU` d'un terme par champ.
+    ///
+    /// Partagé par [`Self::doc_freq`] et [`Self::contains`], pour que « combien de messages
+    /// portent ce mot » et « ce message porte-t-il ce mot » ne puissent pas désigner deux
+    /// ensembles de champs différents.
+    fn word_query(&self, word: &str) -> tantivy::query::BooleanQuery {
+        use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+        use tantivy::schema::IndexRecordOption;
+
+        let clauses: Vec<(Occur, Box<dyn Query>)> = self
+            .fields
+            .searched()
+            .into_iter()
+            .map(|field| {
+                // Le terme est construit sur le mot **déjà replié en minuscules** par l'appelant :
+                // `Term::from_field_text` ne passe pas par l'analyseur du champ, donc un mot capital
+                // n'y trouverait rien. C'est le genre de silence qu'on préfère écrire que découvrir.
+                let term = tantivy::Term::from_field_text(field, word);
+                let query: Box<dyn Query> =
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+                (Occur::Should, query)
+            })
+            .collect();
+        BooleanQuery::new(clauses)
     }
 }
 

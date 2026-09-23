@@ -32,6 +32,7 @@ mod schema;
 mod secrets;
 mod ui;
 mod vectors;
+mod words;
 
 use anyhow::Result;
 use camino::Utf8PathBuf;

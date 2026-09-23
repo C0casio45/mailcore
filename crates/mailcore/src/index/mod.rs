@@ -6,10 +6,12 @@
 //!
 //! Phase 4 : un index vectoriel à côté, un embedding par message.
 
+pub mod coverage;
 pub mod schema;
 pub mod searcher;
 pub mod writer;
 
+pub use coverage::Coverage;
 pub use schema::Fields;
 pub use searcher::{Hit, Searcher};
 pub use writer::{IndexStats, open_or_create, rebuild, update};

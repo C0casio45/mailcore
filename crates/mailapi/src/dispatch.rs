@@ -238,7 +238,8 @@ pub struct PageParams {
     /// Le curseur rendu par la page précédente. Absent pour la première page.
     #[serde(default)]
     pub after: Option<String>,
-    /// Nombre de lignes voulues.
+    /// Nombre de lignes voulues, plafonné à 500 par le serveur. Une page coupée par le plafond
+    /// porte un curseur comme une page coupée par la limite.
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -284,7 +285,7 @@ pub struct SearchParams {
     /// La requête. Même syntaxe que côté MCP : mot, `"phrase exacte"`, `from:`, `subject:`,
     /// `AND` / `OR` / `-mot`.
     pub query: String,
-    /// Nombre maximum de résultats.
+    /// Nombre maximum de résultats, plafonné à 500 par le serveur — `truncated` le dit.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -563,7 +564,14 @@ pub fn call(mailbox: &Mailbox, method: &str, params: Value) -> Result<Value, Err
             // Le curseur ne sort que si la page est pleine. Une page incomplète est la
             // dernière, et rendre un curseur ferait faire au client un aller-retour de plus
             // pour apprendre qu'il n'y a rien après.
-            let next = (items.len() as u32 >= limit)
+            //
+            // « Pleine » au sens du **plafond** autant que de la limite demandée. `Mailbox::page`
+            // coupe en silence à `MAX_RESULTS` ; la première version comparait à la limite
+            // demandée, donc un client qui demandait mille messages par page en recevait cinq
+            // cents **sans curseur**, croyait avoir atteint la fin, et ne voyait jamais la suite du
+            // dossier. Une relecture contradictoire l'a trouvé le 2026-09-23, en cherchant le même
+            // défaut que `truncated` — c'est la même règle, donc la même fonction.
+            let next = mailcore::query::truncated(items.len(), limit as usize)
                 .then(|| items.last().map(|item| encode_cursor(item.date, item.id.0)))
                 .flatten();
 
@@ -632,7 +640,7 @@ pub fn call(mailbox: &Mailbox, method: &str, params: Value) -> Result<Value, Err
                 .map(|result| dto::Row::new(&result.item, Some(result.score)))
                 .collect();
             value(&dto::Results {
-                truncated: rows.len() >= limit,
+                truncated: mailcore::query::truncated(rows.len(), limit),
                 count: rows.len(),
                 search_available: mailbox.search_available(),
                 rows,
@@ -1158,6 +1166,96 @@ mod tests {
         assert_eq!(seen.len(), 25);
         let unique: std::collections::HashSet<i64> = seen.iter().copied().collect();
         assert_eq!(unique.len(), 25, "une ligne est sortie deux fois");
+    }
+
+    /// Le défaut trouvé le 2026-09-23 : une page coupée par le plafond du serveur n'avait pas de
+    /// curseur, donc le client croyait avoir atteint la fin et ne voyait jamais la suite.
+    #[test]
+    fn a_page_cut_by_the_server_ceiling_still_carries_a_cursor() {
+        let total = mailcore::query::MAX_RESULTS + 5;
+        let (_dir, mailbox, folder) = mailbox(total);
+        let page: dto::Page = serde_json::from_value(ok(
+            &mailbox,
+            method::MESSAGES_PAGE,
+            json!({"folder": folder, "limit": 1_000}),
+        ))
+        .unwrap();
+        assert_eq!(page.rows.len(), mailcore::query::MAX_RESULTS);
+        let next = page
+            .next
+            .expect("la page a été coupée par le plafond : il faut un curseur");
+
+        let rest: dto::Page = serde_json::from_value(ok(
+            &mailbox,
+            method::MESSAGES_PAGE,
+            json!({"folder": folder, "limit": 1_000, "after": next}),
+        ))
+        .unwrap();
+        assert_eq!(rest.rows.len(), 5, "la suite du dossier est atteignable");
+        assert!(rest.next.is_none());
+    }
+
+    /// Le même défaut côté recherche : une liste coupée à cinq cents se disait complète.
+    #[test]
+    fn a_search_cut_by_the_server_ceiling_says_it_was_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap().to_owned();
+        {
+            let store = Store::open(&root).unwrap();
+            let writer = store.writer().unwrap();
+            let account = writer.upsert_account("imap", "compte").unwrap();
+            let folder = writer
+                .upsert_folder(account, "INBOX", FolderKind::Inbox)
+                .unwrap();
+            for index in 0..(mailcore::query::MAX_RESULTS + 5) {
+                let raw = format!("From: a@b.c\r\nSubject: facture {index}\r\n\r\nbonjour\r\n");
+                let blob = store.blobs().put(raw.as_bytes()).unwrap().hash;
+                let (id, _) = writer
+                    .insert_message(&NewMessage {
+                        blob,
+                        rfc822_id: None,
+                        date: 1_700_000_000 + index as i64,
+                        from_addr: "a@b.c",
+                        from_name: None,
+                        subject: &format!("facture {index}"),
+                        size: raw.len() as u64,
+                        has_attachments: false,
+                    })
+                    .unwrap();
+                writer
+                    .insert_ref(id, folder, 1_700_000_000, MessageFlags::empty())
+                    .unwrap();
+            }
+            writer.commit().unwrap();
+            mailcore::index::rebuild(&store, &mailcore::Progress::new()).unwrap();
+        }
+        let mailbox = Mailbox::open(&root).unwrap();
+
+        let found: dto::Results = serde_json::from_value(ok(
+            &mailbox,
+            method::SEARCH_QUERY,
+            json!({"query": "facture", "limit": 1_000}),
+        ))
+        .unwrap();
+        assert_eq!(found.count, mailcore::query::MAX_RESULTS);
+        assert!(
+            found.truncated,
+            "cinq cents rendus sur cinq cent cinq : la liste doit se dire coupée"
+        );
+
+        // Le contrôle inverse, au même point d'appel : une recherche qui rend moins que la limite
+        // et moins que le plafond n'a rien coupé.
+        let few: dto::Results = serde_json::from_value(ok(
+            &mailbox,
+            method::SEARCH_QUERY,
+            json!({"query": "\"facture 7\"", "limit": 1_000}),
+        ))
+        .unwrap();
+        assert_eq!(few.count, 1);
+        assert!(
+            !few.truncated,
+            "un seul résultat sur mille demandés n'est pas une coupe"
+        );
     }
 
     #[test]

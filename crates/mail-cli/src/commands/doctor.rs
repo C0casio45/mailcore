@@ -85,12 +85,24 @@ pub fn run(store_root: Option<&Utf8PathBuf>, purge_orphans: bool) -> Result<()> 
     //    l'index est reconstruit à part, et une indexation interrompue la produit.
     match open_or_create(&store).and_then(|(index, _)| Searcher::open(&index)) {
         Ok(searcher) => {
-            let indexed = searcher.document_count();
-            println!("Documents indexés  {indexed}");
-            if indexed != stats.messages {
+            // La règle de `mailcore::index::Coverage`, et non plus une comparaison au nombre de
+            // messages : un message dont le blob manque peut n'avoir **aucun** document — s'il était
+            // déjà perdu à l'indexation — ou en avoir un — s'il l'a été après. L'ancienne égalité
+            // annonçait un index désynchronisé en permanence sur tout store ayant perdu un blob, et
+            // `mail index`, qu'elle conseillait, ne pouvait rien y faire. Le blob manquant est déjà
+            // signalé plus haut, pour ce qu'il est.
+            let coverage = mailcore::index::Coverage {
+                documents: searcher.document_count(),
+                messages: stats.messages,
+                missing_blobs: missing.len() as u64,
+            };
+            println!("Documents indexés  {}", coverage.documents);
+            if !coverage.is_complete() {
                 findings.push(format!(
-                    "index désynchronisé : {indexed} documents pour {} messages — `mail index`",
-                    stats.messages
+                    "index désynchronisé : {} documents, attendu entre {} et {} — `mail index`",
+                    coverage.documents,
+                    coverage.indexable(),
+                    coverage.messages
                 ));
             }
         }

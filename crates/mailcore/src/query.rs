@@ -37,6 +37,37 @@ use crate::store::read::{Cursor, ListItem, StoreStats};
 /// SQLite.
 pub const MAX_RESULTS: usize = 500;
 
+/// Une liste de `returned` résultats, pour `requested` demandés, a-t-elle pu être coupée ?
+///
+/// ## Pourquoi c'est ici et pas chez chaque client
+///
+/// `mailapi` et `mailmcp` le calculaient chacun, à l'identique, comme `returned >= requested` — et
+/// tous deux se trompaient pareil : [`Mailbox::search`] plafonne **en silence** à [`MAX_RESULTS`].
+/// Un client qui demandait mille résultats sur une requête qui en a trois mille en recevait cinq
+/// cents, avec `truncated: false`. Le modèle de langage à l'autre bout croyait avoir tout vu. Une
+/// relecture contradictoire l'a trouvé le 2026-09-23.
+///
+/// La règle vit donc à côté du plafond qu'elle doit connaître, pour qu'aucun client ne puisse
+/// l'oublier.
+///
+/// Deux cas limites, à connaître plutôt qu'à découvrir :
+///
+/// - **une limite nulle** rend `true` : zéro résultat pour zéro demandé, la liste est « pleine ».
+///   Un client qui demande zéro ne regarde de toute façon pas la suite ;
+/// - **un résultat obsolète** — un document que l'index porte encore pour un message supprimé de
+///   SQLite — est écarté par [`Mailbox::search`] **après** la coupe. Une liste pleine peut donc
+///   revenir avec un résultat de moins et se dire complète. C'est rare — il faut un index en
+///   avance sur le store, ce que [`crate::index::Coverage`] détecte — et c'est dit ici.
+#[must_use]
+pub const fn truncated(returned: usize, requested: usize) -> bool {
+    let effective = if requested < MAX_RESULTS {
+        requested
+    } else {
+        MAX_RESULTS
+    };
+    returned >= effective
+}
+
 /// Taille maximale du texte rendu pour un corps de message.
 ///
 /// 256 Kio : au-delà, c'est une pièce jointe déguisée en texte, et personne — humain ou
@@ -379,9 +410,19 @@ impl Mailbox {
 
     /// Combien de messages indexés contiennent ce mot, replié en minuscules par l'appelant.
     ///
-    /// Rend `None` quand il n'y a pas d'index : l'appelant doit distinguer « aucun message » de
-    /// « on ne sait pas », et les confondre ferait passer un corpus non indexé pour un corpus où
-    /// tout mot est rare. Voir [`crate::index::Searcher::doc_freq`] pour ce que ça mesure.
+    /// Voir [`crate::index::Searcher::doc_freq`] pour ce que ça mesure.
+    ///
+    /// ## `None` ne veut **pas** dire « pas encore indexé »
+    ///
+    /// La première version l'affirmait, et un test l'a démenti : [`Self::open`] crée un index
+    /// **vide** quand il n'y en a pas, donc un store fraîchement importé rend `Some(0)` pour tous
+    /// les mots, pas `None`. `None` ne sort que d'un index illisible.
+    ///
+    /// La conséquence est à connaître de tout appelant qui s'en sert pour juger une requête : sur
+    /// un index vide ou incomplet, **chaque mot a l'air introuvable**. Un banc qui classe ses
+    /// requêtes par la rareté de leurs mots doit donc vérifier d'abord que l'index couvre le
+    /// store — voir [`Self::index_coverage`] — sans quoi il rangerait tout dans « aucun mot
+    /// commun » sans rien dire.
     ///
     /// # Errors
     ///
@@ -391,6 +432,51 @@ impl Mailbox {
             Some(searcher) => searcher.doc_freq(word).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// Ce message porte-t-il ce mot, tel que l'index le voit ? `None` si l'index n'est pas lisible.
+    ///
+    /// Voir [`crate::index::Searcher::contains`] pour pourquoi on le demande à l'index plutôt que
+    /// de relire le message.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Tantivy`] si l'index est illisible.
+    pub fn contains(&self, id: MessageId, word: &str) -> Result<Option<bool>> {
+        match &self.searcher {
+            Some(searcher) => searcher.contains(id, word).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Combien de documents l'index plein texte porte, ou `None` s'il n'est pas lisible.
+    ///
+    /// **Ne pas le comparer à [`Store::message_count`]** : un message dont le blob manque est
+    /// marqué indexé sans avoir de document, donc l'écart ne dit pas qu'un index est incomplet.
+    /// La comparaison juste est celle de [`Self::index_coverage`].
+    #[must_use]
+    pub fn indexed_documents(&self) -> Option<u64> {
+        self.searcher.as_ref().map(Searcher::document_count)
+    }
+
+    /// L'index couvre-t-il le store ? `None` si l'index n'est pas lisible.
+    ///
+    /// Voir [`crate::index::Coverage`] : la règle y est écrite une fois, et `mail doctor` comme
+    /// le banc du critère 1 l'appliquent. Le coût est un parcours des blobs du store — une
+    /// vérification de présence par message —, donc c'est un diagnostic, pas un appel de routine.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error`] si le store ou le magasin de blobs est illisible.
+    pub fn index_coverage(&self) -> Result<Option<crate::index::Coverage>> {
+        let Some(documents) = self.indexed_documents() else {
+            return Ok(None);
+        };
+        Ok(Some(crate::index::Coverage {
+            documents,
+            messages: self.store.message_count()?,
+            missing_blobs: self.store.missing_blobs()?.len() as u64,
+        }))
     }
 
     /// La même recherche, **sans plafond**.
@@ -1086,6 +1172,130 @@ mod tests {
         let hits = reopened.search("facture", 10).unwrap();
         assert_eq!(hits.len(), 2, "les deux messages parlent de facture");
         assert!(hits[0].score > 0.0);
+    }
+
+    /// La fréquence documentaire est une **union** de champs, et elle se trompe dans deux sens si
+    /// on la raccourcit.
+    ///
+    /// « plombier » est dans l'expéditeur du premier message et le destinataire du second : un
+    /// **maximum** par champ dirait 1, ce que faisait la première version. « facture » est dans
+    /// les deux sujets et dans un corps : une **somme** dirait 3. Les deux doivent rendre 2.
+    #[test]
+    fn doc_freq_counts_documents_across_fields_without_double_counting() {
+        let (_dir, mailbox) = mailbox();
+        crate::index::rebuild(mailbox.store(), &crate::Progress::new()).unwrap();
+        let reopened = Mailbox::open(mailbox.store().root()).unwrap();
+
+        assert_eq!(
+            reopened.doc_freq("plombier").unwrap(),
+            Some(2),
+            "un maximum par champ oublie le message qui ne le porte qu'en destinataire"
+        );
+        assert_eq!(
+            reopened.doc_freq("facture").unwrap(),
+            Some(2),
+            "une somme par champ compte deux fois le message qui le porte en sujet et en corps"
+        );
+        assert_eq!(reopened.doc_freq("merci").unwrap(), Some(1));
+        assert_eq!(reopened.doc_freq("inexistant").unwrap(), Some(0));
+        // « archive » n'est que dans le champ des dossiers, indexé mais **pas** interrogé par
+        // défaut : la fréquence doit l'ignorer comme la recherche l'ignore. Le contrôle que
+        // `Fields::searched` est bien la liste commune, et pas une copie qui pourrait dériver.
+        assert_eq!(reopened.doc_freq("archive").unwrap(), Some(0));
+    }
+
+    /// Le cas exact que le banc du critère 1 ratait : un mot présent **seulement** chez les
+    /// destinataires. « plombier » n'est dans la réponse que comme destinataire ; relire le sujet,
+    /// l'expéditeur et le corps ne le trouve pas, l'index si.
+    #[test]
+    fn contains_sees_every_field_the_index_searches_including_recipients() {
+        let (_dir, mailbox) = mailbox();
+        crate::index::rebuild(mailbox.store(), &crate::Progress::new()).unwrap();
+        let reopened = Mailbox::open(mailbox.store().root()).unwrap();
+
+        let hits = reopened.search_deep("facture", 10).unwrap();
+        let from_plumber = hits
+            .iter()
+            .find(|hit| hit.item.from_addr == "plombier@exemple.fr")
+            .unwrap()
+            .item
+            .id;
+        let reply = hits
+            .iter()
+            .find(|hit| hit.item.from_addr == "moi@exemple.fr")
+            .unwrap()
+            .item
+            .id;
+
+        assert_eq!(
+            reopened.contains(reply, "plombier").unwrap(),
+            Some(true),
+            "le destinataire est indexé, donc le mot est partagé"
+        );
+        assert_eq!(
+            reopened.contains(from_plumber, "voici").unwrap(),
+            Some(true)
+        );
+        // Le contrôle inverse : un mot d'un autre message n'appartient pas à celui-ci.
+        assert_eq!(reopened.contains(reply, "voici").unwrap(), Some(false));
+        assert_eq!(reopened.contains(reply, "inexistant").unwrap(), Some(false));
+    }
+
+    /// Le défaut que `truncated` corrige : une liste coupée au plafond se disait complète.
+    #[test]
+    fn a_list_cut_at_the_ceiling_says_it_was_cut() {
+        assert!(
+            crate::query::truncated(MAX_RESULTS, 1_000),
+            "cinq cents rendus pour mille demandés : la liste a été coupée par le plafond"
+        );
+        assert!(crate::query::truncated(20, 20));
+        // Le contrôle inverse : moins que demandé et moins que le plafond, rien n'a été coupé.
+        assert!(!crate::query::truncated(19, 20));
+        assert!(!crate::query::truncated(499, 1_000));
+    }
+
+    /// Une limite nulle rend une liste vide, et ne fait pas paniquer tantivy : la limite vient
+    /// d'un client.
+    #[test]
+    fn a_zero_limit_yields_nothing_instead_of_panicking() {
+        let (_dir, mailbox) = mailbox();
+        crate::index::rebuild(mailbox.store(), &crate::Progress::new()).unwrap();
+        let reopened = Mailbox::open(mailbox.store().root()).unwrap();
+        assert!(reopened.search("facture", 0).unwrap().is_empty());
+        assert!(reopened.search_deep("facture", 0).unwrap().is_empty());
+        // Le contrôle inverse : une requête mal formée reste refusée même à limite nulle. La
+        // première version du retour anticipé, placée avant l'analyse, la faisait passer en silence.
+        assert!(matches!(
+            reopened.search("subject:(", 0),
+            Err(crate::Error::Query(_))
+        ));
+        assert!(matches!(
+            reopened.search_deep("subject:(", 0),
+            Err(crate::Error::Query(_))
+        ));
+    }
+
+    /// Le piège que ce test a trouvé en échouant : un store non indexé porte un index **vide**,
+    /// donc chaque mot y a une fréquence de zéro — il a l'air introuvable, pas inconnu.
+    ///
+    /// Ce test s'écrivait d'abord « sans index, on ne sait pas » et attendait `None`. Il a échoué
+    /// avec `Some(0)`, et c'est la justification qui était fausse, pas le code. D'où
+    /// `indexed_documents` et `index_coverage` : la seconde est la façon juste de savoir qu'une
+    /// fréquence veut dire quelque chose.
+    #[test]
+    fn an_unindexed_store_makes_every_word_look_absent_and_says_so_elsewhere() {
+        let (_dir, mailbox) = mailbox();
+        assert_eq!(mailbox.doc_freq("facture").unwrap(), Some(0));
+        assert_eq!(
+            mailbox.indexed_documents(),
+            Some(0),
+            "l'index vide doit se voir au compte, puisqu'il ne se voit pas à la fréquence"
+        );
+        assert_eq!(mailbox.store().message_count().unwrap(), 2);
+
+        crate::index::rebuild(mailbox.store(), &crate::Progress::new()).unwrap();
+        let reopened = Mailbox::open(mailbox.store().root()).unwrap();
+        assert_eq!(reopened.indexed_documents(), Some(2));
     }
 
     #[test]

@@ -85,7 +85,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, remesuré le 2026-09-22** avec un transformeur (`multilingual-e5-small`) après l'avoir été le 2026-09-21 avec un embedding statique : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras et **pour les deux familles de modèles**. **Et la mesure ne départage pas les moteurs**, ce qui est le vrai état au 2026-09-23. Le banc a été refait ce jour-là : le bras plein texte était **censuré à 500 résultats** en silence — donc ses « absente » voulaient dire « au-delà de 500 », et aucun de ses rangs n'était comparable —, la partition reposait sur « partage un mot » que quatre requêtes réelles ont réfuté, et les conclusions étaient tirées de cellules de 3 à 6 requêtes. La décision est maintenant portée par une **comparaison appariée sur tout le jeu** (test de signe exact, rapport géométrique des rangs), et elle rend : plein texte contre hybride **7 victoires contre 15, p = 0,134, ×0,43** — il en aurait fallu 17 sur 22. Les trois paires sont **indécidables à n = 26**. Rien n'est établi sur la comparaison des modèles entre eux ; ce qui est établi est la distance à parcourir, soit **deux victoires** |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
@@ -177,7 +177,7 @@ utilisable.
      images dominent en nombre et ne portent pas de texte, les invitations en valent plus que
      les PDF et se lisent avec du code déjà écrit.
    - ~~**Les formats gratuits** : invitations et `text/*`.~~ Fait le 2026-09-23 :
-     `mailcore::attachtext`, partagé par les deux index. **1 363 messages** gagnent un mot que le
+     `mailcore::attachtext`, partagé par les deux index. **1 117 messages** (1 363 annoncés d'abord, corrigé le jour même) gagnent un mot que le
      reste du message n'a pas, sans une ligne de dépendance nouvelle. Aucune régression sur le
      banc, et aucun gain non plus — le jeu de requêtes ne vise aucune pièce jointe, ce qui est une
      limite de l'instrument et non un résultat.
@@ -1509,7 +1509,7 @@ un expéditeur de décider combien de mémoire une moisson consomme.
 |---|---:|
 | estimation de la veille (1 286 ICS + 594 `text/*`) | 1 880 |
 | **texte effectivement récupéré** | **1 520** |
-| **dont la pièce jointe apporte un mot que le reste du message n'a pas** | **1 363** |
+| **dont la pièce jointe apporte un mot que le reste du message n'a pas** | **1 363**, **1 117** après correction (voir plus bas) |
 
 L'estimation était **24 % trop haute**, pour une raison bête et instructive : les colonnes du
 recensement comptent des messages **par type**, et un message qui porte une invitation *et* une
@@ -1520,7 +1520,7 @@ qu'on lit sans vérifier ce qu'il agrège.
 Le second chiffre est celui qui compte, et il a été ajouté pour ça. « Du texte en plus » ne veut
 pas dire « un message de plus trouvable » : une invitation dont le titre reprend le sujet du
 message n'apporte rien à l'index. **1 363 messages sur 1 520 apportent au moins un mot nouveau**,
-soit 90 % — le gain est donc réel, et on le sait plutôt que de l'espérer.
+soit 90 % — **corrigé le soir même à 1 117, soit 73 %** : le compteur oubliait les destinataires et comptait des mots-outils (voir l'entrée « trois relectures contradictoires »). Le gain est donc réel, et on le sait plutôt que de l'espérer.
 
 #### Ce que le banc dit, et ce qu'il ne peut pas dire
 
@@ -1792,3 +1792,169 @@ Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targe
 statistique : le test de signe contre la table binomiale — dont sa symétrie et son cas à zéro
 requête décidée —, les seuils de victoires que le banc annonce quand il ne conclut pas, et la
 propriété qui justifie le seuil de neuf.
+
+### 2026-09-23 (suite) — trois relectures contradictoires, et ce qu'il restait de faux
+
+L'entrée précédente se terminait sur un banc refait. En le relisant après un changement de modèle,
+j'ai trouvé quatre erreurs dans mon propre raisonnement ; puis trois relectures contradictoires
+— des relecteurs indépendants chargés de trouver des défauts, et pour chaque défaut, trois
+sceptiques chargés de le réfuter — en ont trouvé une vingtaine d'autres, dont **deux introduits
+par mes propres corrections**. Cette entrée dit ce qui était faux, ce que ça changeait, et ce que
+ça ne changeait pas.
+
+#### Ce qui change la lecture du critère 1
+
+**La comparaison que le critère déclare, je ne l'avais pas faite.** Le critère 1 demande depuis le
+2026-09-15 que la recherche de la phase soit « strictement mieux que tantivy seul sur le
+sous-ensemble des requêtes qui ne partagent aucun mot avec le message visé ». J'avais conclu
+« indécidable sur les trois paires » sur **tout le jeu**, et le sous-ensemble déclaré — dix
+requêtes, assez pour un test apparié — n'avait pas été testé. Il l'est :
+
+```
+=== COMPARAISON PRIMAIRE — déclarée par le critère 1 : texte contre hybride, 10 requêtes ===
+  1 victoire, 9 défaites   p = 0,021
+  → « hybride » est meilleur que « texte »
+```
+
+C'est tranché, et le banc le dit avec ses réserves imprimées : **les bras et le sous-ensemble**
+étaient déclarés d'avance, **la grandeur comparée — le rang plutôt que la présence dans les dix
+premiers — et le test** ont été choisis le 2026-09-23, après les premiers relevés. Ce n'est pas une
+prédiction confirmée. Sur la grandeur d'origine, le rappel, les trois moteurs sont à zéro.
+
+Le critère 1 a donc deux moitiés qui ne disent pas la même chose, et le banc les sépare :
+
+| moitié | grandeur | relevé | tenue ? |
+|---|---|---|---|
+| ≥ 80 % des requêtes dans les dix premiers | rappel@10, avec intervalle de Wilson | 26,9 % [14 – 46 %] sur tout le jeu, 0 % [0 – 28 %] sans mot commun | **non**, et même la borne haute en est loin |
+| mieux que tantivy sans mot commun | rang, test de signe apparié | 9 sur 10, p = 0,021 | **oui**, en rang |
+
+Autrement dit : **le sémantique rapproche la cible, nettement et de façon établie, sans la faire
+voir.** Typiquement de 13 000 à 1 300 — dix fois plus près, et toujours mille places trop loin.
+C'est la question que la phase doit maintenant trancher, et elle n'est pas statistique.
+
+Une piste, marquée comme telle parce qu'elle vient de cinq comparaisons exploratoires dont
+jusqu'à 25 % pourraient sortir par hasard : sur ces mêmes dix requêtes, le **sémantique seul bat
+l'hybride** 9 fois sur 10. La fusion dégrade le sémantique là où le plein texte n'est que du bruit —
+c'est le défaut connu de la fusion par rangs réciproques, noté ici le 2026-09-21 sur une seule
+requête, et qui se précise.
+
+#### Ce qui change un chiffre publié
+
+**« 1 363 messages gagnent un mot nouveau » vaut 1 117**, soit 18 % de moins. Deux défauts dans la
+fonction qui décide de ce qu'est un mot nouveau :
+
+- elle ne retirait pas les mots-outils — un « vous » présent seulement dans une invitation passait
+  pour nouveau. Effet mesuré : **deux** messages ;
+- elle ne regardait pas les destinataires — et le nom d'un participant d'invitation est presque
+  toujours déjà un destinataire du message, donc déjà trouvable. Effet mesuré : **244** messages.
+
+L'erreur qu'on soupçonnait était la petite ; celle qu'on n'avait pas vue était la grande. Le
+chiffre de 1 117 reste l'essentiel du gisement, et l'extraction reste justifiée — mais c'est ce
+chiffre-là qu'il faut comparer aux 1 222 messages que promettraient les PDF.
+
+#### Le plus important des défauts d'instrument : un sous-ensemble qui ne contenait pas ce que son nom dit
+
+Le banc décidait qu'une requête partage un mot avec sa cible en relisant le message à la main —
+sujet, expéditeur, corps rendu. La première relecture a trouvé que ce texte recomposé oubliait
+**quatre** des sources que l'index interroge : les destinataires, les parties HTML quand une partie
+texte existe, le texte des pièces jointes indexé le matin même, et la fin des corps longs. Une
+requête qui partageait un mot par l'une de ces voies tombait « sans mot commun » — dans le
+sous-ensemble même de la comparaison primaire.
+
+La correction ne recompose plus rien : elle **demande à l'index** si le document cible porte le mot
+(`Searcher::contains`). Même texte, mêmes champs — ceux-ci lus maintenant dans une seule liste,
+`Fields::searched`, partagée avec le parseur de requêtes, après qu'une deuxième relecture a relevé
+que « exact par construction » ne tenait que parce que deux copies disaient encore la même chose.
+
+Et sur ce corpus, **la correction n'a déplacé aucune requête** : les dix du sous-ensemble sont les
+dix d'avant. Le défaut était réel, son effet ici nul. Il fallait quand même le corriger — c'est le
+sous-ensemble qui porte la conclusion, et le prochain jeu de requêtes n'aurait pas eu la même
+chance.
+
+La leçon, qui vaut au-delà de ce banc : **recomposer à la main ce qu'un composant voit, c'est
+écrire une deuxième copie de ce composant, et elle dérive au premier changement.** Ici elle avait
+dérivé le jour même — le texte des pièces jointes était entré dans l'index le matin, et pas dans
+sa copie.
+
+
+#### Les défauts que j'ai introduits en corrigeant
+
+Quatre, sur deux tours, et ils ont une forme commune : une règle juste appliquée au mauvais nombre,
+ou à un cas qu'elle ne connaissait pas.
+
+- **Le seuil de neuf requêtes portait sur la taille du sous-ensemble**, alors que le test de signe
+  ne compte que les requêtes décidées. Dix requêtes dont quatre que personne ne trouve donnaient
+  six décisions — et un verdict, que le seuil prétendait interdire. Le verdict exige maintenant
+  neuf requêtes **décidées**.
+- **La règle de couverture ne connaissait qu'un ordre des événements.** Un blob perdu *avant*
+  l'indexation n'a pas de document ; un blob perdu *après* en a un, parfaitement valide. La règle
+  « autant de documents que de messages indexables » ne connaissait que le premier cas : dans le
+  second, `mail doctor` aurait annoncé un index désynchronisé et conseillé une réindexation qui
+  **effaçait** le document d'un message intact. C'est maintenant un encadrement — au moins un
+  document par message indexable, au plus un par message.
+- **Le veto du rapport des rangs a été réglé deux fois, et retiré à la troisième.** La première
+  relecture avait relevé que le commentaire promettait « A meilleur que B » seulement si le rapport
+  allait dans le sens du signe, et que le code ne le vérifiait pas. La règle ajoutée pour tenir la
+  promesse était absurde : un rapport calculé sur **une seule** requête annulait un 9 contre 1. La
+  restreindre aux rapports sur neuf requêtes ne réglait rien : trente trouvailles d'un seul côté et
+  neuf requêtes partagées à cinq contre quatre donnaient encore « ni l'un ni l'autre n'est
+  meilleur ».
+
+  La cause était la même les trois fois, et c'est elle qu'il fallait voir plutôt que de retoucher un
+  seuil : **le rapport ne se calcule que sur les requêtes rendues par les deux**, donc il ignore par
+  construction les preuves les plus nettes — trouver ce que l'autre ne trouve pas. Un arbitre qui ne
+  voit pas les preuves les plus fortes ne peut pas arbitrer. Le signe décide seul ; le rapport est
+  imprimé comme taille d'effet, et un avertissement dit quand il va dans l'autre sens. Pour qu'il
+  puisse un jour arbitrer, il faudrait donner un rang aux absences — elles sont **censurées**, pas
+  inconnues —, et c'est un modèle à écrire et à justifier.
+
+La leçon de méthode que ces quatre-là ont en commun : **quand une règle doit être corrigée deux
+fois, la troisième correction n'est pas un meilleur réglage, c'est une question sur la règle.**
+
+#### Les défauts de produit trouvés au passage, hors du banc
+
+Trois, dont deux préexistants, tous autour du plafond de 500 résultats que le banc venait de lever
+pour lui-même :
+
+- **`messages.page` perdait la suite d'un dossier.** Une page coupée par le plafond du serveur
+  n'avait pas de curseur ; un client qui demandait mille messages par page en recevait cinq cents
+  et croyait avoir tout vu. C'est le plus grave des trois — des messages rendus inaccessibles à un
+  client, sans erreur ;
+- **`truncated` mentait de la même façon** dans l'API et dans le serveur MCP : cinq cents résultats
+  pour mille demandés se disaient complets, et le modèle de langage à l'autre bout le croyait. La
+  règle vit maintenant une fois, dans `mailcore::query::truncated`, et les trois appelants s'en
+  servent ;
+- **une limite nulle faisait paniquer tantivy** (`TopDocs::with_limit(0)`), avec une limite venue
+  d'un client.
+
+Et une incohérence qu'un outil de diagnostic partageait avec le banc : **`mail doctor` annonçait un
+index désynchronisé en permanence** sur tout store ayant perdu un blob, et conseillait `mail index`,
+qui n'y pouvait rien. La règle juste vit maintenant dans `mailcore::index::Coverage`, et les deux
+l'appliquent.
+
+Restent, non corrigés parce que hors du sujet : sept messages de `mail-cli` et de
+`xtask secrets` contiennent le même défaut de chaîne que la relecture a trouvé dans le banc — un
+saut de ligne suivi de l'indentation du source, imprimé tel quel. Cosmétique, mais visible.
+
+#### La méthode
+
+**Une relecture contradictoire se relit elle-même.** La première a trouvé dix défauts ; la seconde,
+chargée de vérifier les corrections, une douzaine de plus, dont deux créés par les corrections ; la
+troisième, plus étroite, encore deux défauts de logique dans les corrections de la seconde, et une
+série de tests qui ne pouvaient pas échouer. Un quatrième tour, sur les seules corrections du
+troisième, a été lancé et **n'a pas abouti** — la session s'est interrompue. Ces dernières
+corrections sont des simplifications, vérifiées à la main et par leurs tests, mais aucune relecture
+indépendante ne les a vues : c'est à dire.
+
+**Chaque défaut a reçu un test qui tombe si on le réintroduit**, et c'est vérifié pour les plus
+graves : remettre l'ancienne comparaison dans `messages.page` et dans `truncated` fait tomber les
+deux tests écrits pour eux. La troisième relecture a aussi trouvé des contrôles qui ne pouvaient
+pas échouer — un test des mots-outils qui interrogeait des mots absents de la cible, un test de
+fixture dont le rapport valait exactement 1 — et ils ont été réécrits.
+
+**Un défaut réel peut ne rien changer aux chiffres, et il faut le dire aussi.** La correction de la
+partition n'a déplacé aucune requête. L'écrire évite deux erreurs symétriques : croire que la
+correction « explique » quelque chose, et croire qu'elle était inutile.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 474 tests verts**, soit 28 de plus que l'entrée précédente.

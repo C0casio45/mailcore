@@ -141,7 +141,8 @@ impl Row {
 pub struct Page {
     /// Les lignes, du plus récent au plus ancien.
     pub rows: Vec<Row>,
-    /// Le curseur à repasser dans `after` pour la page suivante. `None` = fin de la liste.
+    /// Le curseur à repasser dans `after` pour la page suivante. `None` = fin de la liste, sauf
+    /// pour une limite nulle, qui rend une page vide sans curseur.
     ///
     /// **Opaque.** Un client le stocke et le renvoie ; il ne l'analyse pas. Ça laisse
     /// changer la clé de pagination sans casser un client.
@@ -330,7 +331,9 @@ pub struct Results {
     pub rows: Vec<Row>,
     /// Nombre de résultats rendus.
     pub count: usize,
-    /// Vrai si la limite demandée a été atteinte : il y a probablement d'autres résultats.
+    /// Vrai si la liste a pu être coupée : la limite demandée **ou le plafond du serveur** (500
+    /// résultats) a été atteint, et il y a probablement d'autres résultats. Une limite nulle rend
+    /// une liste vide marquée coupée — une requête mal formée, elle, reste refusée.
     pub truncated: bool,
     /// Faux quand l'index plein texte est absent. Une liste vide et une recherche
     /// impossible ne doivent pas se ressembler côté client.

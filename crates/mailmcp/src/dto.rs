@@ -99,6 +99,8 @@ pub struct Results {
     pub messages: Vec<MessageSummary>,
     /// Nombre de résultats rendus.
     pub count: usize,
-    /// Vrai si la limite demandée a été atteinte : il y a probablement d'autres résultats.
+    /// Vrai si la liste a pu être coupée : la limite demandée **ou le plafond du serveur** (500
+    /// résultats) a été atteint, et il y a probablement d'autres résultats. Demander plus de 500
+    /// n'en rend pas davantage.
     pub truncated: bool,
 }
