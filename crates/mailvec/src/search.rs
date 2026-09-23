@@ -261,7 +261,12 @@ impl<'a> Hybrid<'a> {
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<mailcore::fusion::Fused>> {
         let depth = self.depth.max(limit);
 
-        let full_text = match self.mailbox.search(query, depth) {
+        // **Non plafonné, depuis le 2026-09-23.** `Mailbox::search` tronque à 500 pour protéger
+        // l'API d'un client qui voudrait vider le store ; la fusion, elle, tourne dans le même
+        // processus et a besoin du rang vrai. Sans ça, le banc du critère 1 lisait « absente »
+        // là où il fallait lire « au-delà de 500 », et deux entrées du journal en dépendaient.
+        // En régime ordinaire `depth` vaut cinquante, donc rien ne change pour un client.
+        let full_text = match self.mailbox.search_deep(query, depth) {
             Ok(hits) => Ok(hits.into_iter().map(|hit| hit.item.id).collect::<Vec<_>>()),
             Err(error) => {
                 tracing::warn!(%error, "le plein texte a refusé la requête");

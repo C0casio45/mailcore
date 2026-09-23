@@ -85,7 +85,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, remesuré le 2026-09-22** avec un transformeur (`multilingual-e5-small`) après l'avoir été le 2026-09-21 avec un embedding statique : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras et **pour les deux familles de modèles**. Ce que les relevés ajoutent est le **partage** que l'agrégat cachait, mesuré à l'étape 6 ter sur un sous-ensemble dur scindé en **synonymie** (cible française, 3 requêtes), **interlangue** (cible anglaise, 6) et un message mixte indécidable : rang médian sémantique **1 304** contre 3 680 au statique sur la synonymie — trois fois mieux, pour un plancher de bruit de 1,06 — et **17 331** contre 5 583 sur l'interlangue, où il est donc **deux à trois fois pire** pour un plancher de 1,65. Le transformeur **améliore la synonymie et perd probablement en interlangue** ; comme 6 requêtes sur 10 sont interlangues, l'agrégat (6 531 contre 3 895) tombe **dans son propre bruit** et ne distingue rien. Acquis par ailleurs : sur le sous-ensemble facile, le transformeur porte le rappel à **50,0 %** et la fusion à un rang médian de **10** (contre 30 au statique). Les lots sont trop petits pour départager moins d'un facteur deux : le jeu doit grossir côté synonymie avant qu'un modèle de plus soit essayé |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **NON TENU, remesuré le 2026-09-22** avec un transformeur (`multilingual-e5-small`) après l'avoir été le 2026-09-21 avec un embedding statique : **0,0 %** sur les 10 requêtes sans mot commun, pour les trois bras et **pour les deux familles de modèles**. **Et la mesure ne départage pas les moteurs**, ce qui est le vrai état au 2026-09-23. Le banc a été refait ce jour-là : le bras plein texte était **censuré à 500 résultats** en silence — donc ses « absente » voulaient dire « au-delà de 500 », et aucun de ses rangs n'était comparable —, la partition reposait sur « partage un mot » que quatre requêtes réelles ont réfuté, et les conclusions étaient tirées de cellules de 3 à 6 requêtes. La décision est maintenant portée par une **comparaison appariée sur tout le jeu** (test de signe exact, rapport géométrique des rangs), et elle rend : plein texte contre hybride **7 victoires contre 15, p = 0,134, ×0,43** — il en aurait fallu 17 sur 22. Les trois paires sont **indécidables à n = 26**. Rien n'est établi sur la comparaison des modèles entre eux ; ce qui est établi est la distance à parcourir, soit **deux victoires** |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
@@ -1659,3 +1659,136 @@ Une remarque de forme sur la provenance, pour que personne ne la chasse plus tar
 `écrit le 2026-09-22` alors que l'étape est du 23. La date est en **UTC** et la passe a commencé
 avant minuit. Ce n'est pas un défaut — un magasin doit se dater dans un référentiel unique, et
 l'heure locale n'en est pas un — mais ça se lit de travers si on ne le sait pas.
+
+### 2026-09-23 (suite) — le banc tronquait à 500, et il ne décidait rien
+
+Quatre requêtes dictées par l'utilisateur sur son propre courrier ont réfuté le critère de
+partition en une fois. Une consultation d'expertise externe a ensuite trouvé, dans le même
+mouvement, un défaut plus grave que celui qu'on cherchait. Les deux sont réparés ici, et le
+relevé qui en sort dit quelque chose de très différent de ce que disaient les précédents.
+
+#### Le défaut : le bras plein texte était censuré à 500, en silence
+
+`Mailbox::search` faisait `limit.min(MAX_RESULTS)` avec `MAX_RESULTS = 500`. Le banc demandait
+73 658 résultats et en recevait 500, sans que rien ne le dise.
+
+**Tout ce que les relevés des 21, 22 et 23 septembre impriment « absente » dans la colonne plein
+texte veut donc dire « au-delà de 500 ».** Pas « introuvable ». Et une phrase de l'entrée
+précédente — « le plein texte ne rend RIEN sur 73 658 messages » — était fausse : elle décrivait
+une troncature d'instrument comme un résultat de moteur.
+
+Le plafond n'était pas en cause. Il protège l'API d'un client qui demanderait cent mille lignes
+pour vider le store, ce qui reste une bonne raison, et il est resté. Ce qui manquait est que **la
+mesure n'est pas un client** : elle tourne dans le même processus, sur son propre store, et elle a
+besoin du rang vrai. D'où `Mailbox::search_deep`, sans plafond, employée par le banc et par la
+fusion — en régime ordinaire la fusion demande cinquante résultats, donc rien ne change pour qui
+lit son courrier.
+
+Ce que ça coûtait, et qui va plus loin qu'une imprécision : **un rang censuré n'a pas de sens
+arithmétique.** On ne peut ni le moyenner, ni en prendre la médiane, ni le comparer à un rang non
+censuré — et le banc faisait les trois. Une absence fabriquée par l'instrument s'était mise à
+circuler comme une propriété du moteur.
+
+C'est la troisième fois de la phase qu'un instrument accuse le moteur, après les cibles qui
+avaient glissé et la médiane écrite pour n = 22. La règle se précise à chaque fois : **ce qui
+tronque doit le dire, sans quoi il fabrique des absences.**
+
+#### Ce que le vrai rang révèle
+
+| rang de la cible, sous-ensemble sans mot commun | avant (censuré) | après |
+|---|---|---|
+| plein texte, synonymie | absente, absente, absente | 3 095, 13 316, 39 672 |
+| plein texte, interlangue | six fois absente | 13 751, 18 130, 45 963, puis trois vraies absences |
+| sémantique, synonymie | 94, 1 296, 1 792 | inchangé |
+
+La comparaison était **impossible** avant, puisqu'on ne compare pas un nombre à une absence. Elle
+est maintenant lisible, et elle est favorable au sémantique — d'un facteur qui reste à établir.
+
+#### Le critère de partition est remplacé
+
+« Partage un mot » testait l'**existence** d'un mot commun, pas son **pouvoir discriminant**.
+« club » est partagé et ne discrimine rien ; un patronyme est partagé et discrimine à quelques
+dizaines près. D'où le nouveau critère : **la fréquence documentaire du mot commun le plus rare**,
+lue dans l'index par `Searcher::doc_freq`.
+
+Sa lecture est littérale, et c'est ce qui le rend défendable : une requête réduite à ce seul mot a
+**au plus `df` candidats**, donc le mot suffit à porter la cible dans les dix premiers si et
+seulement si `df ≤ TOP`. Le seuil n'est pas inventé — c'est `TOP`, déjà motivé. C'est la première
+partition de la phase qui n'a aucune constante à défendre.
+
+Il ne regarde le classement d'**aucun** moteur, ce qui compte : définir la difficulté par le rang
+BM25 aurait rendu circulaire toute comparaison incluant le plein texte — le sous-ensemble « dur
+pour BM25 » contient la malchance de BM25, donc une régression vers la moyenne en faveur de
+l'autre bras.
+
+Trois états au lieu de deux, et c'est le troisième qui manquait :
+
+| | requêtes |
+|---|---:|
+| aucun mot commun | 10 |
+| **un mot commun, mais trop fréquent pour désigner** (`df > 10`) | **15** |
+| un mot commun assez rare pour suffire (`df ≤ 10`) | 1 |
+
+Le gros du jeu est dans la catégorie du milieu, que l'ancien critère rangeait en « facile ». Ce
+sont les requêtes où un moteur de mots **situe sans désigner** : il met la cible dans un groupe de
+plusieurs centaines et le classement à l'intérieur du groupe décide de tout.
+
+#### Et la partition ne décide plus rien — c'est la comparaison appariée qui décide
+
+Une cellule de trois requêtes ne départage rien, et aucune métrique n'y change quoi que ce soit :
+le test de signe le plus permissif ne descend pas sous p = 0,25 à n = 3. Une médiane de trois
+nombres est le nombre du milieu, et elle change quand un seul bouge.
+
+Donc : **les sous-ensembles décrivent, ils ne concluent pas.** Sous neuf requêtes, le banc
+n'imprime plus ni rappel ni médiane — seulement les rangs triés. Neuf est le plus petit effectif
+où une décision à 5 % survit à une voix contraire (8 sur 9, p = 0,039) ; à huit il faut
+l'unanimité, à cinq rien ne conclut.
+
+La première version de cette constante disait dix, sur la foi d'un exemple juste mais non
+minimal — et **c'est le test qui l'a attrapée**, pas une relecture. Un seuil dont la raison écrite
+est vérifiable finit par être vérifié.
+
+Ce qui décide est une **comparaison appariée sur tout le jeu** : les deux moteurs ont répondu aux
+mêmes requêtes, et comparer deux agrégats jetait cette information. Test de signe exact bilatéral
+— robuste, parce que les rangs de queue sont bruités et qu'un test sur les amplitudes prendrait ce
+bruit pour du signal — plus le rapport géométrique des rangs comme taille d'effet.
+
+#### Le relevé qui en sort, et il est sobre
+
+```
+texte contre sémantique    9 victoires, 14 défaites, 3 nuls   p = 0,405   ×0,63
+texte contre hybride       7 victoires, 15 défaites, 4 nuls   p = 0,134   ×0,43
+sémantique contre hybride 14 victoires,  9 défaites, 3 nuls   p = 0,405   ×0,77
+```
+
+**Indécidable sur les trois paires.** Les trois moteurs vont dans le sens attendu — l'hybride bat
+le plein texte d'un facteur 2,3 en rapport géométrique, avec 15 victoires contre 7 — et **aucun
+écart n'atteint le seuil**. Il aurait fallu 17 victoires sur 22 ; il y en a 15.
+
+C'est le résultat le plus utile de la journée, et il est négatif dans les deux sens : il ne dit
+pas que les moteurs se valent, il dit que **26 requêtes ne suffisent pas à les départager**. La
+distance est chiffrée — deux victoires — donc l'effort à fournir l'est aussi : une dizaine de
+requêtes de plus devrait trancher, à condition qu'elles aillent dans le même sens.
+
+#### Ce que ça oblige à retirer du journal
+
+Tout ce qui, dans les entrées des 22 et 23 septembre, conclut sur une cellule de trois ou six
+requêtes est **non soutenu par la méthode d'aujourd'hui**. En particulier :
+
+- « le transformeur est environ trois fois meilleur que les statiques sur les cibles
+  françaises » — trois requêtes, indécidable ;
+- « il est deux à trois fois pire en interlangue » — six requêtes, indécidable ;
+- le « plancher de bruit » tiré de deux variantes du même modèle : deux variantes donnent **un**
+  nombre, pas une distribution. Ce n'est pas un plancher, c'est un point. Il garde un usage — le
+  **contrôle négatif de la méthode** : appliquée à ce couple sur les cibles françaises, la
+  procédure de décision doit rendre « indécidable », et si elle conclut c'est qu'elle est trop
+  lâche.
+
+Les chiffres restent, les phrases qui les interprètent tombent. C'est la même correction que celle
+du 2026-09-21, appliquée cette fois à ma propre façon de conclure plutôt qu'à un composant.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 446 tests verts**, soit 3 de plus. Les trois portent la
+statistique : le test de signe contre la table binomiale — dont sa symétrie et son cas à zéro
+requête décidée —, les seuils de victoires que le banc annonce quand il ne conclut pas, et la
+propriété qui justifie le seuil de neuf.

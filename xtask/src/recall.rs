@@ -133,8 +133,8 @@ struct Outcome {
     subject: String,
     /// Le rang de la cible pour chaque moteur mesuré, à partir de 1. `None` si absente.
     ranks: Vec<(Engine, Option<usize>)>,
-    /// La requête partage-t-elle un mot porteur avec sa cible ?
-    shares_a_word: bool,
+    /// Ce qu'un moteur de mots peut espérer, vu la rareté du mot commun le plus rare.
+    reach: Reach,
     /// La langue des cibles, qui dit si les atteindre franchit une frontière.
     ///
     /// **La plus favorable de toutes les cibles acceptables**, de la même façon que
@@ -273,7 +273,7 @@ pub fn measure(
         for engine in &engines {
             let found: Vec<MessageId> = match engine {
                 Engine::FullText => mailbox
-                    .search(&query.text, limit)
+                    .search_deep(&query.text, limit)
                     .with_context(|| format!("plein texte « {} »", query.text))?
                     .into_iter()
                     .map(|hit| hit.item.id)
@@ -305,7 +305,11 @@ pub fn measure(
         // dans le sous-ensemble dur, même si les autres cibles n'ont rien en commun. La
         // définition conservatrice est la seule honnête : elle ne peut que **sous-estimer** ce
         // que le sémantique apporte, jamais le gonfler.
-        let shares = details.iter().any(|it| shares_a_word(&query.text, it));
+        let reach = match rarest_shared_word(&mailbox, &query.text, &details)? {
+            None => Reach::None,
+            Some(freq) if freq as usize <= TOP => Reach::Word(freq),
+            Some(freq) => Reach::Group(freq),
+        };
 
         // Le français l'emporte dès qu'une cible acceptable est française — voir le champ.
         let langs: Vec<Lang> = details.iter().map(language_of).collect();
@@ -322,7 +326,7 @@ pub fn measure(
             targets,
             subject: detail.item.subject.clone(),
             ranks,
-            shares_a_word: shares,
+            reach,
             lang,
         });
     }
@@ -461,22 +465,87 @@ fn language_of(detail: &mailcore::MessageDetail) -> Lang {
     }
 }
 
-/// La requête partage-t-elle un mot porteur avec ce que le moteur indexe de la cible ?
+/// Le mot commun le plus **rare** entre la requête et sa cible, mesuré par sa fréquence
+/// documentaire dans le corpus.
 ///
-/// Le texte comparé est **celui que l'indexation voit** — sujet, expéditeur, corps — et pas le
-/// seul sujet : une requête peut tomber juste par un mot qui n'est que dans le corps, et le
-/// compter comme « aucun mot commun » surestimerait ce que le sémantique a apporté.
-fn shares_a_word(query: &str, detail: &mailcore::MessageDetail) -> bool {
+/// ## Ce que ça remplace, et pourquoi
+///
+/// Jusqu'au 2026-09-23, le banc partitionnait sur `shares_a_word` : la requête partage-t-elle un
+/// mot porteur avec sa cible, oui ou non. Quatre requêtes dictées par l'utilisateur l'ont réfuté
+/// en une fois — « les sorties en deux-roues avec le club » partage le mot « club » avec sa
+/// cible, et le plein texte la classe **au-delà de trente mille**. Le critère testait
+/// l'**existence** d'un mot commun ; ce qui compte est son **pouvoir discriminant**.
+///
+/// La fréquence documentaire du mot commun le plus rare y répond exactement, et sans regarder le
+/// classement d'aucun moteur — ce qui serait circulaire dès qu'on compare ces moteurs entre eux.
+/// Sa lecture est littérale : une requête réduite à ce seul mot a **au plus `df` candidats**,
+/// donc le mot suffit à mettre la cible dans les dix premiers si et seulement si `df ≤ TOP`.
+///
+/// Le seuil n'est donc pas inventé : c'est [`TOP`], qui est déjà motivé ailleurs. C'est la
+/// première fois de la phase qu'un partage de sous-ensembles n'a pas de constante à défendre.
+///
+/// Rend `None` quand la requête n'a **aucun** mot commun avec sa cible — le cas que l'ancien
+/// critère appelait « dur », qui reste le plus dur de tous et se distingue d'un mot commun trop
+/// fréquent.
+fn rarest_shared_word(
+    mailbox: &Mailbox,
+    query: &str,
+    details: &[mailcore::MessageDetail],
+) -> Result<Option<u64>> {
     let mut haystack = HashSet::new();
-    for source in [
-        detail.item.subject.as_str(),
-        detail.item.from_addr.as_str(),
-        detail.item.from_name.as_deref().unwrap_or_default(),
-        detail.body.as_str(),
-    ] {
-        haystack.extend(words(source));
+    for detail in details {
+        for source in [
+            detail.item.subject.as_str(),
+            detail.item.from_addr.as_str(),
+            detail.item.from_name.as_deref().unwrap_or_default(),
+            detail.body.as_str(),
+        ] {
+            haystack.extend(words(source));
+        }
     }
-    words(query).any(|word| haystack.contains(&word))
+
+    let mut rarest: Option<u64> = None;
+    for word in words(query) {
+        if !haystack.contains(&word) {
+            continue;
+        }
+        // Un mot absent de l'index — il peut l'être, le corps indexé n'est pas le corps rendu —
+        // ne prouve rien et ne doit pas se lire comme « infiniment rare ».
+        let Some(freq) = mailbox.doc_freq(&word)? else {
+            continue;
+        };
+        if freq == 0 {
+            continue;
+        }
+        rarest = Some(rarest.map_or(freq, |least| least.min(freq)));
+    }
+    Ok(rarest)
+}
+
+/// Comment une requête se range, une fois sa cible et le corpus regardés.
+///
+/// Trois états et non deux, parce que le 2026-09-23 a montré qu'il en manquait un : entre « aucun
+/// mot commun » et « trouvable par un mot », il y a le cas majoritaire — un mot commun qui range
+/// la cible dans un **groupe** trop grand pour la liste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Aucun mot commun : un moteur de mots ne peut rien, par construction.
+    None,
+    /// Un mot commun, mais sa fréquence dépasse [`TOP`] : il situe sans désigner.
+    Group(u64),
+    /// Un mot commun assez rare pour porter la cible dans les dix premiers à lui seul.
+    Word(u64),
+}
+
+impl Reach {
+    /// Ce qu'on affiche dans le détail par requête.
+    fn mark(self) -> String {
+        match self {
+            Self::None => "  —".to_owned(),
+            Self::Group(freq) if freq >= 10_000 => format!("{:>3}k", freq / 1_000),
+            Self::Group(freq) | Self::Word(freq) => format!("{freq:>4}"),
+        }
+    }
 }
 
 /// Découpe en mots porteurs : minuscules Unicode, sans ponctuation, sans mots-outils.
@@ -505,8 +574,30 @@ fn report(
     }
     println!();
 
-    let (hard, easy): (Vec<_>, Vec<_>) = outcomes.iter().partition(|it| !it.shares_a_word);
     let all: Vec<&Outcome> = outcomes.iter().collect();
+
+    // **Les sous-ensembles décrivent, ils ne décident plus.**
+    //
+    // Le 2026-09-23 a montré qu'une cellule de trois requêtes ne départage rien : le test de
+    // signe apparié le plus permissif ne descend pas sous p = 0,25 à n = 3, et aucune médiane
+    // n'y change quelque chose. La décision est donc portée par la comparaison appariée sur
+    // **tout le jeu** — voir [`compare`] — et ces lignes-ci sont là pour lire, pas pour conclure.
+    //
+    // C'est pour ça que sous dix requêtes, le banc n'imprime plus ni rappel ni médiane : dix est
+    // le plus petit effectif où une décision survit à une dissidence (9 sur 10 donne p = 0,021 ;
+    // à six, une seule voix contraire emporte tout).
+    let hard: Vec<&Outcome> = outcomes
+        .iter()
+        .filter(|it| it.reach == Reach::None)
+        .collect();
+    let grouped: Vec<&Outcome> = outcomes
+        .iter()
+        .filter(|it| matches!(it.reach, Reach::Group(_)))
+        .collect();
+    let reachable: Vec<&Outcome> = outcomes
+        .iter()
+        .filter(|it| matches!(it.reach, Reach::Word(_)))
+        .collect();
 
     // **Le sous-ensemble dur se scinde**, et c'est l'étape 6 ter.
     //
@@ -553,12 +644,44 @@ fn report(
         ));
     }
     sets.push(("aucun mot commun — les deux ensemble".to_owned(), &hard));
-    sets.push(("au moins un mot commun".to_owned(), &easy));
+    sets.push((
+        "un mot commun, mais trop fréquent pour désigner (df > 10)".to_owned(),
+        &grouped,
+    ));
+    sets.push((
+        "un mot commun assez rare pour suffire (df ≤ 10)".to_owned(),
+        &reachable,
+    ));
     sets.push(("tout le jeu".to_owned(), &all));
 
     for (label, set) in sets {
         let label = label.as_str();
         println!("--- {label} — {} requêtes ---", set.len());
+        if set.len() < MIN_FOR_STATS {
+            // Sous le seuil, on n'imprime que les rangs : un pourcentage sur trois requêtes
+            // varie de 33 points quand une seule bouge, et une médiane de trois nombres est ce
+            // nombre du milieu et rien d'autre. Les afficher inviterait à les lire.
+            println!(
+                "{:<30} {:>12}   rangs triés   (moins de {MIN_FOR_STATS} requêtes : \
+                 ni rappel ni médiane)",
+                "moteur", ""
+            );
+            for engine in engines {
+                let mut ranks: Vec<usize> = set
+                    .iter()
+                    .map(|it| it.rank(*engine).unwrap_or(usize::MAX))
+                    .collect();
+                ranks.sort_unstable();
+                println!(
+                    "{:<30} {:>12}   {}",
+                    engine.label(),
+                    "",
+                    sorted_ranks(&ranks)
+                );
+            }
+            println!();
+            continue;
+        }
         println!(
             "{:<30} {:>13} {:>9} {:>12}   rangs triés",
             "moteur", "dans le top", "rappel", "rang médian"
@@ -568,6 +691,8 @@ fn report(
         }
         println!();
     }
+
+    compare(engines, &all);
 
     // Le détail par requête : sans lui, un chiffre agrégé ne se diagnostique pas. Il montre
     // aussi les **régressions** de la fusion, qui sont ce qu'un rappel moyen cache le mieux.
@@ -592,10 +717,10 @@ fn report(
         // deux problèmes** cette requête pose. La seconde est calculée par un comptage de
         // mots-outils, donc elle peut se tromper — elle est imprimée pour qu'un humain puisse la
         // contredire, comme `queries-rebind` imprime la règle qui a relié chaque cible.
-        let mark = if outcome.shares_a_word { " " } else { "*" };
+        let mark = outcome.reach.mark();
         let lang = outcome.lang.mark();
         println!(
-            "{mark}{lang} {:<8} {:<8} {:<8}  « {} »",
+            "{mark} {lang} {:<8} {:<8} {:<8}  « {} »",
             cells.first().cloned().unwrap_or_default(),
             cells.get(1).cloned().unwrap_or_default(),
             cells.get(2).cloned().unwrap_or_default(),
@@ -667,6 +792,173 @@ fn print_row(engine: Engine, set: &[&Outcome]) {
         median(&ranks),
         sorted_ranks(&ranks),
     );
+}
+
+/// L'effectif minimal sous lequel le banc n'imprime ni rappel ni médiane.
+///
+/// Neuf, et le nombre est motivé plutôt que choisi : c'est le **plus petit** effectif où une
+/// décision à 5 % bilatéral survit à une voix contraire — 8 victoires sur 9 donnent p = 0,039.
+/// À huit, il faut l'unanimité (7 sur 8 donne p = 0,070) ; à cinq, aucune répartition ne conclut.
+///
+/// La première version disait dix, sur la foi d'un exemple — 9 sur 10, p = 0,021 — qui est juste
+/// mais pas minimal. Le test l'a attrapé. C'est exactement ce qu'on demande à un seuil : que sa
+/// raison écrite soit vérifiable, et vérifiée.
+///
+/// En dessous, un pourcentage et une médiane ne sont pas imprécis : ils tiennent à une requête.
+const MIN_FOR_STATS: usize = 9;
+
+/// La comparaison qui décide, et c'est la seule.
+///
+/// ## Pourquoi appariée, et pourquoi une seule
+///
+/// Jusqu'au 2026-09-23 le banc comparait des **agrégats** — la médiane d'un moteur contre celle
+/// d'un autre — sur des cellules de trois à six requêtes. Deux défauts, et le second est le pire :
+///
+/// - une médiane de trois nombres change de valeur quand un seul bouge, donc elle ne départage
+///   rien ;
+/// - comparer deux agrégats jette l'information la plus précieuse du jeu : **les deux moteurs ont
+///   répondu aux mêmes requêtes**. Une comparaison appariée le sait, et elle est bien plus
+///   puissante à effectif égal.
+///
+/// Le test est le **signe exact**, binomial bilatéral sur le nombre de requêtes où un moteur bat
+/// l'autre. Il est choisi pour sa robustesse : les rangs de queue sont bruités — 17 331 contre
+/// 5 583 peut se renverser sur une différence de score minuscule — et un test sur les amplitudes
+/// prendrait ce bruit pour du signal. Le signe ne regarde que « lequel est devant ».
+///
+/// La taille d'effet est le **rapport géométrique des rangs**, c'est-à-dire l'exponentielle de la
+/// moyenne des différences de `log₂`. C'est exactement le « trois fois mieux » que le journal
+/// écrit déjà, mais calculé au lieu d'être lu sur deux médianes.
+///
+/// ## Ce que la phrase de sortie a le droit de dire
+///
+/// Trois états, jamais deux. « A meilleur que B » demande que le test passe **et** que le rapport
+/// soit du bon côté ; sinon la sortie est « indécidable à n = … », avec le nombre de victoires
+/// qu'il aurait fallu. Un facteur seul ne sort jamais sans son test : c'est ce qui a permis
+/// d'écrire « trois fois meilleur » sur trois requêtes.
+fn compare(engines: &[Engine], all: &[&Outcome]) {
+    if engines.len() < 2 {
+        return;
+    }
+    println!(
+        "--- comparaisons appariées, sur les {} requêtes ---",
+        all.len()
+    );
+    println!(
+        "Le test est un signe exact bilatéral ; l'effet est le rapport géométrique des rangs.\n\
+         Une cible absente chez un seul des deux compte comme une défaite pour lui ; absente des\n\
+         deux, la requête sort du test et le compte des nuls est imprimé.\n"
+    );
+
+    for (index, left) in engines.iter().enumerate() {
+        for right in engines.iter().skip(index + 1) {
+            let mut wins = 0usize;
+            let mut losses = 0usize;
+            let mut ties = 0usize;
+            let mut logs: Vec<f64> = Vec::new();
+
+            for outcome in all {
+                match (outcome.rank(*left), outcome.rank(*right)) {
+                    (None, None) => ties += 1,
+                    (Some(_), None) => {
+                        wins += 1;
+                    }
+                    (None, Some(_)) => {
+                        losses += 1;
+                    }
+                    (Some(a), Some(b)) => {
+                        #[allow(clippy::cast_precision_loss)]
+                        logs.push((b as f64).log2() - (a as f64).log2());
+                        match a.cmp(&b) {
+                            std::cmp::Ordering::Less => wins += 1,
+                            std::cmp::Ordering::Greater => losses += 1,
+                            std::cmp::Ordering::Equal => ties += 1,
+                        }
+                    }
+                }
+            }
+
+            let decided = wins + losses;
+            let p = sign_test(wins, decided);
+            #[allow(clippy::cast_precision_loss)]
+            let ratio = if logs.is_empty() {
+                1.0
+            } else {
+                2f64.powf(logs.iter().sum::<f64>() / logs.len() as f64)
+            };
+
+            println!("{} contre {}", short_label(*left), short_label(*right));
+            println!(
+                "  {wins} victoires, {losses} défaites, {ties} nuls   p = {p:.3}   \
+                 rapport des rangs ×{ratio:.2}"
+            );
+            let needed = victories_needed(decided);
+            if p < 0.05 && wins > losses {
+                println!(
+                    "  → {} est meilleur que {} ({ratio:.2} fois, p = {p:.3})",
+                    short_label(*left),
+                    short_label(*right)
+                );
+            } else if p < 0.05 {
+                println!(
+                    "  → {} est meilleur que {} ({:.2} fois, p = {p:.3})",
+                    short_label(*right),
+                    short_label(*left),
+                    1.0 / ratio
+                );
+            } else {
+                match needed {
+                    Some(needed) => println!(
+                        "  → indécidable à n = {decided} : il en aurait fallu {needed} sur \
+                         {decided}"
+                    ),
+                    None => println!(
+                        "  → indécidable à n = {decided} : aucun résultat ne serait concluant \
+                         à cet effectif"
+                    ),
+                }
+            }
+            println!();
+        }
+    }
+}
+
+/// La p-value bilatérale d'un test de signe exact.
+///
+/// Calculée par somme de binomiales à p = 1/2, sans fonction gamma : les effectifs sont de
+/// quelques dizaines, donc un produit itératif suffit et reste exact. Un test qui se trompe sur
+/// ses propres bornes dirait n'importe quoi avec assurance.
+fn sign_test(wins: usize, decided: usize) -> f64 {
+    if decided == 0 {
+        return 1.0;
+    }
+    let extreme = wins.max(decided - wins);
+    // P(X ≥ extreme) + P(X ≤ decided − extreme), symétrique donc deux fois la queue.
+    let mut tail = 0f64;
+    for k in extreme..=decided {
+        tail += binomial(decided, k);
+    }
+    (2.0 * tail / 2f64.powi(i32::try_from(decided).unwrap_or(i32::MAX))).min(1.0)
+}
+
+/// Le coefficient binomial, en flottant pour éviter le débordement.
+fn binomial(n: usize, k: usize) -> f64 {
+    let k = k.min(n - k);
+    let mut value = 1f64;
+    for step in 0..k {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            value = value * (n - step) as f64 / (step + 1) as f64;
+        }
+    }
+    value
+}
+
+/// Combien de victoires il faudrait, sur cet effectif, pour conclure à 5 % bilatéral.
+///
+/// Imprimé quand le test ne conclut pas : « indécidable » sans cette borne laisse croire qu'on
+/// est passé près, alors qu'à n = 6 aucune répartition ne conclut.
+fn victories_needed(decided: usize) -> Option<usize> {
+    (decided.div_ceil(2)..=decided).find(|&wins| sign_test(wins, decided) < 0.05)
 }
 
 /// Le rang médian, au sens ordinaire du terme.
@@ -771,6 +1063,64 @@ mod tests {
     }
 
     /// Les rangs triés sont ce qui rend la médiane vérifiable, donc ils doivent être lisibles.
+    /// Le test de signe, sur les bornes que le banc imprime.
+    ///
+    /// Elles sont vérifiées contre la table binomiale : ce sont elles qui décident si une phrase
+    /// du journal a le droit de dire « meilleur », et un test qui se trompe sur ses propres
+    /// bornes dirait n'importe quoi avec assurance.
+    #[test]
+    fn the_sign_test_matches_the_binomial_table() {
+        // Pile ou face parfait : rien à conclure.
+        assert!((sign_test(5, 10) - 1.0).abs() < 1e-9);
+        // 9 sur 10 → p = 2 × 11 / 1024.
+        assert!((sign_test(9, 10) - 0.021_484_375).abs() < 1e-9);
+        // 10 sur 10 → p = 2 / 1024.
+        assert!((sign_test(10, 10) - 0.001_953_125).abs() < 1e-9);
+        // Symétrique : perdre 9 fois sur 10 est aussi improbable que gagner 9 fois.
+        assert!((sign_test(1, 10) - sign_test(9, 10)).abs() < 1e-12);
+        // Aucun résultat décidé : pas de conclusion, et surtout pas de division par zéro.
+        assert!((sign_test(0, 0) - 1.0).abs() < 1e-9);
+    }
+
+    /// Les seuils que Fable a donnés, et qui sont imprimés à l'utilisateur quand le test échoue.
+    #[test]
+    fn the_victory_thresholds_are_the_ones_the_bench_announces() {
+        assert_eq!(victories_needed(10), Some(9));
+        assert_eq!(victories_needed(20), Some(15));
+        assert_eq!(victories_needed(26), Some(19));
+        assert_eq!(victories_needed(30), Some(21));
+    }
+
+    /// **Le contrôle qui justifie le seuil de dix**, et il a corrigé la première version de sa
+    /// propre justification.
+    ///
+    /// Le commentaire disait d'abord « sous dix, aucune répartition ne conclut ». C'est faux : à
+    /// six requêtes, six victoires sur six donnent p = 0,031, donc une décision est possible —
+    /// **à condition d'être unanime**. La propriété qui tient vraiment, et qui est celle que le
+    /// seuil doit défendre, est qu'en dessous de dix une décision **ne survit pas à une seule
+    /// voix contraire**.
+    ///
+    /// C'est une nuance et elle change le sens : un seuil qui interdit de conclure protège d'une
+    /// fausse certitude, mais il faut dire de quoi exactement. Ici, de la fragilité — pas de
+    /// l'impossibilité.
+    #[test]
+    fn below_ten_a_decision_cannot_survive_a_single_dissent() {
+        for decided in 1..MIN_FOR_STATS {
+            if let Some(needed) = victories_needed(decided) {
+                assert_eq!(
+                    needed, decided,
+                    "à {decided} requêtes, {needed} victoires suffiraient : une dissidence serait \
+                     tolérée, ce que le seuil prétend impossible"
+                );
+            }
+        }
+        assert_eq!(
+            victories_needed(MIN_FOR_STATS),
+            Some(MIN_FOR_STATS - 1),
+            "neuf est censé être le premier effectif qui tolère une dissidence"
+        );
+    }
+
     #[test]
     fn the_sorted_ranks_show_absences_and_say_when_they_are_cut() {
         assert_eq!(sorted_ranks(&[1, 2, usize::MAX]), "[1 2 —]");

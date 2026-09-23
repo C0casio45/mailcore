@@ -367,15 +367,66 @@ impl Mailbox {
     /// Rend une liste vide si l'index est indisponible — la recherche est une fonction en
     /// plus, pas un prérequis pour lire son courrier.
     ///
+    /// **Plafonnée à [`MAX_RESULTS`]**, et c'est voulu : c'est le chemin qu'emprunte un client,
+    /// y compris distant. Une mesure, elle, n'est pas un client — voir [`Self::search_deep`].
+    ///
     /// # Errors
     ///
     /// [`crate::Error::Query`] si la requête est mal formée.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search_within(query, limit.min(MAX_RESULTS))
+    }
+
+    /// Combien de messages indexés contiennent ce mot, replié en minuscules par l'appelant.
+    ///
+    /// Rend `None` quand il n'y a pas d'index : l'appelant doit distinguer « aucun message » de
+    /// « on ne sait pas », et les confondre ferait passer un corpus non indexé pour un corpus où
+    /// tout mot est rare. Voir [`crate::index::Searcher::doc_freq`] pour ce que ça mesure.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Tantivy`] si l'index est illisible.
+    pub fn doc_freq(&self, word: &str) -> Result<Option<u64>> {
+        match &self.searcher {
+            Some(searcher) => searcher.doc_freq(word).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// La même recherche, **sans plafond**.
+    ///
+    /// ## Pourquoi ce chemin existe depuis le 2026-09-23
+    ///
+    /// Le banc du critère 1 demandait 73 658 résultats et en recevait 500, sans que rien ne le
+    /// dise. Tous ses relevés de rang plein texte étaient donc **censurés à droite** : ce qu'il
+    /// imprimait « absente » voulait dire « au-delà de 500 », pas « introuvable ». Deux entrées
+    /// du journal ont été écrites sur cette lecture, et une conclusion — « le plein texte ne
+    /// rend rien sur 73 658 messages » — était fausse.
+    ///
+    /// La leçon est celle du 2026-09-21, encore : **un instrument qui tronque en silence
+    /// fabrique des absences.** Et le plafond n'était pas en cause — il protège l'API contre un
+    /// client qui demanderait cent mille lignes pour vider le store, ce qui reste une bonne
+    /// raison. Ce qui manquait, c'est que la mesure n'est pas un client : elle tourne dans le
+    /// même processus, elle lit son propre store, et elle a besoin du rang **vrai**.
+    ///
+    /// Un rang censuré n'est pas seulement imprécis : il n'a pas de sens arithmétique. On ne
+    /// peut ni le moyenner, ni en prendre la médiane, ni le comparer à un rang non censuré —
+    /// exactement ce que le banc faisait.
+    ///
+    /// # Errors
+    ///
+    /// Les mêmes que [`Self::search`].
+    pub fn search_deep(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        self.search_within(query, limit)
+    }
+
+    /// Le corps commun des deux, qui ne décide d'aucun plafond.
+    fn search_within(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
         let Some(searcher) = &self.searcher else {
             return Ok(Vec::new());
         };
 
-        let hits = searcher.search(query, limit.min(MAX_RESULTS))?;
+        let hits = searcher.search(query, limit)?;
         let mut results = Vec::with_capacity(hits.len());
         for hit in hits {
             // Un résultat dont le message a disparu de SQLite est ignoré plutôt que rendu

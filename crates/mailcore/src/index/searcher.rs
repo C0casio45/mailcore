@@ -160,6 +160,49 @@ impl Searcher {
     pub const fn fields(&self) -> Fields {
         self.fields
     }
+
+    /// Combien de documents contiennent ce mot, dans les champs interrogés par défaut.
+    ///
+    /// ## À quoi ça sert, et pourquoi ce n'est pas une statistique de plus
+    ///
+    /// C'est ce qui permet de dire **si un moteur de mots peut atteindre une cible**, sans
+    /// interroger aucun moteur. Une requête réduite à ce seul mot a au plus `doc_freq`
+    /// candidats ; si ce nombre tient dans les dix premiers résultats, le mot suffit à
+    /// remonter la cible, sinon il ne fait que la ranger dans un groupe.
+    ///
+    /// Le banc du critère 1 en avait besoin le 2026-09-23 : il partitionnait ses requêtes selon
+    /// qu'elles **partagent** un mot avec leur cible, ce qui teste l'existence d'un mot commun
+    /// et non son **pouvoir discriminant**. « club » est partagé et ne discrimine rien ;
+    /// « delacroix » est partagé et discrimine à quelques dizaines près. La fréquence
+    /// documentaire distingue les deux, et elle ne regarde le classement d'aucun moteur — donc
+    /// elle ne peut pas rendre circulaire une comparaison entre moteurs.
+    ///
+    /// Le maximum sur les champs plutôt que la somme : un même message qui porte le mot dans son
+    /// sujet **et** son corps serait compté deux fois par une somme, et la grandeur cesserait
+    /// d'être un nombre de documents. Le maximum la sous-estime d'au plus un facteur égal au
+    /// nombre de champs, ce qui est du bon côté — il ne fera jamais croire qu'un mot est plus
+    /// rare qu'il n'est.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Tantivy`] si l'index est illisible.
+    pub fn doc_freq(&self, word: &str) -> Result<u64> {
+        let searcher = self.reader.searcher();
+        let mut most = 0u64;
+        for field in [
+            self.fields.subject,
+            self.fields.body,
+            self.fields.from,
+            self.fields.to,
+        ] {
+            // Le terme est construit sur le mot **déjà replié en minuscules** par l'appelant :
+            // `Term::from_field_text` ne passe pas par l'analyseur du champ, donc un mot capital
+            // n'y trouverait rien. C'est le genre de silence qu'on préfère écrire que découvrir.
+            let term = tantivy::Term::from_field_text(field, word);
+            most = most.max(searcher.doc_freq(&term)?);
+        }
+        Ok(most)
+    }
 }
 
 /// `IndexReader` et `QueryParser` de tantivy n'implémentent pas `Debug`. Le workspace exige
