@@ -1616,3 +1616,46 @@ perdre la pièce, le corps ordinaire qui n'est **pas** repris ici, le texte de l
 place, un budget nul qui ne prend pas de pièce jointe non plus, une révision de composition refusée
 comme un changement de modèle, un magasin périmé refait plutôt qu'annoncé à jour — et son contrôle
 inverse, sans lequel la passe revectoriserait le corpus entier à chaque moisson.
+
+#### La revectorisation, et ce qu'elle confirme
+
+Le magasin s'est détecté périmé et refait tout seul — c'est la première fois que le contrôle
+tourne pour de bon plutôt que dans un test :
+
+```
+Magasin périmé     écrit par une autre composition de texte ou un autre budget
+                   — le corpus entier est revectorisé
+Durée              12276.3s   73 658 messages   6 msg/s
+Sans texte         10   (13 la veille)
+```
+
+Trois choses en sortent.
+
+**Les trois messages « sans texte » en moins sont le gain, en miniature.** Ils n'avaient
+strictement rien à vectoriser hier ; leur pièce jointe leur en donne. Un message sans texte a un
+vecteur nul, donc il ne sort d'aucune recherche : ces trois-là étaient invisibles au sens le plus
+fort du terme.
+
+**Aucune régression sur aucun des deux bras**, et c'est ce qu'on venait vérifier :
+
+| rang médian sémantique | avant | après |
+|---|---:|---:|
+| synonymie (3) | 1 304 | 1 296 |
+| interlangue (6) | 17 331 | 17 482 |
+| facile (12) | 23 | 24 |
+| facile, hybride | 10 | 11 |
+
+Tout bouge de moins de 2 %, dans les deux sens : c'est du bruit de reclassement, pas un effet. Le
+texte ajouté ne déplace rien pour les messages qui n'en reçoivent pas, ce qui est exactement ce
+qu'on veut d'un ajout ciblé.
+
+**Et la dispersion, une fois de plus.** Cette passe complète a pris **3,41 h à 6,0 msg/s**, la
+précédente **4,37 h à 4,68 msg/s** — même machine, même modèle, même corpus, **28 % d'écart**. Le
+travail a légèrement augmenté entre les deux, pas diminué. Il n'y a donc rien à conclure du sens de
+l'écart, et c'est le rappel qui compte : une durée de passe sur ce corpus se donne avec sa
+dispersion ou ne se donne pas. Les 4,37 h écrites hier étaient un tirage, pas une constante.
+
+Une remarque de forme sur la provenance, pour que personne ne la chasse plus tard : elle porte
+`écrit le 2026-09-22` alors que l'étape est du 23. La date est en **UTC** et la passe a commencé
+avant minuit. Ce n'est pas un défaut — un magasin doit se dater dans un référentiel unique, et
+l'heure locale n'en est pas un — mais ça se lit de travers si on ne le sait pas.
