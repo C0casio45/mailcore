@@ -1958,3 +1958,41 @@ correction « explique » quelque chose, et croire qu'elle était inutile.
 
 Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace` — **1 474 tests verts**, soit 28 de plus que l'entrée précédente.
+
+### 2026-09-23 (suite) — le raccourci ne faisait rien, et il ne pouvait pas dire pourquoi
+
+Un double-clic sur le raccourci du menu Démarrer n'ouvrait rien. La cause était juste et
+invisible : le binaire du raccourci datait du 2026-09-15 et lisait le schéma 13 ; le store, ouvert
+entre-temps par un outil plus récent, était passé au schéma 14 le 2026-09-21. La coquille refusait
+de l'ouvrir — c'est la règle, un binaire ancien ne touche pas un store plus récent — et le disait
+sur une sortie d'erreur que personne ne lit, puisqu'en release elle n'a pas de console.
+
+La vérification ne s'est pas faite sur le vrai store : la coquille embarque le facteur, et un
+lancement qui aurait réussi par surprise aurait pu remettre ce qui attendait dans la file. Le
+refus a été reproduit sur un store vide au schéma 14 — « version de schéma non gérée : 14 (attendu
+au plus 13) » —, puis la coquille recompilée a été vérifiée sur le même store : fenêtre ouverte,
+première image à 188 ms.
+
+Ce qui a changé pour que ça ne se reproduise pas en silence : **un service qui ne s'ouvre pas le
+dit dans une fenêtre** (`mail-shell::failure`) — quoi, pourquoi, quoi faire quand on le sait, et
+la chaîne d'erreurs copiable. Vérifié sur un store au schéma 15 fabriqué pour l'occasion. Un banc
+n'a personne pour fermer une fenêtre : sous `MAILCORE_UI_BENCH`, l'erreur reste seule.
+
+Une relecture contradictoire a trouvé deux défauts dans le texte même du conseil, et les deux sont
+des leçons déjà écrites qui revenaient :
+
+- **le geste proposé échouait si on le suivait fenêtre ouverte.** C'est ce processus qui tient
+  l'exécutable, et Windows refuse de remplacer un `.exe` qui tourne : « recompilez » donnait
+  « Accès refusé ». Le conseil commence maintenant par fermer la fenêtre, et un test vérifie
+  l'ordre. *Dire quoi faire oblige à rendre le geste possible* — la leçon du 2026-09-10 ;
+- **« refusé avant toute écriture » était faux au bord.** `Store::open` crée les répertoires et
+  passe le fichier en WAL **avant** de lire la version : sur un store au schéma futur qui ne serait
+  pas en WAL, la phrase mentait. La promesse est maintenant la plus étroite qui soit vraie —
+  aucune migration appliquée. *Un engagement sans vérification n'est pas une propriété.*
+
+Restent muets depuis le menu Démarrer, et c'est écrit en tête du module pour ne pas les croire
+couverts : une erreur d'arguments, une panique, un pilote OpenGL absent — la fenêtre d'erreur
+passe par le même `glow` que la principale. Et un défaut qui préexistait, trouvé au passage : un
+`--store` explicite qui désigne un dossier déplacé **crée un store vide** au lieu de refuser, donc
+la coquille s'ouvre sur une boîte vide sans rien dire. À trancher à part : c'est une règle de
+démarrage partagée par toutes les coquilles.

@@ -53,6 +53,7 @@
 
 mod app;
 mod cache;
+mod failure;
 mod settings;
 mod signature;
 mod theme;
@@ -206,7 +207,18 @@ fn main() -> Result<()> {
     }
 
     let bench = Bench::from_env();
-    let backend = open_backend(&cli, started)?;
+    let backend = match open_backend(&cli, started) {
+        Ok(backend) => backend,
+        // **Un échec au démarrage se voit.** Sans console en release, l'erreur rendue par `main`
+        // ne va nulle part : voir `failure`. Un banc, lui, lit la sortie et n'a personne pour
+        // fermer une fenêtre — il garde l'erreur seule, sinon il attendrait pour toujours.
+        Err(error) => {
+            if bench == Bench::None {
+                failure::show(&error);
+            }
+            return Err(error);
+        }
+    };
 
     // **Le cache de lecture, avant la fenêtre.** En mode distant, c'est ce qui permet au
     // premier écran d'exister sans attendre le réseau — la note du critère 1. C'est une lecture
