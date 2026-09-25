@@ -14,6 +14,7 @@
 
 mod api;
 mod attach;
+mod bertmodel;
 mod browser;
 mod calendar;
 mod client;
@@ -353,6 +354,37 @@ enum Command {
         queries: usize,
     },
 
+    /// Taille le vocabulaire du transformeur **par écriture** : garde les pièces en alphabet
+    /// latin, avec la ponctuation, les chiffres, les symboles et les émoji.
+    ///
+    /// Le résultat ne dépend que du modèle source — pas d'un corpus —, donc son empreinte est une
+    /// constante. Voir `mailvec::trim`.
+    ModelTrimBert {
+        /// Le modèle d'origine : `config.json`, `tokenizer.json`, `model.safetensors`.
+        #[arg(long, default_value = "measurements/models/multilingual-e5-small")]
+        model: Utf8PathBuf,
+        /// Où écrire le modèle taillé. Refusé s'il y a déjà un modèle.
+        #[arg(long)]
+        out: Utf8PathBuf,
+    },
+
+    /// Vérifie un transformeur taillé sur le corpus réel : les pièces de **chaque** message, puis
+    /// les vecteurs d'un échantillon, au bit près.
+    ModelCheckBert {
+        /// Racine du store d'où viennent les messages.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le modèle d'origine.
+        #[arg(long, default_value = "measurements/models/multilingual-e5-small")]
+        model: Utf8PathBuf,
+        /// Le modèle taillé.
+        #[arg(long)]
+        trimmed: Utf8PathBuf,
+        /// Combien de messages encoder, de chaque sorte, pour l'étage des vecteurs.
+        #[arg(long, default_value_t = 200)]
+        sample: usize,
+    },
+
     /// Demande à un modèle d'embeddings si deux mots qu'un humain juge proches le sont pour lui.
     ///
     /// La question la moins chère qu'on puisse poser à un modèle, et celle qui départage « le
@@ -404,12 +436,25 @@ enum Command {
         /// Le répertoire du modèle taillé, tel que `model-trim` l'a produit.
         #[arg(long, default_value = "measurements/models/potion-taille")]
         model: Utf8PathBuf,
+        /// Charger le transformeur plutôt que l'embedding statique. La famille se choisit, elle ne
+        /// se devine pas depuis le répertoire.
+        #[arg(long)]
+        bert: bool,
+        /// Arrêter la passe après ce nombre de messages. Une mesure de mémoire n'a pas besoin des
+        /// quatre heures d'une passe transformeur complète : la crête d'un lot est bornée par la
+        /// troncature, pas par le corpus.
+        #[arg(long)]
+        limit: Option<u64>,
         /// Enchaîner le contrôle de reprise, qui refait une passe complète puis une seconde.
         ///
         /// Séparé parce qu'il double la durée du banc : on veut le débit à chaque exécution, la
         /// reprise une fois.
         #[arg(long)]
         resume: bool,
+        /// Où garder le magasin de vecteurs produit — un fichier neuf, jamais un magasin existant.
+        /// Pour mesurer ensuite le rappel du modèle mesuré sans refaire la passe.
+        #[arg(long)]
+        keep: Option<Utf8PathBuf>,
     },
 
     /// Recense les pièces jointes du corpus : types, nombres, volumes.
@@ -653,6 +698,13 @@ fn main() -> Result<()> {
             queries,
         } => scan::measure(messages, dim, limit, queries),
         Command::ModelProbe { model, bert } => probe::model(&model, bert),
+        Command::ModelTrimBert { model, out } => bertmodel::trim(&model, &out),
+        Command::ModelCheckBert {
+            store,
+            model,
+            trimmed,
+            sample,
+        } => bertmodel::check(&store, &model, &trimmed, sample),
         Command::QueriesRebind {
             store,
             queries,
@@ -661,8 +713,18 @@ fn main() -> Result<()> {
         Command::MeasureVectors {
             store,
             model,
+            bert,
+            limit,
             resume,
-        } => vectors::measure(&store, &model, resume),
+            keep,
+        } => vectors::measure(&vectors::Options {
+            store,
+            model,
+            bert,
+            limit,
+            resume,
+            keep,
+        }),
         Command::AttachmentCensus { store, top } => attach::census(&store, top),
         Command::CorpusSample {
             store,

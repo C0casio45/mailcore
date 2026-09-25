@@ -32,8 +32,10 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 /// pour que la mesure ne pèse pas sur ce qu'elle mesure.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Le plafond du critère 3.
-const RSS_LIMIT: u64 = 500 * 1000 * 1000;
+/// Le plafond du critère 3 de la phase 1, en octets — celui que le critère 2 de la phase 2 et le
+/// critère 5 de la phase 4 reprennent. Un seul endroit, pour qu'un banc ne puisse plus en
+/// appliquer un autre sous le même nom.
+pub(crate) const RSS_LIMIT: u64 = 500 * 1000 * 1000;
 
 /// Mesure un import complet : durée, RSS crête, taux de dédup.
 pub fn import(profile: &Utf8PathBuf, store_root: &Utf8PathBuf, dry_run: bool) -> Result<()> {

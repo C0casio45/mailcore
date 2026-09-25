@@ -17,22 +17,73 @@
 //! Le critère 5 demande que la mesure dise **où** va la mémoire. Les paliers sont donc relevés
 //! un par un, comme pour `model-bench` : au démarrage, store ouvert, modèle chargé, passe finie.
 //! C'est ce relevé-là qui avait désigné le tokeniseur plutôt que la table, le 2026-09-15.
+//!
+//! ## Des crêtes échantillonnées, et plus seulement des paliers
+//!
+//! Jusqu'au 2026-09-25, la « crête » était le plus grand de **deux relevés ponctuels** — modèle
+//! chargé, passe finie. Ce qui se passe entre les deux lui échappait : le chargement d'un
+//! transformeur double brièvement ses poids, et un lot d'attention se libère avant la fin de la
+//! passe. Aucun des deux ne se voit dans un relevé pris après coup. Le chargement et la passe
+//! ont donc chacun leur échantillonneur, celui de `measure-import`, toutes les 20 ms.
+//!
+//! Et le chiffre de 1 304 Mio du 2026-09-22 ne sortait d'aucun instrument du dépôt : ce banc ne
+//! savait charger que l'embedding statique. `--bert` le rend remesurable.
 
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use mailcore::{Progress, Store};
+use mailvec::pass::Encoder;
 
+use crate::measure::{RSS_LIMIT, RssSampler};
 use crate::model::{current_rss, mib};
 
-/// Mesure une passe complète : débit, durée, mémoire par palier, et reprise.
+/// Ce que le banc doit mesurer.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// Le store d'origine, lu et jamais écrit.
+    pub store: Utf8PathBuf,
+    /// Le répertoire du modèle.
+    pub model: Utf8PathBuf,
+    /// Le transformeur plutôt que l'embedding statique.
+    ///
+    /// Un drapeau et non une déduction depuis le contenu du répertoire : la famille se choisit,
+    /// elle ne se devine pas — la même règle que `mail vectors`.
+    pub bert: bool,
+    /// Arrêter la passe après ce nombre de messages.
+    ///
+    /// La passe transformeur complète dure de trois à quatre heures ; une mesure de mémoire n'en
+    /// a pas besoin, parce que la crête d'un lot est bornée par la troncature et non par le
+    /// corpus. Le débit relevé sur une passe bornée, lui, ne vaut que pour les messages mesurés :
+    /// le banc le dit à côté du chiffre.
+    pub limit: Option<u64>,
+    /// Enchaîner le contrôle de reprise.
+    pub resume: bool,
+    /// Où garder le magasin de vecteurs produit, une fois la passe finie.
+    ///
+    /// Sans lui, le magasin disparaît avec la copie jetable, et mesurer le rappel du modèle mesuré
+    /// demanderait une seconde passe de plusieurs heures. **Un fichier neuf** : refusé s'il existe,
+    /// pour qu'un banc ne puisse pas écraser le magasin d'un store — la règle de
+    /// `measure-attachment`, appliquée à la sortie.
+    pub keep: Option<Utf8PathBuf>,
+}
+
+/// Les relevés pris avant que le modèle ne soit chargé.
+#[derive(Debug, Clone, Copy)]
+struct Before {
+    start: u64,
+    store: u64,
+}
+
+/// Mesure une passe : débit, durée, mémoire par palier et par crête, et reprise.
 ///
 /// # Errors
 ///
 /// Si le store n'est pas copiable ou lisible, si le modèle n'est pas chargeable, ou si la passe
 /// échoue.
-pub fn measure(store_root: &Utf8PathBuf, model: &Utf8PathBuf, resume: bool) -> Result<()> {
+pub fn measure(options: &Options) -> Result<()> {
     // Le même refus que `measure-scan`, et la même raison : la passe passe son temps dans
     // `mailvec` et `mailcore`, deux membres de l'espace de travail que le profil de débogage
     // n'optimise pas. Un débit relevé là serait faux d'un facteur qu'on ne connaît pas.
@@ -49,51 +100,151 @@ pub fn measure(store_root: &Utf8PathBuf, model: &Utf8PathBuf, resume: bool) -> R
     let root = Utf8PathBuf::from_path_buf(work.path().to_path_buf())
         .map_err(|p| anyhow::anyhow!("chemin non UTF-8 : {}", p.display()))?;
 
-    copy_index(store_root, &root)?;
-    let store = Store::open(&root).context("ouverture de la copie")?;
-    let rss_store = current_rss();
+    copy_index(&options.store, &root)?;
 
     // Les blobs du store d'origine, lus en place. La copie n'en a pas, et les recopier
-    // coûterait plusieurs gigaoctets pour une passe qui ne fait que les lire.
-    let blobs = store_root.join("blobs");
+    // coûterait plusieurs gigaoctets pour une passe qui ne fait que les lire. **Avant**
+    // l'ouverture du store : voir `link_blobs`.
+    let blobs = options.store.join("blobs");
     if !blobs.is_dir() {
         anyhow::bail!("le store n'a pas de répertoire `blobs` : {blobs}");
     }
-    link_blobs(&blobs, &root.join("blobs"))?;
+    let _linked = link_blobs(&blobs, &root.join("blobs"))?;
 
+    let store = Store::open(&root).context("ouverture de la copie")?;
+    let rss_store = current_rss();
+
+    // **Une passe depuis zéro, dans la copie.** Le corpus de mesure est déjà vectorisé : ses
+    // drapeaux disent « fait », et le banc refusait jusqu'ici de tourner dessus — « rien à
+    // vectoriser ». Ce qui se mesure ici est le coût d'une passe, donc ils sont remis à zéro,
+    // **dans la copie** : l'original n'est pas ouvert, il n'y a rien à y remettre.
+    store
+        .reset_vectorised()
+        .context("remise des drapeaux de la copie")?;
     let total = store.unvectorised_total().context("compte des messages")?;
-    println!("Store             {store_root}");
-    println!("Modèle            {model}");
-    println!("À vectoriser      {total} messages\n");
-    anyhow::ensure!(total > 0, "rien à vectoriser : le store est-il indexé ?");
+    println!("Store             {}", options.store);
+    println!("Modèle            {}", options.model);
+    println!(
+        "Famille           {}",
+        if options.bert {
+            "transformeur"
+        } else {
+            "embedding statique"
+        }
+    );
+    match options.limit {
+        Some(limit) => println!("À vectoriser      {total} messages, arrêt après {limit}\n"),
+        None => println!("À vectoriser      {total} messages\n"),
+    }
+    anyhow::ensure!(total > 0, "rien à vectoriser : le store est-il vide ?");
 
+    let before = Before {
+        start: rss_start,
+        store: rss_store,
+    };
+    if options.bert {
+        run(options, &store, total, before, || {
+            mailvec::bert::Bert::load(&options.model)
+        })
+    } else {
+        run(options, &store, total, before, || {
+            mailvec::model::Model::load(&options.model)
+        })
+    }
+}
+
+/// Charge le modèle, fait la passe, relève tout.
+///
+/// Générique plutôt qu'un `Box<dyn Encoder>` : la passe prend un `&impl Encoder`, et c'est
+/// l'appel que le produit fait. Un banc qui passerait par une autre porte mesurerait autre chose.
+fn run<E: Encoder>(
+    options: &Options,
+    store: &Store,
+    total: u64,
+    before: Before,
+    load: impl FnOnce() -> mailvec::Result<E>,
+) -> Result<()> {
+    let sampler = RssSampler::start();
     let loading = Instant::now();
-    let encoder = mailvec::model::Model::load(model).context("chargement du modèle")?;
-    let load = loading.elapsed();
+    let encoder = load().context("chargement du modèle")?;
+    let load_time = loading.elapsed();
+    let load_peak = sampler.stop();
     let rss_model = current_rss();
-    let dim = encoder.dim();
 
     let progress = Progress::new();
+    let sampler = RssSampler::start();
     let at = Instant::now();
-    let stats = mailvec::pass::update_with(
-        &store,
-        &encoder,
-        mailvec::text::Budget::default(),
-        &progress,
-    )
+    let stats = bounded(options.limit, &progress, || {
+        mailvec::pass::update_with(store, &encoder, mailvec::text::Budget::default(), &progress)
+    })
     .context("passe")?;
     let elapsed = at.elapsed();
+    let pass_peak = sampler.stop();
     let rss_done = current_rss();
 
-    report(
-        &stats, elapsed, load, dim, total, rss_start, rss_store, rss_model, rss_done,
-    );
+    report(&Reading {
+        stats,
+        elapsed,
+        load: load_time,
+        dim: encoder.dim(),
+        batch: encoder.batch(),
+        total,
+        limited: options.limit.is_some(),
+        start: before.start,
+        store: before.store,
+        load_peak,
+        model: rss_model,
+        pass_peak,
+        done: rss_done,
+    });
 
-    if resume {
-        measure_resume(&store, &encoder)?;
+    if let Some(keep) = &options.keep {
+        keep_vectors(store, keep)?;
     }
 
+    if options.resume {
+        measure_resume(store, &encoder)?;
+    }
     Ok(())
+}
+
+/// Recopie le magasin de vecteurs de la copie jetable vers `keep`, qui ne doit pas exister.
+fn keep_vectors(store: &Store, keep: &Utf8PathBuf) -> Result<()> {
+    anyhow::ensure!(
+        !keep.exists(),
+        "{keep} existe déjà : le banc n'écrase pas un magasin"
+    );
+    std::fs::copy(store.vectors_path().as_std_path(), keep.as_std_path())
+        .with_context(|| format!("copie du magasin vers {keep}"))?;
+    println!("\nMagasin gardé     {keep}");
+    Ok(())
+}
+
+/// Fait tourner `work` et l'annule une fois `limit` messages faits.
+///
+/// Par l'annulation coopérative que la passe consulte à chaque message, et non par un paramètre
+/// de plus dans la passe : le banc mesure la passe telle qu'elle est livrée. Elle s'arrête donc à
+/// la fin du lot en cours — un lot au plus de plus que demandé, et le relevé donne le nombre
+/// réellement fait.
+fn bounded<T>(limit: Option<u64>, progress: &Progress, work: impl FnOnce() -> T) -> T {
+    let Some(limit) = limit else {
+        return work();
+    };
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !finished.load(Ordering::Relaxed) {
+                if progress.done() >= limit {
+                    progress.cancel();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let result = work();
+        finished.store(true, Ordering::Relaxed);
+        result
+    })
 }
 
 /// Le contrôle du critère 3 : une passe coupée repart où elle en était.
@@ -101,12 +252,9 @@ pub fn measure(store_root: &Utf8PathBuf, model: &Utf8PathBuf, resume: bool) -> R
 /// Mesuré et pas seulement testé, parce que le test unitaire porte sur quatre messages et que ce
 /// qui est en jeu ici est le **temps** : une reprise qui recalculerait tout aurait exactement le
 /// même résultat et un coût multiplié par le nombre de coupures.
-fn measure_resume(store: &Store, encoder: &mailvec::model::Model) -> Result<()> {
+fn measure_resume(store: &Store, encoder: &impl Encoder) -> Result<()> {
     store.reset_vectorised().context("remise des drapeaux")?;
 
-    // Une coupure au premier lot : `Progress` annulé dès le départ arrête la passe avant tout
-    // travail, ce qui n'est pas la coupure intéressante. On laisse donc un lot passer, puis on
-    // annule — ce que la boucle regarde message par message.
     let progress = Progress::new();
     let first =
         mailvec::pass::update_with(store, encoder, mailvec::text::Budget::default(), &progress)
@@ -132,58 +280,87 @@ fn measure_resume(store: &Store, encoder: &mailvec::model::Model) -> Result<()> 
     Ok(())
 }
 
-/// Écrit le relevé.
-#[allow(clippy::too_many_arguments)]
-fn report(
-    stats: &mailvec::pass::Stats,
-    elapsed: std::time::Duration,
-    load: std::time::Duration,
+/// Tout ce que le relevé imprime.
+struct Reading {
+    stats: mailvec::pass::Stats,
+    elapsed: Duration,
+    load: Duration,
     dim: usize,
+    batch: usize,
     total: u64,
-    rss_start: u64,
-    rss_store: u64,
-    rss_model: u64,
-    rss_done: u64,
-) {
-    let seconds = elapsed.as_secs_f64();
+    limited: bool,
+    start: u64,
+    store: u64,
+    load_peak: u64,
+    model: u64,
+    pass_peak: u64,
+    done: u64,
+}
+
+/// Écrit le relevé.
+fn report(r: &Reading) {
+    let seconds = r.elapsed.as_secs_f64();
     #[allow(clippy::cast_precision_loss)]
-    let rate = stats.vectorised as f64 / seconds.max(f64::EPSILON);
+    let rate = r.stats.vectorised as f64 / seconds.max(f64::EPSILON);
 
     println!("--- critère 3 : le coût de la passe ---");
-    println!("Dimension         {dim}");
-    println!("Chargement        {load:.2?}");
-    println!("Passe             {elapsed:.2?}");
-    println!("Débit             {rate:.0} messages/s");
-    println!("Vectorisés        {}", stats.vectorised);
-    println!("Blobs absents     {}", stats.missing_blobs);
-    println!("Textes vides      {}", stats.empty);
+    println!("Dimension         {}", r.dim);
+    println!("Lot               {}", r.batch);
+    println!("Chargement        {:.2?}", r.load);
+    println!("Passe             {:.2?}", r.elapsed);
+    println!("Débit             {rate:.2} messages/s");
+    println!("Vectorisés        {}", r.stats.vectorised);
+    println!("Blobs absents     {}", r.stats.missing_blobs);
+    println!("Textes vides      {}", r.stats.empty);
     #[allow(clippy::cast_precision_loss)]
-    let projected = 73_658.0 / rate.max(f64::EPSILON);
-    println!("Projection 73 658 {projected:.0} s");
-    if total != stats.vectorised + stats.missing_blobs {
+    let projected = r.total as f64 / rate.max(f64::EPSILON);
+    println!(
+        "Projection        {projected:.0} s pour {} messages{}",
+        r.total,
+        if r.limited {
+            " — sur les premiers messages seulement, dont les longueurs ne sont pas celles du \
+             corpus"
+        } else {
+            ""
+        }
+    );
+    if !r.limited && r.total != r.stats.vectorised + r.stats.missing_blobs {
         println!(
-            "ANOMALIE          {total} attendus, {} traités",
-            stats.vectorised
+            "ANOMALIE          {} attendus, {} traités",
+            r.total, r.stats.vectorised
         );
     }
 
     println!("\n--- critère 5 : où va la mémoire ---");
     for (label, rss) in [
-        ("au démarrage", rss_start),
-        ("store ouvert", rss_store),
-        ("modèle chargé", rss_model),
-        ("passe finie", rss_done),
+        ("au démarrage", r.start),
+        ("store ouvert", r.store),
+        ("crête chargement", r.load_peak),
+        ("modèle chargé", r.model),
+        ("crête passe", r.pass_peak),
+        ("passe finie", r.done),
     ] {
-        println!("{label:<18}{}", mib(rss as usize));
+        println!(
+            "{label:<18}{}",
+            mib(usize::try_from(rss).unwrap_or(usize::MAX))
+        );
     }
-    let peak = rss_done.max(rss_model);
+    // Les deux crêtes échantillonnées, et les deux paliers au cas où l'échantillonneur aurait
+    // manqué un instant : la crête est le plus grand de tout ce qui a été vu.
+    let peak = [r.load_peak, r.model, r.pass_peak, r.done]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    // Le seuil est **celui du critère 2 de la phase 2**, en octets et non en mébioctets : le
+    // critère 5 le cite. Ce banc comparait jusqu'au 2026-09-25 à 500 Mio, soit 23 Mio plus
+    // indulgent que le seuil qu'il prétendait appliquer.
     println!(
         "\nCrête             {}   {}",
-        mib(peak as usize),
-        if peak < 500 * 1024 * 1024 {
-            "sous les 500 Mio du critère"
+        mib(usize::try_from(peak).unwrap_or(usize::MAX)),
+        if peak < RSS_LIMIT {
+            "sous les 500 Mo du critère"
         } else {
-            "AU-DESSUS du seuil"
+            "AU-DESSUS du seuil de 500 Mo"
         }
     );
 }
@@ -197,26 +374,122 @@ fn copy_index(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Le lien vers les blobs d'origine, retiré **avant** que le répertoire jetable ne le soit.
+///
+/// ## Pourquoi un gardien, et pourquoi il passe en premier
+///
+/// Le répertoire de travail est effacé à la fin du banc, et le lien est dedans. Un effacement
+/// récursif qui **suivrait** le lien effacerait le corpus de mesure — soixante-treize mille
+/// messages, des heures de réimport. La bibliothèque standard ne suit ni les liens symboliques ni
+/// les jonctions, et c'est précisément le genre de propriété qu'on ne veut pas avoir à croire :
+/// le lien est donc retiré par ce gardien, seul, par [`unlink`] — qui retire un lien de
+/// répertoire sans jamais toucher sa cible. Il est déclaré après le répertoire jetable, donc détruit avant lui.
+#[must_use]
+struct Linked {
+    path: Utf8PathBuf,
+    /// Faux quand on a dû copier : une copie s'efface avec le reste, elle n'a rien d'original.
+    link: bool,
+}
+
+impl Drop for Linked {
+    fn drop(&mut self) {
+        if self.link
+            && let Err(error) = unlink(&self.path)
+        {
+            eprintln!("lien des blobs non retiré ({}) : {error}", self.path);
+        }
+    }
+}
+
 /// Rend les blobs du store d'origine visibles depuis la copie, sans les dupliquer.
 ///
-/// Un lien symbolique quand le système le permet, une jonction de répertoire sinon. Les blobs
-/// sont **lus** par la passe et par rien d'autre : le lien ne peut pas servir à les modifier,
-/// parce que personne n'écrit sur ce chemin.
-fn link_blobs(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
-    #[cfg(windows)]
-    let made = std::os::windows::fs::symlink_dir(from.as_std_path(), to.as_std_path());
-    #[cfg(not(windows))]
-    let made = std::os::unix::fs::symlink(from.as_std_path(), to.as_std_path());
+/// Un lien symbolique quand le système le permet, une **jonction** de répertoire sinon — elle ne
+/// demande aucun privilège sous Windows, là où le lien symbolique demande le mode développeur.
+/// La copie ne vient qu'en dernier recours. Les blobs sont **lus** par la passe et par rien
+/// d'autre : le lien ne peut pas servir à les modifier, parce que personne n'écrit sur ce chemin.
+///
+/// **À appeler avant `Store::open`**, qui crée un `blobs/` vide s'il n'en trouve pas : le lien
+/// tombait alors sur un répertoire existant, échouait, et le banc recopiait tout le corpus à
+/// chaque exécution — ce qu'il faisait jusqu'au 2026-09-25, en l'attribuant à un privilège.
+fn link_blobs(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<Linked> {
+    // **Absolue**, la cible : un lien symbolique range un chemin relatif par rapport à *son
+    // propre* répertoire, pas au répertoire courant. `measurements/store/blobs`, la valeur par
+    // défaut, donnait donc un lien qui ne menait nulle part — et `Store::open`, trouvant un nom
+    // occupé qui n'était pas un répertoire, refusait d'ouvrir. Trouvé au premier relevé du
+    // 2026-09-25 ; le test, qui passait des chemins absolus, ne pouvait pas le voir.
+    let from = std::path::absolute(from.as_std_path())
+        .with_context(|| format!("chemin absolu de {from}"))?;
+    let from = Utf8PathBuf::from_path_buf(from)
+        .map_err(|p| anyhow::anyhow!("chemin non UTF-8 : {}", p.display()))?;
 
-    if made.is_ok() {
-        return Ok(());
+    #[cfg(windows)]
+    let made = usable(
+        std::os::windows::fs::symlink_dir(from.as_std_path(), to.as_std_path()).is_ok(),
+        to,
+    ) || usable(junction(&from, to), to);
+    #[cfg(not(windows))]
+    let made = usable(
+        std::os::unix::fs::symlink(from.as_std_path(), to.as_std_path()).is_ok(),
+        to,
+    );
+
+    if made {
+        return Ok(Linked {
+            path: to.clone(),
+            link: true,
+        });
     }
 
-    // Sans le privilège de création de lien — le cas ordinaire sur Windows hors mode
-    // développeur —, on copie. C'est long et ça marche, et le dire vaut mieux que d'échouer sur
-    // une permission qui n'a rien à voir avec ce qu'on mesure.
+    // Ni lien ni jonction : on copie. C'est long et ça marche, et le dire vaut mieux que
+    // d'échouer sur une permission qui n'a rien à voir avec ce qu'on mesure.
     println!("Lien impossible, copie des blobs…");
-    copy_tree(from, to)
+    copy_tree(&from, to)?;
+    Ok(Linked {
+        path: to.clone(),
+        link: false,
+    })
+}
+
+/// Vrai si un lien vient d'être créé **et** mène à un répertoire.
+///
+/// Un lien créé qui ne mène nulle part est retiré : le laisser occuperait le nom, et la copie de
+/// repli échouerait dessus.
+fn usable(made: bool, to: &Utf8PathBuf) -> bool {
+    if !made {
+        return false;
+    }
+    if to.is_dir() {
+        return true;
+    }
+    unlink(to).ok();
+    false
+}
+
+/// Retire un lien de répertoire, jamais sa cible.
+///
+/// `remove_dir` sous Windows, où un lien de répertoire et une jonction sont des répertoires pour
+/// le système ; `remove_file` ailleurs, où un lien symbolique est un fichier. Aucun des deux ne
+/// descend dans ce qu'il désigne, et `remove_dir` échoue sur un vrai répertoire non vide plutôt
+/// que de le vider.
+fn unlink(path: &Utf8PathBuf) -> std::io::Result<()> {
+    #[cfg(windows)]
+    return std::fs::remove_dir(path.as_std_path());
+    #[cfg(not(windows))]
+    return std::fs::remove_file(path.as_std_path());
+}
+
+/// Une jonction de répertoire, par `mklink /J`.
+///
+/// Un utilitaire du système et non un script : la bibliothèque standard ne sait pas créer de
+/// jonction, et la seule autre voie est un appel Win32 que `#![forbid(unsafe_code)]` exclut.
+#[cfg(windows)]
+fn junction(from: &Utf8PathBuf, to: &Utf8PathBuf) -> bool {
+    std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J", to.as_str(), from.as_str()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Copie récursive, pour le repli de [`link_blobs`].
@@ -237,4 +510,95 @@ fn copy_tree(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::link_blobs;
+    use camino::Utf8PathBuf;
+
+    fn utf8(dir: &tempfile::TempDir) -> Utf8PathBuf {
+        Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap()
+    }
+
+    #[test]
+    fn the_originals_survive_the_cleanup_of_the_work_directory() {
+        // Le risque que le gardien couvre : un effacement du répertoire jetable qui suivrait le
+        // lien et viderait le corpus de mesure.
+        let originals = tempfile::tempdir().unwrap();
+        let original = utf8(&originals).join("blobs");
+        std::fs::create_dir_all(original.join("ab")).unwrap();
+        std::fs::write(original.join("ab").join("cdef"), b"un message").unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let linked_path = utf8(&work).join("blobs");
+        let linked = link_blobs(&original, &linked_path).unwrap();
+
+        // Le contrôle positif : le lien donne bien à lire les originaux. Sans lui, un lien raté
+        // qui ne mène nulle part passerait le reste du test.
+        assert_eq!(
+            std::fs::read(linked_path.join("ab").join("cdef")).unwrap(),
+            b"un message"
+        );
+
+        drop(linked);
+        drop(work);
+        assert_eq!(
+            std::fs::read(original.join("ab").join("cdef")).unwrap(),
+            b"un message",
+            "l'effacement du répertoire jetable a atteint les originaux"
+        );
+    }
+
+    #[test]
+    fn a_link_is_made_rather_than_a_copy() {
+        // Le défaut du 2026-09-25 : le banc recopiait tout le corpus à chaque exécution. Sur la
+        // machine de mesure, il doit maintenant lier — symlink ou jonction.
+        let originals = tempfile::tempdir().unwrap();
+        let original = utf8(&originals).join("blobs");
+        std::fs::create_dir_all(&original).unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let linked = link_blobs(&original, &utf8(&work).join("blobs")).unwrap();
+        assert!(linked.link, "les blobs ont été copiés au lieu d'être liés");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod dangling {
+    use super::usable;
+    use camino::Utf8PathBuf;
+
+    #[test]
+    fn a_link_that_leads_nowhere_is_refused_and_its_name_freed() {
+        // Le défaut du premier relevé du 2026-09-25 : un lien vers une cible relative, donc
+        // pendant. Il occupait le nom, et tout ce qui suivait — l'ouverture du store, la copie de
+        // repli — échouait dessus.
+        let work = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(work.path().to_path_buf()).unwrap();
+        let nowhere = root.join("absent");
+        let to = root.join("blobs");
+
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(nowhere.as_std_path(), to.as_std_path())
+            .is_ok()
+            || super::junction(&nowhere, &to);
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(nowhere.as_std_path(), to.as_std_path()).is_ok();
+
+        // Le contrôle positif : un lien pendant existe bien. Sinon le test ne prouverait rien.
+        assert!(
+            made,
+            "impossible de fabriquer un lien pendant sur cette machine"
+        );
+        assert!(std::fs::symlink_metadata(to.as_std_path()).is_ok());
+
+        assert!(!usable(made, &to), "un lien pendant a été accepté");
+        assert!(
+            std::fs::symlink_metadata(to.as_std_path()).is_err(),
+            "le lien pendant occupe encore le nom"
+        );
+    }
 }

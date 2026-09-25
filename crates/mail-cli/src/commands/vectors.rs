@@ -67,15 +67,24 @@ pub fn run(
     // contrôle de péremption ajouté dans la passe le 2026-09-23, et continuait d'annoncer « rien
     // à faire » sur un magasin écrit par une autre composition de texte. Deux endroits qui
     // répondent à la même question finissent par ne pas y répondre pareil.
-    let pending = mailvec::pass::pending(&store, budget)
-        .map_err(explain)
-        .context("état du magasin de vecteurs")?;
     println!("Store              {root}");
     println!("Modèle             {model}");
     if rebuild {
+        // **Sans demander ce qu'il y a à faire.** La reconstruction est le geste qui répare un
+        // magasin illisible ; poser d'abord la question, c'était lire l'en-tête qu'on venait
+        // réparer, et refuser pour toujours sur un fichier abîmé.
         println!("Mode               reconstruction complète");
     } else {
-        if pending.stale {
+        let pending = mailvec::pass::pending(&store, budget)
+            .map_err(explain)
+            .context("état du magasin de vecteurs")?;
+        if pending.diverged {
+            println!(
+                "Magasin incomplet  moins de vecteurs que de messages marqués — supprimé, \
+                 remplacé ou tronqué"
+            );
+            println!("                   — le corpus entier est revectorisé");
+        } else if pending.stale {
             println!(
                 "Magasin périmé     écrit par une autre composition de texte ou un autre budget"
             );

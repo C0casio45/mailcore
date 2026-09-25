@@ -235,42 +235,40 @@ pub fn update_with(
     progress: &Progress,
 ) -> Result<Stats> {
     let path = store.vectors_path();
+    let found = pending(store, budget)?;
 
     // **Le critère 9 : les deux magasins ne doivent pas se contredire.** Le drapeau est dans
     // SQLite, les vecteurs dans un fichier. Ils divergent quand le fichier disparaît — disque
-    // remplacé, répertoire nettoyé — et des drapeaux qui disent « vectorisé » feraient alors
-    // sauter tous les messages : la recherche sémantique resterait vide pour toujours, sans que
-    // rien ne le signale.
+    // remplacé, répertoire nettoyé —, quand une copie plus ancienne le remplace, ou quand il est
+    // tronqué ; des drapeaux qui disent « vectorisé » feraient alors sauter ces messages pour
+    // toujours, sans que rien ne le signale.
     //
     // Le contrôle est ici, au point d'usage, et non à l'ouverture du magasin : celle-ci sert
     // aussi les chemins de **lecture** — une recherche — qui ne doivent pas écrire. C'est la
     // même répartition que pour l'index plein texte, et elle a la même raison.
-    let stored = mailcore::vectors::Vectors::load(&path, model.dim())?;
-    if stored.is_empty() && store.vectorised_count()? > 0 {
-        tracing::warn!(
-            "magasin de vecteurs vide alors que des messages se disent vectorisés : passe complète"
-        );
-        store.reset_vectorised()?;
-    }
-    drop(stored);
-
-    // **Le second cas de divergence, trouvé le 2026-09-23.** Le premier est un magasin *disparu*
-    // pendant que les drapeaux disent « fait » ; celui-ci est un magasin *présent* mais écrit par
-    // une autre composition de texte. Les deux ont la même conséquence — des drapeaux qui
-    // mentent — et la même réponse.
     //
-    // Il est traité ici plutôt que dans `update` parce que c'est le passage obligé des deux
-    // chemins, celui du modèle statique et celui du transformeur. Le mettre en amont n'aurait
-    // couvert que le premier, et c'est le second qui avait le magasin périmé.
-    if stale(store, budget)? {
-        tracing::warn!(
-            "le magasin de vecteurs a été écrit par une autre composition de texte ou un autre \
-             budget : passe complète"
-        );
+    // **Le second cas de divergence, trouvé le 2026-09-23** : un magasin *présent* mais écrit par
+    // une autre composition de texte. Même conséquence, même réponse — et les deux sont traités
+    // ici, le passage obligé des deux chemins, celui du modèle statique et celui du transformeur.
+    if found.diverged || found.stale {
+        if found.diverged {
+            tracing::warn!(
+                "le magasin de vecteurs a moins de records que de messages marqués vectorisés : \
+                 passe complète"
+            );
+        } else {
+            tracing::warn!(
+                "le magasin de vecteurs a été écrit par une autre composition de texte ou un \
+                 autre budget : passe complète"
+            );
+        }
         store.reset_vectorised()?;
-        // Le magasin est retiré, sinon `VectorWriter::open` refuserait d'y ajouter — à juste
-        // titre : ses records et ceux qu'on s'apprête à écrire ne se comparent pas. C'est le
-        // même geste que `rebuild`, déclenché par une divergence au lieu d'une demande.
+        // Le magasin est retiré dans les deux cas, et c'est le même geste que `rebuild`,
+        // déclenché par une divergence au lieu d'une demande. Périmé, `VectorWriter::open`
+        // refuserait d'y ajouter — à juste titre : ses records et ceux qu'on s'apprête à écrire
+        // ne se comparent pas. Plus court que les drapeaux, il ne contient plus ce qu'on croit :
+        // une copie ancienne porte des records que plus rien ne désigne, et les garder ferait
+        // remonter des messages disparus.
         if path.exists() {
             std::fs::remove_file(&path).map_err(|source| {
                 Error::Core(mailcore::Error::Io {
@@ -354,29 +352,54 @@ pub struct Pending {
     /// Quand c'est vrai, `messages` ne dit plus rien d'utile : la passe remettra tous les
     /// drapeaux à zéro, donc le travail réel est le corpus entier.
     pub stale: bool,
+    /// Le magasin a-t-il **moins de records que de messages marqués vectorisés** ?
+    ///
+    /// Le critère 9 : chaque message marqué a au moins un record, puisque le drapeau n'est posé
+    /// qu'après l'écriture durable. Moins de records prouve que les deux magasins se contredisent
+    /// — fichier supprimé, remplacé par une copie plus ancienne, tronqué. Comme `stale`, il rend
+    /// `messages` sans objet : la passe repartira de zéro.
+    pub diverged: bool,
 }
 
 impl Pending {
-    /// Vrai s'il n'y a rien à faire — **les deux** conditions, pas seulement le compte.
+    /// Vrai s'il n'y a rien à faire — **les trois** conditions, pas seulement le compte.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.messages == 0 && !self.stale
+        self.messages == 0 && !self.stale && !self.diverged
     }
 }
 
 /// Ce qu'une passe aurait à faire, sans rien charger de cher.
 ///
-/// Un `COUNT` sur colonne indexée et un en-tête de vingt octets. C'est ce qui permet de la poser
-/// après chaque moisson sans payer le chargement d'un modèle — la leçon du 2026-09-11, et elle
-/// tient toujours : ce contrôle-ci ne l'a pas rendue plus chère.
+/// Deux `COUNT`, un en-tête de vingt octets et la taille d'un fichier. C'est ce qui permet de la
+/// poser après chaque moisson sans payer le chargement d'un modèle — la leçon du 2026-09-11, et
+/// elle tient toujours : ce contrôle-ci ne l'a pas rendue plus chère.
+///
+/// ## Le contrôle du critère 9, ici plutôt qu'après
+///
+/// Jusqu'au 2026-09-25, la divergence n'était vue que par [`update_with`], en relisant le magasin
+/// entier — et seulement quand il y avait déjà du travail. Un magasin supprimé pendant que les
+/// drapeaux disaient « fait » donnait donc « rien à faire » à `mail vectors`, et le restait
+/// jusqu'à l'arrivée d'un message. Le nombre de records se lit dans la taille du fichier : la
+/// question coûte le même prix que les autres, donc elle se pose avec elles.
 ///
 /// # Errors
 ///
 /// [`Error::Core`] si le store ou l'en-tête du magasin est illisible.
 pub fn pending(store: &Store, budget: crate::text::Budget) -> Result<Pending> {
+    let summary = mailcore::vectors::summary_of(&store.vectors_path())?;
+    let unvectorised = store.unvectorised_total()?;
+    // Les messages marqués, par différence : le `COUNT` des non-vectorisés est servi par l'index
+    // partiel de `SCHEMA_V14`, celui des vectorisés ne l'est pas.
+    let marked = store.message_count()?.saturating_sub(unvectorised);
+    let records = summary.as_ref().map_or(0, |summary| summary.records);
     Ok(Pending {
-        messages: store.unvectorised_total()?,
-        stale: stale(store, budget)?,
+        messages: unvectorised,
+        stale: summary
+            .as_ref()
+            .and_then(|summary| summary.provenance.as_ref())
+            .is_some_and(|found| stale_against(found, budget)),
+        diverged: records < marked,
     })
 }
 
@@ -393,11 +416,8 @@ pub fn pending(store: &Store, budget: crate::text::Budget) -> Result<Pending> {
 /// Un magasin absent ou sans provenance n'est **pas** périmé : le premier n'existe pas encore, le
 /// second est un magasin de version 1 qu'on ne peut pas juger. Les déclarer périmés déclencherait
 /// une passe complète de quatre heures à chaque démarrage sur une installation ancienne.
-fn stale(store: &Store, budget: crate::text::Budget) -> Result<bool> {
-    let Some(found) = mailcore::vectors::provenance_of(&store.vectors_path())? else {
-        return Ok(false);
-    };
-    Ok(found.budget != budget.body || found.revision != crate::text::REVISION)
+const fn stale_against(found: &mailcore::vectors::Provenance, budget: crate::text::Budget) -> bool {
+    found.budget != budget.body || found.revision != crate::text::REVISION
 }
 
 /// Ce qui sera écrit dans l'en-tête du magasin.
@@ -455,6 +475,55 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
+/// Ce que la passe tire d'une ligne.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Composed {
+    /// Le blob est absent : rien à lire.
+    Missing,
+    /// Le texte que le modèle recevra — vide, parfois.
+    Text(String),
+}
+
+/// Le texte qu'un message donne au modèle.
+///
+/// **Le même pour la passe et pour tout banc** qui veut savoir ce que la passe verrait : la leçon
+/// du 2026-09-10, un banc qui réimplémente ce qu'il vérifie ne vérifie rien. `model-bench`
+/// composait jusqu'ici son propre texte — « sujet adresse corps » — qui n'était pas celui de la
+/// passe.
+///
+/// # Errors
+///
+/// [`Error::Core`] si le blob est illisible pour une autre raison que son absence.
+pub fn compose(
+    store: &Store,
+    row: &mailcore::store::read::VectorRow,
+    budget: crate::text::Budget,
+) -> Result<Composed> {
+    compose_with(store, row, &mail_parser::MessageParser::default(), budget)
+}
+
+/// [`compose`] avec un analyseur déjà construit, pour la boucle.
+fn compose_with(
+    store: &Store,
+    row: &mailcore::store::read::VectorRow,
+    parser: &mail_parser::MessageParser,
+    budget: crate::text::Budget,
+) -> Result<Composed> {
+    let raw = match store.blobs().read(row.blob) {
+        Ok(bytes) => bytes,
+        Err(mailcore::Error::BlobNotFound(_)) => return Ok(Composed::Missing),
+        Err(other) => return Err(other.into()),
+    };
+    Ok(Composed::Text(match parser.parse(&raw) {
+        Some(parsed) => {
+            crate::text::from_message(&parsed, &row.subject, row.from_name.as_deref(), budget)
+        }
+        // En-têtes illisibles : on vectorise sur ce que SQLite sait déjà. Un message
+        // introuvable serait pire qu'un message mal placé.
+        None => crate::text::compose(&row.subject, row.from_name.as_deref(), ""),
+    }))
+}
+
 /// La boucle partagée par [`update`] et [`rebuild`].
 ///
 /// Partagée et non recopiée : c'est la leçon du carnet, où deux boucles auraient divergé et où
@@ -498,12 +567,11 @@ fn advance(
                 cancelled = true;
                 break;
             }
-            let raw = match store.blobs().read(row.blob) {
-                Ok(bytes) => bytes,
-                Err(mailcore::Error::BlobNotFound(hash)) => {
+            match compose_with(store, row, &parser, budget)? {
+                Composed::Missing => {
                     // Un blob absent est diagnostiquable par `mail doctor`. Ce n'est pas de quoi
                     // interrompre une passe de soixante-treize mille messages.
-                    tracing::warn!(%hash, id = row.id.0, "blob absent, message non vectorisé");
+                    tracing::warn!(hash = %row.blob, id = row.id.0, "blob absent, message non vectorisé");
                     stats.missing_blobs += 1;
                     absent += 1;
                     // **Marqué quand même.** Sinon la ligne revient à chaque passe, pour toujours,
@@ -512,28 +580,15 @@ fn advance(
                     // plus jamais. Un blob qui réapparaît est un cas pour une reconstruction.
                     ids.push(row.id);
                     texts.push(String::new());
-                    progress.advance(1);
-                    continue;
                 }
-                Err(other) => return Err(other.into()),
-            };
-
-            let text = match parser.parse(&raw) {
-                Some(parsed) => crate::text::from_message(
-                    &parsed,
-                    &row.subject,
-                    row.from_name.as_deref(),
-                    budget,
-                ),
-                // En-têtes illisibles : on vectorise sur ce que SQLite sait déjà. Un message
-                // introuvable serait pire qu'un message mal placé.
-                None => crate::text::compose(&row.subject, row.from_name.as_deref(), ""),
-            };
-            if text.trim().is_empty() {
-                stats.empty += 1;
+                Composed::Text(text) => {
+                    if text.trim().is_empty() {
+                        stats.empty += 1;
+                    }
+                    ids.push(row.id);
+                    texts.push(text);
+                }
             }
-            ids.push(row.id);
-            texts.push(text);
             progress.advance(1);
         }
 
@@ -739,6 +794,79 @@ mod tests {
         update_with(&store, &fake, budget(), &progress).unwrap();
 
         assert_eq!(fake.encoded.get(), before, "le corpus a été revectorisé");
+    }
+
+    /// Le défaut que `pending` avait jusqu'au 2026-09-25 : un magasin supprimé pendant que les
+    /// drapeaux disaient « fait » rendait « rien à faire », donc `mail vectors` s'arrêtait et une
+    /// moisson sans nouveau message ne voyait rien.
+    #[test]
+    fn the_cheap_question_already_sees_a_vanished_store() {
+        let (_dir, store) = corpus(3);
+        let fake = Fake::new(8);
+        update_with(&store, &fake, budget(), &Progress::new()).unwrap();
+        assert!(pending(&store, budget()).unwrap().is_empty());
+
+        std::fs::remove_file(store.vectors_path()).unwrap();
+        let found = pending(&store, budget()).unwrap();
+        assert!(found.diverged, "{found:?}");
+        assert!(!found.is_empty());
+    }
+
+    /// Un magasin **plus court** que les drapeaux — une copie ancienne remise en place, un
+    /// fichier tronqué : ni vide ni absent, donc invisible au contrôle d'avant.
+    #[test]
+    fn a_store_shorter_than_its_flags_is_redone_from_scratch() {
+        let (_dir, store) = corpus(4);
+        let fake = Fake::new(8);
+        let progress = Progress::new();
+        update_with(&store, &fake, budget(), &progress).unwrap();
+
+        // Deux records retirés à la main, en fin de fichier.
+        let path = store.vectors_path();
+        let length = std::fs::metadata(path.as_std_path()).unwrap().len();
+        let record = 8 + 4 * 8;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path.as_std_path())
+            .unwrap()
+            .set_len(length - 2 * record)
+            .unwrap();
+        assert!(pending(&store, budget()).unwrap().diverged);
+
+        let redone = update_with(&store, &fake, budget(), &progress).unwrap();
+        assert_eq!(redone.vectorised, 4, "le corpus n'a pas été refait");
+        assert_eq!(Vectors::load(&path, 8).unwrap().len(), 4);
+        assert!(pending(&store, budget()).unwrap().is_empty());
+    }
+
+    /// Un fichier vide est ce que laisse une passe tuée avant l'en-tête. La lecture le refusait,
+    /// et la passe avec elle, pour toujours.
+    #[test]
+    fn an_empty_store_file_is_an_absent_store_not_an_error() {
+        let (_dir, store) = corpus(2);
+        std::fs::write(store.vectors_path().as_std_path(), []).unwrap();
+        let found = pending(&store, budget()).unwrap();
+        assert_eq!(found.messages, 2);
+        assert!(!found.diverged && !found.stale);
+
+        let fake = Fake::new(8);
+        let done = update_with(&store, &fake, budget(), &Progress::new()).unwrap();
+        assert_eq!(done.vectorised, 2);
+    }
+
+    /// Le contrôle inverse : un magasin complet, et même un magasin qui porte **plus** de records
+    /// que de messages — des doublons après une reprise —, ne divergent pas.
+    #[test]
+    fn a_complete_store_with_duplicates_does_not_diverge() {
+        let (_dir, store) = corpus(3);
+        let fake = Fake::new(8);
+        update_with(&store, &fake, budget(), &Progress::new()).unwrap();
+        // Une reprise après coupure réécrit des records déjà là : l'ajout seul les garde.
+        store.reset_vectorised().unwrap();
+        update_with(&store, &fake, budget(), &Progress::new()).unwrap();
+        let found = pending(&store, budget()).unwrap();
+        assert!(!found.diverged, "{found:?}");
+        assert!(found.is_empty());
     }
 
     #[test]

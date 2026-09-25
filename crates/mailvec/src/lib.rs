@@ -32,6 +32,8 @@ pub mod model;
 pub mod pass;
 pub mod search;
 pub mod text;
+pub mod trim;
+mod weights;
 
 #[cfg(test)]
 mod testing;

@@ -80,17 +80,63 @@ pub use store::VectorWriter;
 /// [`crate::Error::Io`] si le fichier existe et n'est pas lisible, [`crate::Error::VectorFormat`]
 /// si son en-tête n'est pas celui d'un magasin.
 pub fn provenance_of(path: &camino::Utf8Path) -> crate::Result<Option<Provenance>> {
+    Ok(summary_of(path)?.and_then(|summary| summary.provenance))
+}
+
+/// Ce qu'un magasin porte, lu **sans** charger ses records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    /// La dimension de ses vecteurs.
+    pub dim: usize,
+    /// Combien de records **complets** il contient — doublons compris, queue partielle exclue.
+    ///
+    /// C'est une borne, pas un compte de messages : un message revectorisé a deux records. Mais
+    /// c'est une borne **dans le bon sens** pour le critère 9 : chaque message marqué vectorisé a
+    /// au moins un record, puisque le drapeau n'est posé qu'après l'écriture durable. Moins de
+    /// records que de messages marqués prouve donc que les deux magasins se contredisent.
+    pub records: u64,
+    /// Ce qui l'a écrit, s'il le dit.
+    pub provenance: Option<Provenance>,
+}
+
+/// La dimension, le nombre de records et la provenance d'un magasin, lus dans son en-tête et
+/// dans sa taille.
+///
+/// ## Pourquoi cette porte existe
+///
+/// Jusqu'au 2026-09-25, la passe relisait le magasin **entier** — 108 Mio au format du
+/// transformeur — à chaque appel, pour savoir s'il était vide. Le nombre de records se déduit de
+/// la taille du fichier : `(taille − en-tête) / (8 + 4 × dimension)`. Un en-tête et un `stat`.
+///
+/// Un magasin absent **ou vide** rend `Ok(None)`. Vide, c'est ce que laisse une passe tuée entre
+/// la création du fichier et l'écriture de son en-tête : [`VectorWriter::open`] le traite déjà
+/// comme neuf, et les lecteurs le refusaient pour toujours — `mail vectors --rebuild` compris,
+/// puisqu'il demandait d'abord ce qu'il y avait à faire.
+///
+/// # Errors
+///
+/// [`crate::Error::Io`] si le fichier existe et n'est pas lisible, [`crate::Error::VectorFormat`]
+/// si son en-tête n'est pas celui d'un magasin.
+pub fn summary_of(path: &camino::Utf8Path) -> crate::Result<Option<Summary>> {
+    let io = |source| crate::Error::Io {
+        path: path.to_owned(),
+        source,
+    };
     let mut file = match std::fs::File::open(path.as_std_path()) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(crate::Error::Io {
-                path: path.to_owned(),
-                source,
-            });
-        }
+        Err(source) => return Err(io(source)),
     };
-    Ok(store::read_header(&mut file, path)?.provenance)
+    let length = file.metadata().map_err(io)?.len();
+    if length == 0 {
+        return Ok(None);
+    }
+    let header = store::read_header(&mut file, path)?;
+    Ok(Some(Summary {
+        dim: header.dim,
+        records: length.saturating_sub(header.len) / record_len(header.dim),
+        provenance: header.provenance,
+    }))
 }
 
 /// Ce qui a écrit un magasin de vecteurs.

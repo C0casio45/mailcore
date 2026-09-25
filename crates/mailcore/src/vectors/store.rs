@@ -388,6 +388,45 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_counts_complete_records_without_reading_them() {
+        let (_dir, path) = scratch();
+        {
+            let mut writer = VectorWriter::open(&path, 4, &prov()).unwrap();
+            for id in 0..5 {
+                writer.append(MessageId(id), &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            }
+            // Un doublon : compté comme un record, parce que c'en est un.
+            writer.append(MessageId(0), &[0.0, 1.0, 0.0, 0.0]).unwrap();
+            writer.sync().unwrap();
+        }
+        // Une queue partielle, ce que laisse une écriture coupée : pas un record.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[7; 5])
+            .unwrap();
+
+        let summary = crate::vectors::summary_of(&path).unwrap().unwrap();
+        assert_eq!(summary.dim, 4);
+        assert_eq!(summary.records, 6);
+        assert_eq!(summary.provenance, Some(prov()));
+    }
+
+    #[test]
+    fn an_absent_or_empty_store_has_no_summary_and_reads_as_empty() {
+        let (_dir, path) = scratch();
+        assert_eq!(crate::vectors::summary_of(&path).unwrap(), None);
+        std::fs::write(&path, []).unwrap();
+        assert_eq!(crate::vectors::summary_of(&path).unwrap(), None);
+        assert_eq!(crate::vectors::provenance_of(&path).unwrap(), None);
+        assert!(Vectors::load(&path, 4).unwrap().is_empty());
+        // Le contrôle inverse : un fichier non vide qui n'est pas un magasin reste refusé.
+        std::fs::write(&path, b"pas un magasin, mais pas vide").unwrap();
+        assert!(crate::vectors::summary_of(&path).is_err());
+    }
+
+    #[test]
     fn what_is_written_comes_back_normalised() {
         let (_dir, path) = scratch();
         let mut writer = VectorWriter::open(&path, 3, &prov()).unwrap();

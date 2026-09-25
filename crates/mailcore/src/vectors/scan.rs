@@ -79,6 +79,19 @@ impl Vectors {
                 return Err(Error::Io { path, source: e });
             }
         };
+        // Vide : ce que laisse une passe tuée avant d'avoir écrit l'en-tête. L'écrivain le traite
+        // comme neuf ; la lecture fait de même — voir `summary_of`.
+        if file
+            .metadata()
+            .map_err(|e| Error::Io {
+                path: path.clone(),
+                source: e,
+            })?
+            .len()
+            == 0
+        {
+            return Ok(Self::empty(dim));
+        }
 
         let found = read_header(&mut file, &path)?;
         if found.dim != dim {

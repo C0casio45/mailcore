@@ -1996,3 +1996,159 @@ passe par le même `glow` que la principale. Et un défaut qui préexistait, tro
 `--store` explicite qui désigne un dossier déplacé **crée un store vide** au lieu de refuser, donc
 la coquille s'ouvre sur une boîte vide sans rien dire. À trancher à part : c'est une règle de
 démarrage partagée par toutes les coquilles.
+
+### 2026-09-25 — le critère 5 : où allaient les 1 304 Mio, et ce qu'il en reste
+
+**En clair d'abord.** Le transformeur demandait 1,3 Gio pour vectoriser, deux fois et demie le
+seuil. La réponse écrite le 2026-09-22 était « tailler le vocabulaire ». Elle était juste et elle
+ne suffisait pas : les 1,3 Gio se partageaient en quatre blocs de poids voisins, et le vocabulaire
+n'en touchait que deux. Le plus gros des deux autres était une **copie du tokeniseur faite à
+chaque lot** — un défaut d'écriture, pas un coût du modèle.
+
+#### L'instrument d'abord
+
+Le 1 304 du 2026-09-22 ne sortait d'aucun instrument du dépôt : `measure-vectors` ne savait
+charger que l'embedding statique, et sa « crête » était le plus grand de deux relevés ponctuels.
+Il prend maintenant `--bert`, `--limit`, et échantillonne la mémoire toutes les 20 ms pendant le
+chargement et pendant la passe. Trois défauts de l'instrument trouvés en le faisant :
+
+- **il comparait à 500 Mio**, là où le seuil qu'il citait — le critère 2 de la phase 2 — est de
+  500 Mo, 23 Mio de moins. Un seul endroit, `measure::RSS_LIMIT`, maintenant ;
+- **il recopiait tout le corpus à chaque exécution.** Le lien vers les blobs échouait, et le banc
+  l'attribuait à un privilège manquant. La vraie cause : `Store::open` crée un `blobs/` vide, et le
+  lien, fait après, tombait sur un nom occupé. Puis, une fois l'ordre corrigé, un lien vers un
+  chemin **relatif** menait nulle part — un lien symbolique range sa cible par rapport à son
+  propre répertoire. Le test passait des chemins absolus et ne pouvait voir ni l'un ni l'autre.
+  Une exécution coûtait plusieurs minutes de copie ; elle en coûte 15 secondes ;
+- **il refusait le corpus de mesure**, déjà vectorisé : « rien à vectoriser ». Les drapeaux sont
+  remis à zéro dans la copie.
+
+Et le premier relevé de l'étape 1 est parti sur **l'ancien binaire** : `cargo build … | tail -1 &&
+…` prend le code de sortie de `tail`, pas celui de `cargo`. La compilation n'a pas produit de
+binaire — des sources étaient modifiées pendant qu'elle tournait, c'est la cause la plus probable,
+et elle n'a pas été vérifiée. Vu à la date du binaire, antérieure à la fin de la référence ;
+arrêté, et relancé après une compilation au premier plan dont le code de sortie est lu.
+#### Ce que chaque étape a retiré
+
+Mille messages du corpus de mesure, trois exécutions dont la première est jetée, crête
+échantillonnée toutes les 20 ms, seuil de 500 Mo soit 476,8 Mio :
+
+| | chargement : crête | modèle chargé | passe : crête | débit |
+|---|---:|---:|---:|---:|
+| référence (2026-09-22) | 921–1 080 Mio | 711,5 Mio | 1 281–1 288 Mio | 4,08–4,34 msg/s |
+| sans copie du tokeniseur, poids lus en place | 684–712 | 711,5 | 1 026–1 038 | 4,43–4,61 |
+| vocabulaire taillé | 293–343 | 343 | 658 | 4,67–4,68 |
+| lots triés, huit longs textes | 332–343 | 343 | 517–525 | *faussé* |
+| **lots triés, quatre longs textes** | 331–343 | 343 | **451–456** | *faussé* |
+
+Chaque ligne a retiré ce qu'on attendait d'elle, et c'est la première fois dans cette phase qu'une
+prévision de mémoire se vérifie au mébioctet :
+
+- **la copie du tokeniseur** : −250 Mio de crête de passe. C'était la copie profonde faite à
+  chaque lot pour régler deux paramètres qui ne changent jamais — et, à chaque requête de
+  recherche, 249 Mio de plus et le temps de les copier ;
+- **les poids lus en place** : la crête de chargement tombe sur le modèle chargé. Les poids
+  n'existent plus deux fois, et le fichier n'est plus lu deux fois — l'empreinte se calcule sur
+  la même lecture. La crête de chargement de la référence variait de 921 à 1 080 Mio d'une
+  exécution à l'autre : le doublement durait si peu que l'échantillonneur le manquait une fois
+  sur deux. Mieux valait le supprimer que le mesurer mieux ;
+- **la taille** : −368 Mio de modèle, chargement de 0,76 à 0,24 s ;
+- **les lots triés** : −135 Mio à budget de huit longs textes, ce qui laissait la crête à 45 Mio
+  au-dessus du seuil ; d'où quatre.
+
+**La crête passe sous le seuil, à 451–456 Mio : 21 à 25 Mio de marge**, sur mille messages. Elle
+est bornée par construction — le pire lot est quatre textes à la longueur maximale, quel que soit
+le corpus —, mais une borne par construction se vérifie : la passe complète tourne au moment où
+j'écris, et c'est elle qui dira le critère.
+
+**Le débit, lui, n'est pas mesuré, et la colonne le dit.** Un jeu occupait sept cœurs pendant les
+deux dernières lignes, et trois `find` lancés par une autre session parcouraient le disque depuis
+10 h 47. La mémoire ne dépend pas de la charge ; le temps, si. Le signe qui disqualifie ces relevés
+n'est pas le débit — qu'on aurait pu croire dû au tri — mais **le chargement**, que le tri ne
+touche pas et qui était deux fois et demie plus lent (0,45 à 0,87 s contre 0,24). Les débits des
+deux premières lignes, cohérents entre eux, ont été pris sur une machine que rien ne garantissait
+au repos non plus : ils ne valent pas mesure du critère 3, qui se refera machine au repos.
+
+#### La taille, vérifiée sur le corpus et non sur les messages qui l'ont servie
+
+114 581 pièces gardées sur 250 002 : l'alphabet latin et ses extensions, la ponctuation, les
+chiffres, les monnaies, les symboles, les émoji — et ce que la normalisation fait de tout ça. La
+table passe de 448,8 à 250,4 Mio, le `tokenizer.json` de 16,3 à 3,9 Mio. Empreinte
+`410d6ae9bfe8f4aa`, qui ne dépend que du modèle source : deux machines qui taillent le même
+fichier obtiennent le même.
+
+`cargo xtask model-check-bert` sur les 73 658 messages, avec le texte exact que la passe compose :
+
+| | messages |
+|---|---:|
+| écrits dans les blocs gardés, mêmes pièces | 71 570 |
+| écrits dans les blocs gardés, pièces différentes | **0** |
+| une autre écriture, pièces différentes | 913 |
+| une autre écriture, mêmes pièces | 1 175 |
+
+Et sur un échantillon : **200 messages à pièces égales, 200 vecteurs identiques au bit près** ;
+200 messages à pièces changées, cosinus médian 0,997 avec le vecteur du modèle entier, minimal
+0,834. 9 196 pièces sur 13,26 millions deviennent `<unk>`, soit 0,069 %. Ce que la taille coûte
+est donc nommé : 913 messages, 1,2 % du corpus, en russe pour l'essentiel et en japonais pour le
+reste — le `・` de certaines lettres d'information.
+
+Le premier relevé de cette vérification s'est accusé lui-même, deux fois :
+
+- **« 0 pièce devenue `<unk>` »** à côté de 859 messages dont les pièces avaient changé : un
+  chiffre impossible. Le tokeniseur rend un caractère inconnu **sous sa forme d'origine**, avec
+  l'identifiant de `<unk>` ; compter la chaîne `<unk>` ne trouvait rien, et comparer par texte
+  rendait égaux un `Ж` inconnu et une pièce `Ж` connue. D'où l'unique message à pièces « égales »
+  dont le vecteur différait. Les pièces se comparent maintenant **par leur entrée de
+  vocabulaire** ;
+- **dix-neuf messages écrits dans les blocs gardés avaient perdu des pièces** : la propriété
+  annoncée était fausse. La vérification a nommé les caractères en cause par point de code, sans
+  rien imprimer du courrier : `U+3009` et `U+03BC`. Le tokeniseur **normalise** avant de découper,
+  et la normalisation fait sortir des caractères de leur bloc — le signe micro `µ` devient le `μ`
+  grec, le chevron technique `〉` celui de la ponctuation CJK. La règle garde maintenant aussi ce
+  que la normalisation du modèle produit à partir d'un caractère gardé, calculé depuis le fichier
+  source et non écrit à la main : 148 pièces de plus, et la case tombe à zéro.
+
+La leçon est celle de 2026-09-10, une fois de plus : **le premier relevé d'un banc neuf accuse le
+banc**. Et une seconde, propre à ce jour : une propriété « par construction » ne l'est que pour le
+modèle qu'on a en tête du système — ici, un tokeniseur qui découpait le texte tel qu'on l'écrit.
+
+#### Trois défauts du critère 9, trouvés en retirant une relecture
+
+La passe relisait le magasin **entier** — 108 Mio au format du transformeur — à chaque appel, pour
+savoir s'il était vide. En retirant cette relecture, qui coûtait de la mémoire et le temps d'une
+passe incrémentale, trois défauts sont apparus, tous du critère 9 :
+
+- **`mail vectors` annonçait « rien à faire » sur un magasin supprimé** tant qu'aucun message
+  n'arrivait : la divergence n'était vue que par la passe, et la passe n'était appelée que s'il y
+  avait du travail. Le nombre de records se lit dans la taille du fichier
+  (`mailcore::vectors::summary_of`), donc la question se pose maintenant dans `pass::pending`, au
+  même prix que les autres ;
+- **un magasin plus court que ses drapeaux passait inaperçu** — une copie ancienne remise en
+  place, un fichier tronqué. Ni vide ni absent. Chaque message marqué ayant au moins un record,
+  moins de records que de messages marqués **prouve** la contradiction, et la passe repart de
+  zéro ;
+- **un fichier vide bloquait tout, pour toujours**, y compris `mail vectors --rebuild` : c'est ce
+  que laisse une passe tuée entre la création du fichier et l'écriture de son en-tête, l'écrivain
+  le traitait comme neuf et les lecteurs le refusaient. Il est lu comme absent, partout ; et la
+  reconstruction ne demande plus d'abord ce qu'il y a à faire — elle lisait l'en-tête qu'elle
+  venait réparer.
+
+#### Ce qui reste
+
+- **la passe complète**, qui dira le critère 5 sur le corpus entier et produira le magasin du
+  modèle taillé. Elle tourne en priorité minimale : la machine sert en même temps ;
+- **le débit du critère 3**, machine au repos, et la comparaison des lots triés avec les lots
+  d'arrivée — le tri devrait gagner le remplissage et perdre une partie de l'amortissement sur les
+  longs textes, et rien ne dit lequel l'emporte ;
+- **le rappel du critère 1 avec le modèle taillé**. La taille est exacte pour 97 % du corpus et ne
+  peut donc déplacer que les requêtes dont la cible est dans les 913 messages touchés ; la mesure le
+  dira quand même, parce que c'est le genre de phrase qui se vérifie en une commande ;
+- **la ligne du critère 5 du tableau** disait que le rognage « ne coûte rien en rappel », sur la
+  foi d'un plancher de bruit que le 2026-09-23 a retiré. Elle sera réécrite avec la mesure.
+
+Vérification : `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 514 tests verts**, soit 35 de plus. Les tests de `bert.rs` sont les
+premiers de ce fichier : un transformeur minuscule — dimension 8, une couche — écrit par les tests
+et lu par le même `Bert::load` que le modèle livré. Deux contrôles inverses ont été vérifiés en
+réintroduisant le défaut : une table décalée d'une ligne fait tomber deux tests, une règle sans la
+normalisation en fait tomber un.
