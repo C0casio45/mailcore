@@ -54,10 +54,11 @@ pub struct Options {
     pub bert: bool,
     /// Arrêter la passe après ce nombre de messages.
     ///
-    /// La passe transformeur complète dure de trois à quatre heures ; une mesure de mémoire n'en
-    /// a pas besoin, parce que la crête d'un lot est bornée par la troncature et non par le
-    /// corpus. Le débit relevé sur une passe bornée, lui, ne vaut que pour les messages mesurés :
-    /// le banc le dit à côté du chiffre.
+    /// La passe transformeur complète dure de trois à quatre heures. Une passe bornée sert à
+    /// comparer deux réglages, **pas à trancher le critère 5** : l'encodage d'un lot est borné
+    /// par construction, mais la composition du texte dépend de la taille du message, et les
+    /// premiers messages du store ne sont pas les plus gros. Le banc le dit à côté de la crête —
+    /// il l'affirmait le contraire jusqu'à ce qu'une relecture le réfute, le 2026-09-25.
     pub limit: Option<u64>,
     /// Enchaîner le contrôle de reprise.
     pub resume: bool,
@@ -95,8 +96,14 @@ pub fn measure(options: &Options) -> Result<()> {
         );
     }
 
+    // `--keep` vérifié **avant** la passe : un chemin refusé au bout de quatre heures perdait la
+    // passe avec la copie jetable qui la portait.
+    if let Some(keep) = &options.keep {
+        check_keep(keep, &options.store)?;
+    }
+
     let rss_start = current_rss();
-    let work = tempfile::tempdir().context("répertoire jetable")?;
+    let work = work_dir().context("répertoire de travail")?;
     let root = Utf8PathBuf::from_path_buf(work.path().to_path_buf())
         .map_err(|p| anyhow::anyhow!("chemin non UTF-8 : {}", p.display()))?;
 
@@ -208,6 +215,81 @@ fn run<E: Encoder>(
     Ok(())
 }
 
+/// Où le banc travaille : un répertoire à lui, sous `target/measure-vectors/`, et non le
+/// répertoire temporaire du système.
+///
+/// ## Pourquoi un endroit connu
+///
+/// Une exécution interrompue — `Ctrl-C`, un processus tué — ne détruit rien : ni le lien vers les
+/// blobs du corpus, ni la copie de `index.sqlite`, qui porte les sujets et les adresses du courrier
+/// réel. Deux liens de ce genre ont été retrouvés dans `%TEMP%` le 2026-09-25, laissés par des
+/// mesures arrêtées ; un nettoyeur qui les aurait suivis aurait vidé le corpus. Dans un endroit
+/// connu, chaque exécution **balaie celles d'avant** en commençant : les liens d'abord, par
+/// [`unlink`], puis le reste.
+fn work_dir() -> Result<tempfile::TempDir> {
+    let base = std::path::absolute("target/measure-vectors").context("chemin de travail")?;
+    work_dir_in(&base)
+}
+
+/// [`work_dir`] sous une base donnée — pour que le balayage se teste ailleurs que sur les vraies
+/// exécutions.
+fn work_dir_in(base: &std::path::Path) -> Result<tempfile::TempDir> {
+    let base = base.to_path_buf();
+    std::fs::create_dir_all(&base).with_context(|| format!("création de {}", base.display()))?;
+    for entry in
+        std::fs::read_dir(&base).with_context(|| format!("lecture de {}", base.display()))?
+    {
+        let entry = entry?;
+        let Ok(dir) = Utf8PathBuf::from_path_buf(entry.path()) else {
+            continue;
+        };
+        if !dir.file_name().is_some_and(|name| name.starts_with("run-")) {
+            continue;
+        }
+        let blobs = dir.join("blobs");
+        if std::fs::symlink_metadata(blobs.as_std_path())
+            .is_ok_and(|meta| !meta.is_dir() || is_link(&blobs))
+        {
+            unlink(&blobs)
+                .with_context(|| format!("lien laissé par une exécution interrompue : {blobs}"))?;
+        }
+        println!("Exécution interrompue balayée : {dir}");
+        std::fs::remove_dir_all(dir.as_std_path()).with_context(|| format!("balayage de {dir}"))?;
+    }
+    tempfile::Builder::new()
+        .prefix("run-")
+        .tempdir_in(&base)
+        .context("répertoire jetable")
+}
+
+/// Vrai si `path` est un lien de répertoire ou une jonction, et non un vrai répertoire.
+fn is_link(path: &Utf8PathBuf) -> bool {
+    std::fs::read_link(path.as_std_path()).is_ok()
+}
+
+/// Refuse un `--keep` qui existe, dont le parent n'existe pas, ou qui tomberait dans le store.
+fn check_keep(keep: &Utf8PathBuf, store: &Utf8PathBuf) -> Result<()> {
+    anyhow::ensure!(
+        !keep.exists(),
+        "{keep} existe déjà : le banc n'écrase pas un magasin"
+    );
+    let parent = keep
+        .parent()
+        .filter(|p| !p.as_str().is_empty())
+        .map_or_else(|| Utf8PathBuf::from("."), Utf8PathBuf::from);
+    anyhow::ensure!(
+        parent.is_dir(),
+        "{parent} n'est pas un répertoire : --keep ne saurait où écrire"
+    );
+    let inside = std::path::absolute(parent.as_std_path())?
+        .starts_with(std::path::absolute(store.as_std_path())?);
+    anyhow::ensure!(
+        !inside,
+        "{keep} est dans le store mesuré, que le banc ne doit jamais écrire"
+    );
+    Ok(())
+}
+
 /// Recopie le magasin de vecteurs de la copie jetable vers `keep`, qui ne doit pas exister.
 fn keep_vectors(store: &Store, keep: &Utf8PathBuf) -> Result<()> {
     anyhow::ensure!(
@@ -241,10 +323,21 @@ fn bounded<T>(limit: Option<u64>, progress: &Progress, work: impl FnOnce() -> T)
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let result = work();
-        finished.store(true, Ordering::Relaxed);
-        result
+        // **Levé par un gardien**, pas après l'appel : une panique dans la passe sautait la ligne
+        // qui libère le surveillant, et `thread::scope` attend chaque fil avant de relancer la
+        // panique — le banc restait suspendu pour toujours, à zéro pour cent de processeur.
+        let _release = Release(&finished);
+        work()
     })
+}
+
+/// Lève le drapeau de fin en étant détruit, y compris pendant une panique.
+struct Release<'a>(&'a AtomicBool);
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Le contrôle du critère 3 : une passe coupée repart où elle en était.
@@ -363,6 +456,14 @@ fn report(r: &Reading) {
             "AU-DESSUS du seuil de 500 Mo"
         }
     );
+    if r.limited {
+        // Une passe bornée ne voit que les premiers messages du store, et la composition d'un
+        // message coûte selon sa taille : sa crête compare deux réglages, elle ne tranche pas.
+        println!(
+            "                  — sur {} messages seulement : pas un verdict du critère 5",
+            r.stats.vectorised + r.stats.missing_blobs
+        );
+    }
 }
 
 /// Copie `index.sqlite` du store vers la racine de travail.
@@ -456,6 +557,11 @@ fn link_blobs(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<Linked> {
 /// repli échouerait dessus.
 fn usable(made: bool, to: &Utf8PathBuf) -> bool {
     if !made {
+        // Une commande qui échoue peut avoir créé quelque chose avant d'échouer : un lien laissé
+        // occuperait le nom, et la copie de repli écrirait **à travers** lui.
+        if is_link(to) {
+            unlink(to).ok();
+        }
         return false;
     }
     if to.is_dir() {
@@ -482,8 +588,17 @@ fn unlink(path: &Utf8PathBuf) -> std::io::Result<()> {
 ///
 /// Un utilitaire du système et non un script : la bibliothèque standard ne sait pas créer de
 /// jonction, et la seule autre voie est un appel Win32 que `#![forbid(unsafe_code)]` exclut.
+///
+/// **Pas de caractère que `cmd` interpréterait.** Rust ne met entre guillemets qu'un argument qui
+/// porte une espace, et `cmd` lit `&`, `^`, `%` : un chemin `a&b\blobs` créait une jonction vers
+/// `a`, un tout autre répertoire, puis échouait — et la copie de repli y écrivait le corpus. Un tel
+/// chemin est refusé, et la copie prend le relais.
 #[cfg(windows)]
 fn junction(from: &Utf8PathBuf, to: &Utf8PathBuf) -> bool {
+    const INTERPRETED: &[char] = &['&', '|', '^', '%', '<', '>', '(', ')', '"', '!'];
+    if from.as_str().contains(INTERPRETED) || to.as_str().contains(INTERPRETED) {
+        return false;
+    }
     std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J", to.as_str(), from.as_str()])
         .stdout(std::process::Stdio::null())
@@ -493,8 +608,11 @@ fn junction(from: &Utf8PathBuf, to: &Utf8PathBuf) -> bool {
 }
 
 /// Copie récursive, pour le repli de [`link_blobs`].
+///
+/// `create_dir` et non `create_dir_all` : la copie refuse un répertoire qui existe déjà — un lien
+/// resté là la ferait écrire ailleurs que dans la copie.
 fn copy_tree(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
-    std::fs::create_dir_all(to.as_std_path()).with_context(|| format!("création de {to}"))?;
+    std::fs::create_dir(to.as_std_path()).with_context(|| format!("création de {to}"))?;
     for entry in
         std::fs::read_dir(from.as_std_path()).with_context(|| format!("lecture de {from}"))?
     {
@@ -600,5 +718,43 @@ mod dangling {
             std::fs::symlink_metadata(to.as_std_path()).is_err(),
             "le lien pendant occupe encore le nom"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod sweep {
+    use super::{link_blobs, work_dir_in};
+    use camino::Utf8PathBuf;
+
+    #[test]
+    fn an_interrupted_run_is_swept_without_touching_what_it_linked() {
+        // Ce qu'une exécution tuée laisse : son répertoire, une copie d'index, et un lien vers les
+        // blobs du corpus. Le balayage doit retirer le tout, et laisser la cible du lien intacte.
+        let originals = tempfile::tempdir().unwrap();
+        let blobs = Utf8PathBuf::from_path_buf(originals.path().join("blobs")).unwrap();
+        std::fs::create_dir_all(blobs.join("ab")).unwrap();
+        std::fs::write(blobs.join("ab").join("cdef"), b"un message").unwrap();
+
+        let base = tempfile::tempdir().unwrap();
+        let killed = Utf8PathBuf::from_path_buf(base.path().join("run-tue")).unwrap();
+        std::fs::create_dir_all(&killed).unwrap();
+        std::fs::write(killed.join("index.sqlite"), b"copie").unwrap();
+        let linked = link_blobs(&blobs, &killed.join("blobs")).unwrap();
+        assert!(linked.link, "le test veut un vrai lien");
+        // Tué : le gardien ne s'exécute pas.
+        std::mem::forget(linked);
+
+        let fresh = work_dir_in(base.path()).unwrap();
+        assert!(
+            !killed.exists(),
+            "l'exécution interrompue n'a pas été balayée"
+        );
+        assert_eq!(
+            std::fs::read(blobs.join("ab").join("cdef")).unwrap(),
+            b"un message",
+            "le balayage a atteint les originaux"
+        );
+        assert!(fresh.path().starts_with(base.path()));
     }
 }

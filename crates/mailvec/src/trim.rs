@@ -94,7 +94,13 @@ pub struct Report {
 ///
 /// La liste est **écrite**, bloc par bloc, plutôt que déduite d'une propriété Unicode : c'est ce
 /// qui décide de ce qu'un modèle sait lire, et elle doit pouvoir se relire. Ce qui manque ici est
-/// une écriture — grec, cyrillique, arabe, hébreu, écritures d'Asie —, jamais un symbole.
+/// une écriture — grec, cyrillique, arabe, hébreu, écritures d'Asie —, et avec elles les symboles
+/// qui n'existent qu'à l'intérieur de l'une d'elles : la ponctuation CJK, le `・` japonais.
+///
+/// La première version annonçait « jamais un symbole » et oubliait le caractère de remplacement
+/// `�` — fréquent dans le courrier mal décodé —, la ponctuation supplémentaire `⸺`, les formes
+/// verticales et compactes, les symboles hérités de l'informatique et les étiquettes des drapeaux
+/// régionaux. Une relecture l'a relevé le jour même ; ils y sont.
 const KEPT: &[(u32, u32)] = &[
     // Latin de base et Latin-1, Latin étendu A et B, alphabet phonétique, lettres modificatives,
     // diacritiques combinants.
@@ -108,15 +114,38 @@ const KEPT: &[(u32, u32)] = &[
     // opérateurs, symboles techniques, pavés et formes géométriques, symboles divers et
     // dingbats — y compris `▁`, le marqueur d'espace du tokeniseur (U+2581).
     (0x2000, 0x2BFF),
-    // Latin étendu C, D et E.
+    // Latin étendu C.
     (0x2C60, 0x2C7F),
+    // Ponctuation supplémentaire — `⸺`, `⸻`, `⸮`.
+    (0x2E00, 0x2E7F),
+    // Les quatre émoji rangés dans des blocs CJK : `〰`, `〽`, `㊗`, `㊙`.
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    // Latin étendu D et E.
     (0xA720, 0xA7FF),
     (0xAB30, 0xAB6F),
-    // Ligatures latines, sélecteurs de variante.
+    // Ligatures latines, sélecteurs de variante, formes verticales, demi-signes combinants, formes
+    // de compatibilité et petites formes de ponctuation.
     (0xFB00, 0xFB06),
-    (0xFE00, 0xFE0F),
-    // Émoji et symboles.
-    (0x1F000, 0x1FAFF),
+    (0xFE00, 0xFE6F),
+    // Caractères spéciaux, dont `�`, le caractère de remplacement.
+    (0xFFF0, 0xFFFF),
+    // Émoji et symboles, symboles hérités de l'informatique.
+    (0x1F000, 0x1FBFF),
+    // Étiquettes, qui composent les drapeaux régionaux.
+    (0xE0000, 0xE007F),
+];
+
+/// Les signes combinants gardés : ceux qu'un texte gardé peut placer après une lettre, et que la
+/// normalisation peut composer avec elle.
+const MARKS: &[(u32, u32)] = &[
+    (0x0300, 0x036F),
+    (0x1AB0, 0x1AFF),
+    (0x1DC0, 0x1DFF),
+    (0x20D0, 0x20FF),
+    (0xFE20, 0xFE2F),
 ];
 
 /// Vrai si un caractère appartient aux blocs que la taille garde.
@@ -133,8 +162,20 @@ pub fn is_kept(c: char) -> bool {
 /// caractère gardé.
 ///
 /// Chaque point de code des blocs est normalisé seul, par le normaliseur que le fichier déclare ;
-/// ce qui en sort et n'est pas gardé est rendu. Dix mille normalisations d'un caractère : le
-/// temps d'une installation, et une fois.
+/// ce qui en sort et n'est pas gardé est rendu.
+///
+/// ## Et chaque lettre suivie d'un signe combinant
+///
+/// La normalisation **compose** aussi : le signe ohm `Ω` des symboles lettrés suivi d'un accent
+/// aigu combinant — deux caractères gardés — devient `Ώ`, une lettre grecque qu'aucun caractère
+/// gardé ne produit seul. Une relecture l'a montré le 2026-09-25 sous NFC et NFKC : huit paires
+/// sous NFKC, treize sous NFC, et aucune sous le normaliseur de `e5`, qui ne compose pas. Les
+/// paires sont donc essayées aussi : chaque caractère gardé du plan de base, suivi de chaque signe
+/// de [`MARKS`] — trois millions de normalisations, quelques secondes, à l'installation.
+///
+/// Ce qui reste hors de portée, écrit pour ne pas le croire couvert : une composition qui
+/// demanderait **deux** signes à la suite pour sortir des blocs. Aucun n'est connu ; la
+/// vérification sur le corpus — `cargo xtask model-check-bert` — est ce qui le dirait.
 ///
 /// # Errors
 ///
@@ -151,16 +192,31 @@ fn images(
     let normalizer: tokenizers::normalizers::NormalizerWrapper =
         serde_json::from_value(normalizer.clone())
             .map_err(|e| format!("normaliseur illisible : {e}"))?;
-    for (first, last) in KEPT {
-        for code in *first..=*last {
-            let Some(c) = char::from_u32(code) else {
-                continue;
-            };
-            let mut text = tokenizers::NormalizedString::from(c.to_string().as_str());
-            normalizer
-                .normalize(&mut text)
-                .map_err(|e| format!("normalisation de U+{code:04X} : {e}"))?;
-            found.extend(text.get().chars().filter(|image| !is_kept(*image)));
+    let mut image = |text: &str| -> std::result::Result<(), String> {
+        let mut normalized = tokenizers::NormalizedString::from(text);
+        normalizer
+            .normalize(&mut normalized)
+            .map_err(|e| format!("normalisation de {text:?} : {e}"))?;
+        found.extend(normalized.get().chars().filter(|c| !is_kept(*c)));
+        Ok(())
+    };
+
+    let characters = |ranges: &'static [(u32, u32)]| {
+        ranges
+            .iter()
+            .flat_map(|(first, last)| *first..=*last)
+            .filter_map(char::from_u32)
+    };
+    let marks: Vec<char> = characters(MARKS).collect();
+    for base in characters(KEPT) {
+        let mut buffer = [0u8; 8];
+        image(base.encode_utf8(&mut buffer))?;
+        // Les paires, pour le plan de base seulement : un émoji ne se compose avec aucun accent.
+        if u32::from(base) <= 0xFFFF {
+            for mark in &marks {
+                let pair: String = [base, *mark].iter().collect();
+                image(&pair)?;
+            }
         }
     }
     Ok(found)
@@ -168,10 +224,19 @@ fn images(
 
 /// Taille un modèle transformeur de `source` vers `target`.
 ///
-/// `target` doit être vide de ces trois fichiers : une taille n'écrase jamais un modèle
-/// installé. Chaque fichier est écrit sous un nom provisoire puis renommé, et `config.json` en
-/// dernier : c'est lui que le chargement lit d'abord, donc un répertoire interrompu en cours de
-/// route est un modèle absent, jamais un modèle à moitié écrit.
+/// `target` doit être vide de ces trois fichiers : une taille n'écrase jamais un modèle installé.
+///
+/// ## Tout ou rien
+///
+/// **Tout ce qui peut être refusé l'est avant la première écriture** : le tokeniseur et la
+/// configuration sont réécrits en mémoire d'abord. Puis les trois fichiers sont écrits sous des
+/// noms provisoires, et renommés ensemble à la fin, `config.json` en dernier — c'est lui que le
+/// chargement lit d'abord, donc un répertoire interrompu est un modèle absent, jamais un modèle à
+/// moitié écrit. Un échec en route retire ce que l'appel avait écrit.
+///
+/// La première version lisait `config.json` **après** avoir mis les poids en place : une
+/// configuration illisible laissait un `model.safetensors` derrière elle, et la taille suivante
+/// refusait d'écraser « un modèle » qui n'en était pas un. Trouvé par une relecture le 2026-09-25.
 ///
 /// # Errors
 ///
@@ -190,43 +255,68 @@ pub fn trim(source: &Utf8Path, target: &Utf8Path) -> Result<Report> {
             ));
         }
     }
-    std::fs::create_dir_all(target.as_std_path())
-        .map_err(|e| model_error(target, format!("création du répertoire : {e}")))?;
 
     let tokenizer = std::fs::read_to_string(source.join("tokenizer.json").as_std_path())
         .map_err(|e| model_error(source, format!("tokenizer.json : {e}")))?;
-    let (tokenizer, kept, pieces, images) =
-        rewrite_tokenizer(&tokenizer).map_err(|reason| model_error(source, reason))?;
-
-    let (rows, digest) = rewrite_weights(
-        &source.join("model.safetensors"),
-        &target.join("model.safetensors"),
-        &kept,
-    )
-    .map_err(|reason| model_error(source, reason))?;
-
-    write_atomically(&target.join("tokenizer.json"), tokenizer.as_bytes())?;
-
+    let rewritten = rewrite_tokenizer(&tokenizer).map_err(|reason| model_error(source, reason))?;
     let config = std::fs::read_to_string(source.join("config.json").as_std_path())
         .map_err(|e| model_error(source, format!("config.json : {e}")))?;
     let config =
-        rewrite_config(&config, kept.len()).map_err(|reason| model_error(source, reason))?;
-    write_atomically(&target.join("config.json"), config.as_bytes())?;
+        rewrite_config(&config, &rewritten).map_err(|reason| model_error(source, reason))?;
+
+    std::fs::create_dir_all(target.as_std_path())
+        .map_err(|e| model_error(target, format!("création du répertoire : {e}")))?;
+    let mut staged = Staged::default();
+    let weights = target.join("model.safetensors");
+    let (rows, digest) = rewrite_weights(
+        &source.join("model.safetensors"),
+        &staged.partial(&weights),
+        &rewritten.kept,
+    )
+    .map_err(|reason| model_error(source, reason))?;
+    staged.write(&target.join("tokenizer.json"), rewritten.text.as_bytes())?;
+    staged.write(&target.join("config.json"), config.as_bytes())?;
+    staged.commit()?;
 
     Ok(Report {
-        pieces,
-        kept: kept.len(),
+        pieces: rewritten.pieces,
+        kept: rewritten.kept.len(),
         rows,
         digest,
-        images,
+        images: rewritten.images,
     })
 }
 
-/// Réécrit le tokeniseur. Rend le nouveau texte, les identifiants gardés dans l'ordre, et le
-/// nombre de pièces d'origine.
-fn rewrite_tokenizer(
-    text: &str,
-) -> std::result::Result<(String, Vec<usize>, usize, usize), String> {
+/// Ce que la réécriture du tokeniseur rend.
+struct Rewritten {
+    /// Le nouveau `tokenizer.json`.
+    text: String,
+    /// Les identifiants d'origine gardés, dans l'ordre : la *n*-ième pièce gardée est `kept[n]`.
+    kept: Vec<usize>,
+    /// L'identifiant nouveau de chaque identifiant d'origine, s'il est gardé.
+    map: Vec<Option<u64>>,
+    /// Les pièces du vocabulaire d'origine.
+    pieces: usize,
+    /// Les caractères gardés par normalisation.
+    images: usize,
+}
+
+impl Rewritten {
+    /// L'identifiant nouveau d'un identifiant d'origine, ou une phrase qui dit qu'il a été retiré.
+    fn remap(&self, old: u64) -> std::result::Result<u64, String> {
+        remap_in(&self.map, old)
+    }
+}
+
+fn remap_in(map: &[Option<u64>], old: u64) -> std::result::Result<u64, String> {
+    usize::try_from(old)
+        .ok()
+        .and_then(|old| map.get(old).copied().flatten())
+        .ok_or_else(|| format!("identifiant {old} sans pièce gardée"))
+}
+
+/// Réécrit le tokeniseur, en mémoire.
+fn rewrite_tokenizer(text: &str) -> std::result::Result<Rewritten, String> {
     let mut root: Value =
         serde_json::from_str(text).map_err(|e| format!("tokenizer.json illisible : {e}"))?;
 
@@ -294,12 +384,7 @@ fn rewrite_tokenizer(
             *slot = Some(new as u64);
         }
     }
-    let remap = |old: u64| -> std::result::Result<u64, String> {
-        usize::try_from(old)
-            .ok()
-            .and_then(|old| map.get(old).copied().flatten())
-            .ok_or_else(|| format!("identifiant {old} sans pièce gardée"))
-    };
+    let remap = |old: u64| remap_in(&map, old);
 
     let new_vocab: Vec<Value> = kept
         .iter()
@@ -336,8 +421,15 @@ fn rewrite_tokenizer(
         padding.insert("pad_id".to_owned(), Value::from(remap(id)?));
     }
 
-    let text = serde_json::to_string(&root).map_err(|e| format!("écriture du tokeniseur : {e}"))?;
-    Ok((text, kept, pieces, images.len()))
+    let text = serde_json::to_string(&canonical(root))
+        .map_err(|e| format!("écriture du tokeniseur : {e}"))?;
+    Ok(Rewritten {
+        text,
+        kept,
+        map,
+        pieces,
+        images: images.len(),
+    })
 }
 
 /// Réécrit les identifiants que le post-traitement porte en dur.
@@ -376,15 +468,54 @@ fn remap_processor(
     Ok(())
 }
 
-/// Réécrit `config.json` avec la nouvelle taille de vocabulaire.
-fn rewrite_config(text: &str, vocab: usize) -> std::result::Result<String, String> {
+/// Les champs de `config.json` qui portent un identifiant de pièce.
+///
+/// `pad_token_id` est celui que [`crate::bert::Bert`] lit pour remplir un lot : un identifiant
+/// resté ancien après la taille désignerait une autre pièce, ou une ligne hors de la table — et
+/// chaque lot de longueurs mêlées échouerait.
+const CONFIG_IDS: [&str; 3] = ["pad_token_id", "bos_token_id", "eos_token_id"];
+
+/// Réécrit `config.json`, en mémoire : la taille du vocabulaire, et les identifiants qu'il porte.
+fn rewrite_config(text: &str, rewritten: &Rewritten) -> std::result::Result<String, String> {
     let mut config: Value =
         serde_json::from_str(text).map_err(|e| format!("config.json illisible : {e}"))?;
     let object = config
         .as_object_mut()
         .ok_or_else(|| "config.json n'est pas un objet".to_owned())?;
-    object.insert("vocab_size".to_owned(), Value::from(vocab));
-    serde_json::to_string_pretty(&config).map_err(|e| format!("écriture de config.json : {e}"))
+    object.insert("vocab_size".to_owned(), Value::from(rewritten.kept.len()));
+    for key in CONFIG_IDS {
+        if let Some(old) = object.get(key).and_then(Value::as_u64) {
+            let new = rewritten
+                .remap(old)
+                .map_err(|_| format!("config.json : {key} désigne la pièce {old}, retirée"))?;
+            object.insert(key.to_owned(), Value::from(new));
+        }
+    }
+    serde_json::to_string_pretty(&canonical(config))
+        .map_err(|e| format!("écriture de config.json : {e}"))
+}
+
+/// Une valeur JSON dont chaque objet a ses clés **dans l'ordre**.
+///
+/// L'empreinte du modèle taillé est une constante — c'est ce qui permet de la vérifier. Elle
+/// dépendait pourtant d'un détail de compilation : `serde_json` range les clés dans l'ordre sans la
+/// fonction `preserve_order`, dans l'ordre d'insertion avec. Qu'un autre membre de l'espace de
+/// travail l'active, et le même fichier source aurait donné une autre empreinte. Ranger les clés
+/// soi-même donne le même texte dans les deux cas.
+fn canonical(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut sorted = serde_json::Map::new();
+            for (key, value) in entries {
+                sorted.insert(key, canonical(value));
+            }
+            Value::Object(sorted)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical).collect()),
+        other => other,
+    }
 }
 
 /// Un écrivain qui hache ce qu'il écrit.
@@ -407,14 +538,21 @@ impl<W: Write> Write for Hashing<W> {
     }
 }
 
-/// Réécrit les poids : la table réduite aux lignes gardées, le reste recopié à l'octet.
+/// Réécrit les poids dans `partial` : la table réduite aux lignes gardées, le reste recopié à
+/// l'octet. Rend le nombre de lignes d'origine et l'empreinte de ce qui a été écrit.
 ///
 /// **Par morceaux**, jamais en entier : une installation n'a pas de raison de coûter 470 Mo de
-/// mémoire quand quelques mébioctets suffisent. Rend le nombre de lignes d'origine et
-/// l'empreinte de ce qui a été écrit.
+/// mémoire quand quelques mébioctets suffisent.
+///
+/// ## En avançant, sans revenir en arrière
+///
+/// La table se lit **dans l'ordre** : les identifiants gardés croissent, donc on saute les lignes
+/// retirées vers l'avant et on lit les autres au passage. La première version se replaçait avant
+/// chaque ligne gardée, et un repositionnement vide le tampon de lecture : cent quatorze mille
+/// relectures d'un mébioctet pour écrire cent soixante-huit mébioctets de lignes.
 fn rewrite_weights(
     source: &Utf8Path,
-    target: &Utf8Path,
+    partial: &Utf8Path,
     kept: &[usize],
 ) -> std::result::Result<(usize, String), String> {
     let file = std::fs::File::open(source.as_std_path()).map_err(|e| format!("poids : {e}"))?;
@@ -439,7 +577,15 @@ fn rewrite_weights(
             "la pièce {beyond} n'a pas de ligne dans une table de {rows}"
         ));
     }
-    let row_bytes = hidden as u64 * table.kind.width();
+    if kept.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("les pièces gardées ne sont pas dans l'ordre".to_owned());
+    }
+    let row_bytes = (hidden as u64)
+        .checked_mul(table.kind.width())
+        .ok_or_else(|| format!("une ligne de {EMBEDDINGS} déborde"))?;
+    let kept_bytes = (kept.len() as u64)
+        .checked_mul(row_bytes)
+        .ok_or_else(|| format!("{EMBEDDINGS} taillée déborde"))?;
 
     // L'en-tête d'arrivée, dans l'ordre des noms : un fichier qui ne dépend que de sa source,
     // octet pour octet, donc une empreinte qu'on peut écrire d'avance.
@@ -452,7 +598,7 @@ fn rewrite_weights(
     let mut offset = 0u64;
     for entry in &entries {
         let (shape, bytes) = if entry.name == EMBEDDINGS {
-            (vec![kept.len(), hidden], kept.len() as u64 * row_bytes)
+            (vec![kept.len(), hidden], kept_bytes)
         } else {
             (entry.shape.clone(), entry.end - entry.begin)
         };
@@ -466,14 +612,13 @@ fn rewrite_weights(
         );
         offset += bytes;
     }
-    let mut header =
-        serde_json::to_string(&Value::Object(header)).map_err(|e| format!("en-tête : {e}"))?;
+    let mut header = serde_json::to_string(&canonical(Value::Object(header)))
+        .map_err(|e| format!("en-tête : {e}"))?;
     // Aligné sur huit octets, comme le fait l'écrivain de référence du format.
     while header.len() % 8 != 0 {
         header.push(' ');
     }
 
-    let partial = partial_of(target);
     let out = std::fs::File::create(partial.as_std_path())
         .map_err(|e| format!("création de {partial} : {e}"))?;
     let mut writer = Hashing {
@@ -489,23 +634,29 @@ fn rewrite_weights(
     let mut buffer = vec![0u8; 1 << 20];
     for entry in &entries {
         let start = layout.data_start + entry.begin;
+        reader
+            .seek(SeekFrom::Start(start))
+            .map_err(|e| format!("lecture de {} : {e}", entry.name))?;
         if entry.name == EMBEDDINGS {
             let row = buffer
                 .get_mut(..usize::try_from(row_bytes).map_err(|e| e.to_string())?)
                 .ok_or_else(|| "ligne plus longue que le tampon".to_owned())?;
+            let mut next = 0usize;
             for id in kept {
+                // Vers l'avant, dans le tampon quand c'est possible : `seek_relative` ne le vide
+                // pas si la cible y tient.
+                let gap = i64::try_from((*id - next) as u64 * row_bytes)
+                    .map_err(|e| format!("saut dans la table : {e}"))?;
                 reader
-                    .seek(SeekFrom::Start(start + *id as u64 * row_bytes))
+                    .seek_relative(gap)
                     .map_err(|e| format!("lecture de la table : {e}"))?;
                 reader
                     .read_exact(row)
                     .map_err(|e| format!("lecture de la table : {e}"))?;
                 writer.write_all(row).map_err(io)?;
+                next = id + 1;
             }
         } else {
-            reader
-                .seek(SeekFrom::Start(start))
-                .map_err(|e| format!("lecture de {} : {e}", entry.name))?;
             let mut remaining = entry.end - entry.begin;
             while remaining > 0 {
                 let take =
@@ -529,30 +680,68 @@ fn rewrite_weights(
         .into_inner()
         .map_err(|e| format!("écriture des poids : {}", e.error()))?;
     file.sync_all().map_err(io)?;
-    drop(file);
-    std::fs::rename(partial.as_std_path(), target.as_std_path())
-        .map_err(|e| format!("renommage de {partial} : {e}"))?;
     Ok((rows, digest))
 }
 
-/// Le nom provisoire d'un fichier en cours d'écriture.
-fn partial_of(path: &Utf8Path) -> Utf8PathBuf {
-    let mut name = path.file_name().unwrap_or("fichier").to_owned();
-    name.push_str(".partial");
-    path.with_file_name(name)
+/// Les fichiers qu'une taille écrit, sous leurs noms provisoires, jusqu'à ce qu'elle réussisse.
+///
+/// Détruit sans avoir été validé, il retire tout ce qu'il a écrit — provisoires et fichiers déjà
+/// renommés : un échec ne laisse rien qui ressemble à un modèle, ni qui empêche la taille suivante.
+#[derive(Default)]
+struct Staged {
+    /// `(provisoire, définitif)`, dans l'ordre où ils seront renommés.
+    files: Vec<(Utf8PathBuf, Utf8PathBuf)>,
+    /// Combien ont déjà été renommés.
+    renamed: usize,
+    committed: bool,
 }
 
-/// Écrit un fichier sous un nom provisoire, puis le renomme.
-fn write_atomically(path: &Utf8Path, bytes: &[u8]) -> Result<()> {
-    let partial = partial_of(path);
-    let mut file = std::fs::File::create(partial.as_std_path())
-        .map_err(|e| model_error(path, format!("création : {e}")))?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| model_error(path, format!("écriture : {e}")))?;
-    drop(file);
-    std::fs::rename(partial.as_std_path(), path.as_std_path())
-        .map_err(|e| model_error(path, format!("renommage : {e}")))
+impl Staged {
+    /// Réserve un nom provisoire pour `path`.
+    fn partial(&mut self, path: &Utf8Path) -> Utf8PathBuf {
+        let mut name = path.file_name().unwrap_or("fichier").to_owned();
+        name.push_str(".partial");
+        let partial = path.with_file_name(name);
+        self.files.push((partial.clone(), path.to_owned()));
+        partial
+    }
+
+    /// Écrit `bytes` sous un nom provisoire pour `path`.
+    fn write(&mut self, path: &Utf8Path, bytes: &[u8]) -> Result<()> {
+        let partial = self.partial(path);
+        let mut file = std::fs::File::create(partial.as_std_path())
+            .map_err(|e| model_error(path, format!("création : {e}")))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| model_error(path, format!("écriture : {e}")))
+    }
+
+    /// Renomme tout, dans l'ordre.
+    fn commit(&mut self) -> Result<()> {
+        for (partial, path) in &self.files {
+            std::fs::rename(partial.as_std_path(), path.as_std_path())
+                .map_err(|e| model_error(path, format!("renommage : {e}")))?;
+            self.renamed += 1;
+        }
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (index, (partial, path)) in self.files.iter().enumerate() {
+            let written = if index < self.renamed { path } else { partial };
+            if written.exists()
+                && let Err(error) = std::fs::remove_file(written.as_std_path())
+            {
+                tracing::warn!(%written, %error, "fichier d'une taille échouée non retiré");
+            }
+        }
+    }
 }
 
 fn model_error(path: &Utf8Path, reason: String) -> Error {
@@ -670,7 +859,14 @@ mod tests {
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
         let mut pieces = TINY_PIECES.to_vec();
         let mask = pieces.pop().unwrap();
-        pieces.extend([("μ", -6.0), ("▁μg", -3.0), ("g", -6.0), ("Ж", -7.0)]);
+        pieces.extend([
+            ("μ", -6.0),
+            ("▁μg", -3.0),
+            ("g", -6.0),
+            ("Ж", -7.0),
+            ("▁Ώ", -4.0),
+            ("Ώ", -6.0),
+        ]);
         pieces.push(mask);
         crate::testing::tiny_bert_with(
             &root.join("full"),
@@ -693,14 +889,25 @@ mod tests {
         // Et le texte tel qu'on le tape, signe micro compris, rend le même vecteur.
         let full = Bert::load(root.join("full")).unwrap();
         let trimmed = Bert::load(root.join("trimmed")).unwrap();
-        let texts = vec!["5 µg".to_owned()];
-        assert_eq!(
-            full.tokens(&texts[0], Role::Passage).unwrap(),
-            trimmed.tokens(&texts[0], Role::Passage).unwrap()
-        );
-        assert_eq!(
-            full.encode_as(&texts, Role::Passage).unwrap(),
-            trimmed.encode_as(&texts, Role::Passage).unwrap()
+        // Le signe ohm suivi d'un accent combinant — deux caractères gardés — se compose en `Ώ`,
+        // que la normalisation d'un caractère seul ne produit pas.
+        for text in ["5 µg", "\u{2126}\u{301}"] {
+            let texts = vec![text.to_owned()];
+            assert!(text.chars().all(is_kept), "{text:?}");
+            assert_eq!(
+                full.tokens(text, Role::Passage).unwrap(),
+                trimmed.tokens(text, Role::Passage).unwrap(),
+                "{text:?}"
+            );
+            assert_eq!(
+                full.encode_as(&texts, Role::Passage).unwrap(),
+                trimmed.encode_as(&texts, Role::Passage).unwrap(),
+                "{text:?}"
+            );
+        }
+        assert!(
+            small.contains(&"Ώ".to_owned()),
+            "la composition a été oubliée"
         );
     }
 
@@ -815,6 +1022,66 @@ mod tests {
             std::fs::read(models.trimmed.join("model.safetensors").as_std_path()).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn a_trim_that_fails_leaves_nothing_behind_and_can_be_retried() {
+        // Le défaut que la relecture du 2026-09-25 a reproduit : une configuration illisible,
+        // lue après la mise en place des poids, laissait un `model.safetensors` — et la taille
+        // suivante refusait d'écraser « un modèle ».
+        let (models, _) = trimmed();
+        let config = models.full.join("config.json");
+        let original = std::fs::read(config.as_std_path()).unwrap();
+        std::fs::write(config.as_std_path(), "[]").unwrap();
+
+        let target = models.full.parent().unwrap().join("retried");
+        assert!(trim(&models.full, &target).is_err());
+        let left: Vec<String> = std::fs::read_dir(target.as_std_path())
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(left.is_empty(), "une taille échouée a laissé {left:?}");
+
+        std::fs::write(config.as_std_path(), original).unwrap();
+        trim(&models.full, &target).unwrap();
+    }
+
+    #[test]
+    fn the_padding_id_of_the_configuration_follows_its_piece() {
+        let (models, _) = trimmed();
+        let config = models.full.join("config.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config.as_std_path()).unwrap()).unwrap();
+        let full_vocab = vocabulary(&models.full);
+
+        // Une pièce qui change d'identifiant avec la taille : `😀`, après le russe retiré.
+        let emoji = full_vocab.iter().position(|piece| piece == "😀").unwrap();
+        value["pad_token_id"] = serde_json::json!(emoji);
+        std::fs::write(config.as_std_path(), value.to_string()).unwrap();
+        let target = models.full.parent().unwrap().join("padded");
+        trim(&models.full, &target).unwrap();
+        let written: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(target.join("config.json").as_std_path()).unwrap(),
+        )
+        .unwrap();
+        let new = usize::try_from(written["pad_token_id"].as_u64().unwrap()).unwrap();
+        assert_eq!(vocabulary(&target)[new], "😀");
+        assert_ne!(
+            new, emoji,
+            "l'identifiant aurait dû bouger — le test ne prouve rien"
+        );
+
+        // Et une pièce retirée ne peut pas servir de remplissage : refusé, rien d'écrit.
+        let russian = full_vocab.iter().position(|piece| piece == "ква").unwrap();
+        value["pad_token_id"] = serde_json::json!(russian);
+        std::fs::write(config.as_std_path(), value.to_string()).unwrap();
+        let refused = models.full.parent().unwrap().join("refused-pad");
+        let error = trim(&models.full, &refused).unwrap_err().to_string();
+        assert!(error.contains("pad_token_id"), "{error}");
+        assert!(!refused.join("model.safetensors").exists());
     }
 
     #[test]

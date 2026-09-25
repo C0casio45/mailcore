@@ -196,7 +196,9 @@ pub(crate) fn read_layout<R: Read>(reader: &mut R, length: u64) -> Result<Layout
 
     // Dans l'ordre du fichier : c'est ce qui permet de tout lire d'une traite, donc de hacher en
     // passant, et de refuser deux tenseurs qui se chevauchent.
-    entries.sort_by_key(|entry| entry.begin);
+    // Par début, puis par fin : un tenseur vide qui partage son décalage avec un voisin passe
+    // **avant** lui, sans quoi il semblerait commencer au milieu de ce voisin.
+    entries.sort_by_key(|entry| (entry.begin, entry.end));
     let mut position = 0u64;
     for entry in &entries {
         if entry.begin < position {
@@ -289,6 +291,15 @@ fn parse_entry(
 
     // La forme doit décrire **exactement** les octets annoncés. C'est ce qui borne l'allocation :
     // un tenseur ne peut pas demander plus que ce que le fichier contient.
+    // Le produit des dimensions **non nulles** doit tenir, lui aussi : `candle` calcule les pas du
+    // tenseur en multipliant les dimensions depuis la droite, zéros compris, et une forme
+    // `[0, 2^40, 2^40]` — zéro élément, donc zéro octet, donc acceptée par le contrôle qui suit —
+    // y débordait. Trouvé par une relecture le 2026-09-25 : une panique en profil de débogage.
+    shape
+        .iter()
+        .filter(|dim| **dim != 0)
+        .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+        .ok_or_else(|| format!("la forme du tenseur {name} déborde"))?;
     let elements = shape
         .iter()
         .try_fold(1u64, |acc, dim| acc.checked_mul(*dim as u64))
@@ -595,6 +606,34 @@ mod tests {
             let error = refused(header, data);
             assert!(error.contains(expected), "{header} → {error}");
         }
+    }
+
+    #[test]
+    fn a_shape_with_a_zero_does_not_hide_an_overflow() {
+        // Zéro élément, donc zéro octet — et des pas qui débordent dans `candle`.
+        let error = refused(
+            r#"{"a":{"dtype":"F32","shape":[0,1099511627776,1099511627776],"data_offsets":[0,0]}}"#,
+            &[],
+        );
+        assert!(error.contains("déborde"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_tensor_beside_its_neighbour_is_valid() {
+        // Ce que `candle` écrit lui-même : `z` vide, au même décalage que le début de `a`.
+        let (_guard, root) = dir();
+        let path = root.join("model.safetensors");
+        raw(
+            &path,
+            r#"{"p":{"dtype":"I64","shape":[1],"data_offsets":[0,8]},"z":{"dtype":"I64","shape":[1,0],"data_offsets":[8,8]},"a":{"dtype":"F32","shape":[2],"data_offsets":[8,16]}}"#,
+            &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 63, 0, 0, 0, 64],
+        );
+        let loaded = load(&path, &Device::Cpu).unwrap();
+        assert_eq!(loaded.tensors.len(), 3);
+        assert_eq!(
+            loaded.tensors["a"].to_vec1::<f32>().unwrap(),
+            vec![1.0, 2.0]
+        );
     }
 
     #[test]

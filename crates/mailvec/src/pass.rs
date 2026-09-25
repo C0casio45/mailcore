@@ -387,19 +387,21 @@ impl Pending {
 ///
 /// [`Error::Core`] si le store ou l'en-tête du magasin est illisible.
 pub fn pending(store: &Store, budget: crate::text::Budget) -> Result<Pending> {
+    // **Les comptes d'abord, dans un même instantané, et la taille du fichier ensuite.** Deux
+    // `COUNT` séparés laissaient une moisson s'intercaler et fabriquer une divergence — voir
+    // `Store::vector_counts`. Et dans cet ordre, la taille lue est toujours au moins celle qui
+    // correspondait aux drapeaux comptés : pendant une passe, les records ne font que croître, et
+    // un drapeau n'est posé qu'après que son record est durable.
+    let counts = store.vector_counts()?;
     let summary = mailcore::vectors::summary_of(&store.vectors_path())?;
-    let unvectorised = store.unvectorised_total()?;
-    // Les messages marqués, par différence : le `COUNT` des non-vectorisés est servi par l'index
-    // partiel de `SCHEMA_V14`, celui des vectorisés ne l'est pas.
-    let marked = store.message_count()?.saturating_sub(unvectorised);
     let records = summary.as_ref().map_or(0, |summary| summary.records);
     Ok(Pending {
-        messages: unvectorised,
+        messages: counts.unvectorised,
         stale: summary
             .as_ref()
             .and_then(|summary| summary.provenance.as_ref())
             .is_some_and(|found| stale_against(found, budget)),
-        diverged: records < marked,
+        diverged: records < counts.marked(),
     })
 }
 
@@ -509,11 +511,25 @@ fn compose_with(
     parser: &mail_parser::MessageParser,
     budget: crate::text::Budget,
 ) -> Result<Composed> {
-    let raw = match store.blobs().read(row.blob) {
-        Ok(bytes) => bytes,
+    // Les premiers [`crate::text::MESSAGE_CAP`] octets, lus en flux : `mail-parser` décode tout ce
+    // qu'on lui donne, et un message de 124 Mio coûtait 209 Mio le temps de sa lecture.
+    let mut reader = match store.blobs().open(row.blob) {
+        Ok(reader) => reader,
         Err(mailcore::Error::BlobNotFound(_)) => return Ok(Composed::Missing),
         Err(other) => return Err(other.into()),
     };
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut reader, crate::text::MESSAGE_CAP),
+        &mut raw,
+    )
+    .map_err(|source| {
+        // Le chemin du blob n'est pas exposé par le trait ; son empreinte le désigne.
+        Error::Core(mailcore::Error::Io {
+            path: camino::Utf8PathBuf::from(format!("blob {}", row.blob)),
+            source,
+        })
+    })?;
     Ok(Composed::Text(match parser.parse(&raw) {
         Some(parsed) => {
             crate::text::from_message(&parsed, &row.subject, row.from_name.as_deref(), budget)
@@ -852,6 +868,106 @@ mod tests {
         let fake = Fake::new(8);
         let done = update_with(&store, &fake, budget(), &Progress::new()).unwrap();
         assert_eq!(done.vectorised, 2);
+    }
+
+    /// Un message plus long que la borne de lecture arrive **tronqué** à `mail-parser` : c'est une
+    /// entrée malformée, et le corps, qui la précède, doit en sortir intact.
+    #[test]
+    fn a_message_cut_at_the_reading_cap_still_gives_its_body() {
+        let (_dir, store) = corpus(0);
+        let attachment = "QUFB".repeat(usize::try_from(crate::text::MESSAGE_CAP).unwrap() / 3);
+        let raw = format!(
+            "From: Plomberie <devis@exemple.invalid>\r\n\
+             Subject: devis\r\n\
+             Content-Type: multipart/mixed; boundary=\"b\"\r\n\
+             \r\n\
+             --b\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             \r\n\
+             Voici le devis pour la chaudiere.\r\n\
+             --b\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Transfer-Encoding: base64\r\n\
+             \r\n\
+             {attachment}\r\n\
+             --b--\r\n"
+        );
+        assert!(raw.len() as u64 > crate::text::MESSAGE_CAP);
+        let blob = store.blobs().put(raw.as_bytes()).unwrap().hash;
+        let row = mailcore::store::read::VectorRow {
+            id: mailcore::MessageId(1),
+            blob,
+            subject: "devis".to_owned(),
+            from_name: None,
+        };
+        match compose(&store, &row, budget()).unwrap() {
+            Composed::Text(text) => assert!(text.contains("chaudiere"), "{text}"),
+            Composed::Missing => panic!("le blob est là"),
+        }
+    }
+
+    /// Le défaut que la relecture du 2026-09-25 a trouvé dans le contrôle ajouté le matin même :
+    /// deux `COUNT` pris dans deux instantanés, et une moisson qui valide entre les deux fabrique
+    /// une divergence — donc l'effacement d'un magasin sain et une passe complète de quatre
+    /// heures. Elle en avait provoqué 112 sur 23 198 appels en quatre secondes.
+    #[test]
+    fn a_harvest_committing_during_the_question_is_not_a_divergence() {
+        use mailcore::store::write::NewMessage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (dir, store) = corpus(20);
+        let fake = Fake::new(8);
+        update_with(&store, &fake, budget(), &Progress::new()).unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+
+        let stop = AtomicBool::new(false);
+        let (diverged, calls, inserted) = std::thread::scope(|scope| {
+            let harvest = scope.spawn(|| {
+                // Une seconde connexion, comme une moisson du démon pendant `mail vectors`.
+                let other = Store::open(&root).unwrap();
+                let mut inserted = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let raw = format!("Subject: arrivée {inserted}\r\n\r\ncorps {inserted}\r\n");
+                    let blob = other.blobs().put(raw.as_bytes()).unwrap().hash;
+                    let writer = other.writer().unwrap();
+                    writer
+                        .insert_message(&NewMessage {
+                            blob,
+                            rfc822_id: None,
+                            date: 1_800_000_000,
+                            from_addr: "e@exemple.invalid",
+                            from_name: None,
+                            subject: "arrivée",
+                            size: raw.len() as u64,
+                            has_attachments: false,
+                        })
+                        .unwrap();
+                    writer.commit().unwrap();
+                    inserted += 1;
+                }
+                inserted
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+            let (mut diverged, mut calls) = (0u64, 0u64);
+            while std::time::Instant::now() < deadline {
+                if pending(&store, budget()).unwrap().diverged {
+                    diverged += 1;
+                }
+                calls += 1;
+            }
+            stop.store(true, Ordering::Relaxed);
+            (diverged, calls, harvest.join().unwrap())
+        });
+
+        // Le contrôle positif : la moisson a bien tourné pendant la question.
+        assert!(
+            inserted > 10,
+            "{inserted} messages insérés : la course n'a pas eu lieu"
+        );
+        assert_eq!(
+            diverged, 0,
+            "{diverged} fausses divergences sur {calls} appels"
+        );
     }
 
     /// Le contrôle inverse : un magasin complet, et même un magasin qui porte **plus** de records

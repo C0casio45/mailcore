@@ -75,7 +75,32 @@ pub const BUDGET: usize = 2_000;
 /// |---|---|
 /// | 1 | sujet, expéditeur, corps sans citation (2026-09-21) |
 /// | 2 | le texte des pièces jointes s'y ajoute, avant le corps (2026-09-23) |
-pub const REVISION: u32 = 2;
+/// | 3 | le message lu est borné à [`MESSAGE_CAP`], la source du corps à [`BODY_SOURCE_CAP`] (2026-09-25) |
+pub const REVISION: u32 = 3;
+
+/// Ce qu'on lit d'un message pour en composer le texte : ses seize premiers mébioctets.
+///
+/// ## Pourquoi la composition a besoin d'une borne
+///
+/// Trouvé par une relecture contradictoire du 2026-09-25, et mesuré par elle : `mail-parser`
+/// décode **toutes** les parties d'un message avant qu'on en lise une, et la sanitisation du corps
+/// coûte une vingtaine de fois sa taille avant que le budget ne la tronque. Un message de 124 Mio
+/// ajoutait 209 Mio à la passe le temps d'être lu ; un corps HTML de 9,5 Mio, 217 Mio. Le critère 5
+/// laissait 130 Mio de marge au-dessus du modèle chargé : un seul de ces messages suffisait, et le
+/// relevé de la veille, sur les mille premiers messages, ne pouvait pas le voir.
+///
+/// Le texte d'un message tient dans ses premiers mébioctets — l'en-tête, puis le corps, puis les
+/// pièces jointes, qui sont ce que la borne coupe. Au-delà, ce qu'on perd est le texte d'une pièce
+/// jointe tardive, qui était déjà plafonné.
+pub const MESSAGE_CAP: u64 = 16 * 1024 * 1024;
+
+/// Ce qu'on donne de la source du corps à la sanitisation : un mébioctet.
+///
+/// Le budget du corps est de deux mille caractères ; une source d'un mébioctet en porte, sauf
+/// accident, des centaines de fois plus. La borne ne change donc le texte que d'un message dont
+/// les deux mille premiers caractères visibles viendraient après le premier mébioctet de sa
+/// source — une feuille de style ou une image en ligne d'un mébioctet en tête de corps.
+pub const BODY_SOURCE_CAP: usize = 1024 * 1024;
 
 /// Ce qu'on garde d'un message, et jusqu'où.
 ///
@@ -184,13 +209,19 @@ pub fn from_message(
     from_name: Option<&str>,
     budget: Budget,
 ) -> String {
+    // La source du corps, bornée **avant** d'être convertie ou sanitisée : c'est la conversion et
+    // la sanitisation qui coûtent, pas la chaîne. Voir [`BODY_SOURCE_CAP`].
     let mut html = String::new();
     for id in &parsed.html_body {
+        let room = BODY_SOURCE_CAP.saturating_sub(html.len());
+        if room == 0 {
+            break;
+        }
         match parsed.part(*id).map(|part| &part.body) {
             Some(mail_parser::PartType::Text(text)) => {
-                html.push_str(&mailhtml::plain::to_html(text));
+                html.push_str(&mailhtml::plain::to_html(prefix(text, room)));
             }
-            Some(mail_parser::PartType::Html(part)) => html.push_str(part),
+            Some(mail_parser::PartType::Html(part)) => html.push_str(prefix(part, room)),
             _ => {}
         }
     }
@@ -295,6 +326,18 @@ fn push_block(out: &mut String, text: &str) {
     out.push_str(text);
 }
 
+/// Les `room` premiers octets d'un texte, sur une frontière de caractère.
+fn prefix(text: &str, room: usize) -> &str {
+    if text.len() <= room {
+        return text;
+    }
+    let mut cut = room;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.get(..cut).unwrap_or_default()
+}
+
 /// Coupe au budget, sur une frontière de caractère.
 ///
 /// La frontière n'est pas une élégance : `String::truncate` **panique** au milieu d'un caractère
@@ -324,6 +367,67 @@ mod tests {
     /// aucune citation, et toutes les citations du courrier en texte brut entrent dans les
     /// vecteurs — silencieusement, avec pour seul symptôme un rappel médiocre qu'on mettrait sur
     /// le compte du modèle.
+    /// Un message HTML dont le corps commence par `lead` puis porte `text` visible.
+    fn html_message(lead: &str, text: &str) -> Vec<u8> {
+        format!(
+            "From: Lettre <lettre@exemple.invalid>\r\n\
+             Subject: nouvelles\r\n\
+             Content-Type: text/html; charset=utf-8\r\n\
+             \r\n\
+             <html><body>{lead}<p>{text}</p></body></html>\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_body_larger_than_the_cap_gives_the_text_its_start_gives() {
+        // La borne ne change rien quand les deux mille caractères du budget sont au début : le
+        // cas ordinaire, y compris pour un corps de plusieurs mébioctets.
+        let long = "mot ".repeat(BODY_SOURCE_CAP / 2);
+        let parser = mail_parser::MessageParser::default();
+        let big = html_message("", &long);
+        assert!(big.len() > BODY_SOURCE_CAP * 2);
+        let small = html_message("", &"mot ".repeat(1_000));
+        let from_big = from_message(
+            &parser.parse(&big).unwrap(),
+            "nouvelles",
+            None,
+            Budget::default(),
+        );
+        let from_small = from_message(
+            &parser.parse(&small).unwrap(),
+            "nouvelles",
+            None,
+            Budget::default(),
+        );
+        assert_eq!(from_big, from_small);
+    }
+
+    #[test]
+    fn what_lies_past_the_cap_is_what_the_cap_gives_up() {
+        // Le prix de la borne, écrit en test pour qu'il reste visible : un texte qui n'arrive
+        // qu'après un mébioctet de source — ici un commentaire — n'entre plus dans le vecteur.
+        let filler = format!("<!-- {} -->", "x".repeat(BODY_SOURCE_CAP));
+        let parser = mail_parser::MessageParser::default();
+        let raw = html_message(&filler, "chaudiere");
+        let found = from_message(
+            &parser.parse(&raw).unwrap(),
+            "nouvelles",
+            None,
+            Budget::default(),
+        );
+        assert!(!found.contains("chaudiere"), "{found}");
+        // Le contrôle inverse : sous la borne, le même texte entre.
+        let raw = html_message("<!-- court -->", "chaudiere");
+        let found = from_message(
+            &parser.parse(&raw).unwrap(),
+            "nouvelles",
+            None,
+            Budget::default(),
+        );
+        assert!(found.contains("chaudiere"), "{found}");
+    }
+
     #[test]
     fn a_plain_text_quote_is_recognised_as_a_quote() {
         let raw = b"From: Plomberie Martin <devis@exemple.invalid>\r\n\

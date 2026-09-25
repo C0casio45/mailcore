@@ -59,6 +59,24 @@ pub struct IndexRow {
     pub folders: String,
 }
 
+/// Les deux comptes que le contrôle du critère 9 compare, lus ensemble — voir
+/// [`Store::vector_counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorCounts {
+    /// Tous les messages du store.
+    pub messages: u64,
+    /// Ceux qui n'ont pas encore de vecteur.
+    pub unvectorised: u64,
+}
+
+impl VectorCounts {
+    /// Ceux qui se disent vectorisés.
+    #[must_use]
+    pub const fn marked(&self) -> u64 {
+        self.messages.saturating_sub(self.unvectorised)
+    }
+}
+
 /// Ce dont la passe de vectorisation a besoin pour un message.
 ///
 /// ## Pourquoi elle n'est pas [`IndexRow`]
@@ -412,11 +430,38 @@ impl Store {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
-    /// Combien de messages se disent vectorisés.
+    /// Le nombre de messages et celui des messages à vectoriser, **lus dans un même instantané**.
     ///
     /// Sert le contrôle de cohérence entre les deux magasins — critère 9 de `docs/PHASE-4.md` :
-    /// un magasin de vecteurs vide alors que des messages se disent vectorisés veut dire que le
-    /// fichier a disparu sous les pieds du store. Voir `SCHEMA_V14`.
+    /// les messages marqués, par différence, se comparent au nombre de records du magasin de
+    /// vecteurs. Voir `SCHEMA_V14`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn vector_counts(&self) -> Result<VectorCounts> {
+        // **Une seule instruction**, donc une seule lecture du journal WAL. Deux `COUNT` séparés
+        // prenaient chacun leur instantané, et une moisson qui validait entre les deux faisait
+        // compter des messages « marqués » qui n'existaient pas au premier : la passe concluait à
+        // un magasin plus court que ses drapeaux, l'effaçait, et repartait pour quatre heures.
+        // Trouvé par une relecture le 2026-09-25 — 112 faux positifs sur 23 198 appels, en quatre
+        // secondes de moisson simulée. Chaque sous-requête garde son index.
+        let (messages, unvectorised): (i64, i64) = self.connection().query_row(
+            "SELECT (SELECT COUNT(*) FROM messages),
+                    (SELECT COUNT(*) FROM messages WHERE vectorised = 0)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(VectorCounts {
+            messages: u64::try_from(messages).unwrap_or(0),
+            unvectorised: u64::try_from(unvectorised).unwrap_or(0),
+        })
+    }
+
+    /// Combien de messages se disent vectorisés.
+    ///
+    /// Non servi par l'index partiel de `SCHEMA_V14`, qui ne porte que les messages **à** faire ;
+    /// [`Self::vector_counts`] est la question bon marché.
     ///
     /// # Errors
     ///

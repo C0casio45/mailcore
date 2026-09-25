@@ -280,15 +280,16 @@ impl Bert {
     }
 }
 
-/// Ce qu'un lot peut coûter en attention : textes × pièces², soit **quatre** textes de la longueur
-/// maximale.
+/// Ce qu'un lot peut porter : **textes × longueur du plus long**, soit quatre textes de la longueur
+/// maximale — 1 024 pièces, remplissage compris.
 ///
 /// ## Pourquoi un budget, et pas un nombre de textes
 ///
-/// La mémoire d'un lot est linéaire en nombre de textes et **quadratique** en longueur : douze
-/// couches de matrices `pièces × pièces` par texte. Mesuré le 2026-09-25 hors du crate : +290 Mio
-/// pour 16 × 256, +140 pour 8 × 256, +84 pour 16 × 128, +27 pour 16 × 64. Un lot de seize textes
-/// était donc le **pire cas** de seize longs textes, et rien ne le bornait sinon la troncature.
+/// La mémoire d'un lot a deux termes. L'un est **quadratique** en longueur : douze couches de
+/// matrices `pièces × pièces` par texte. L'autre est **linéaire** en nombre de pièces : les couches
+/// denses, les états cachés. Mesuré le 2026-09-25 hors du crate : +290 Mio pour 16 × 256, +140 pour
+/// 8 × 256, +84 pour 16 × 128, +27 pour 16 × 64. Un lot de seize textes était donc le **pire cas**
+/// de seize longs textes, et rien ne le bornait sinon la troncature.
 ///
 /// Et le temps suit la même loi, avec un défaut de plus : un lot formé dans l'ordre d'arrivée se
 /// remplit à la longueur de son plus long texte. Un message de trois lignes rangé à côté d'une
@@ -296,24 +297,37 @@ impl Bert {
 /// l'intérieur d'une passe (2026-09-22).
 ///
 /// Les textes sont donc **triés par longueur**, puis regroupés tant que le lot tient dans ce
-/// budget : quatre longs textes, ou soixante-quatre courts, et presque aucun remplissage.
+/// budget : quatre textes de 256 pièces, seize de 64, et presque aucun remplissage.
+///
+/// ## Pourquoi un budget de pièces, et pas d'attention
+///
+/// La première version bornait le seul terme quadratique, textes × pièces². Une relecture l'a
+/// réfuté le jour même, mesure à l'appui : à budget quadratique égal, soixante-quatre textes de
+/// soixante-quatre pièces passaient d'un bloc — 4 096 pièces —, et le terme linéaire, que ce
+/// budget ne voyait pas, en faisait **le pire lot permis** : 125,5 Mio de tas pour la passe avant,
+/// contre 88,2 pour quatre textes de 256. Trente-sept de plus, soit davantage que la marge du
+/// critère 5. « Borné par construction » était faux.
+///
+/// Borner le produit textes × longueur borne **les deux termes à la fois** : le linéaire à
+/// 1 024 pièces, le quadratique à 1 024 × 256 — exactement le cas de quatre longs textes, qui
+/// devient le pire lot, quel que soit le corpus.
 ///
 /// ## Pourquoi quatre, et pas huit
 ///
-/// Huit a été mesuré d'abord, sur le modèle taillé : crête de passe de 517 à 525 Mio, soit
-/// 182 au-dessus des 343 du modèle chargé — et le seuil du critère 5 est de 500 Mo, 476,8 Mio.
+/// Huit a été mesuré d'abord, sur le modèle taillé : crête de passe de 517 à 525 Mio, soit 182
+/// au-dessus des 343 du modèle chargé — et le seuil du critère 5 est de 500 Mo, 476,8 Mio.
 /// Quatre divise par deux ce qui dépassait. Le prix est un lot plus petit pour les seuls longs
 /// textes, là où le calcul est de toute façon dominé par leurs propres pièces.
-const ATTENTION_BUDGET: usize = 4 * MAX_TOKENS * MAX_TOKENS;
+const PIECE_BUDGET: usize = 4 * MAX_TOKENS;
 
-/// Plafond de textes par lot, même très courts : au-delà, le coût linéaire — les couches denses —
-/// reprend le dessus sur l'attention, et le budget ne le voit plus.
+/// Plafond de textes par lot, même très courts, et taille de la fenêtre que la passe remet d'un
+/// coup — voir [`crate::pass::Encoder::batch`].
 const MAX_BATCH: usize = 64;
 
 /// Répartit des textes en lots, par longueur croissante.
 ///
 /// Rend des indices dans la liste d'origine : chaque texte apparaît dans exactement un lot, et
-/// chaque lot tient dans [`ATTENTION_BUDGET`] — sauf un texte seul, qu'on ne peut pas couper.
+/// chaque lot tient dans [`PIECE_BUDGET`] — sauf un texte seul, qu'on ne peut pas couper.
 /// L'ordre est entièrement déterminé par les longueurs et les positions : le même lot donne
 /// toujours les mêmes lots.
 fn plan(lengths: &[usize]) -> Vec<Vec<usize>> {
@@ -325,8 +339,8 @@ fn plan(lengths: &[usize]) -> Vec<Vec<usize>> {
     for index in order {
         // Par longueur croissante : le texte qui arrive est le plus long du lot en cours.
         let longest = lengths.get(index).copied().unwrap_or(0);
-        let cost = (current.len() + 1).saturating_mul(longest.saturating_mul(longest));
-        if !current.is_empty() && (cost > ATTENTION_BUDGET || current.len() >= MAX_BATCH) {
+        let cost = (current.len() + 1).saturating_mul(longest);
+        if !current.is_empty() && (cost > PIECE_BUDGET || current.len() >= MAX_BATCH) {
             groups.push(std::mem::take(&mut current));
         }
         current.push(index);
@@ -426,7 +440,7 @@ impl crate::pass::Encoder for Bert {
 
     /// Soixante-quatre textes par appel, que [`Bert::encode_as`] redécoupe en lots par longueur.
     ///
-    /// Ce n'est plus la taille d'un lot de calcul — c'est [`ATTENTION_BUDGET`] qui la borne,
+    /// Ce n'est plus la taille d'un lot de calcul — c'est [`PIECE_BUDGET`] qui la borne,
     /// depuis le 2026-09-25 —, mais celle de la **fenêtre** dans laquelle les textes sont triés.
     /// Plus grande, elle trierait mieux ; elle retarderait aussi d'autant l'écriture durable et
     /// l'arrêt demandé, que la passe ne regarde qu'entre deux appels. Soixante-quatre messages,
@@ -452,7 +466,7 @@ pub fn default_dir(store_root: &Utf8Path) -> Utf8PathBuf {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{ATTENTION_BUDGET, Bert, MAX_BATCH, MAX_TOKENS, Role, plan};
+    use super::{Bert, MAX_BATCH, MAX_TOKENS, PIECE_BUDGET, Role, plan};
     use crate::testing::{TINY_PIECES, tiny_bert};
 
     fn tiny() -> (tempfile::TempDir, Bert) {
@@ -465,7 +479,7 @@ mod tests {
 
     fn cost(group: &[usize], lengths: &[usize]) -> usize {
         let longest = group.iter().map(|index| lengths[*index]).max().unwrap();
-        group.len() * longest * longest
+        group.len() * longest
     }
 
     #[test]
@@ -478,7 +492,7 @@ mod tests {
         for group in &groups {
             assert!(group.len() <= MAX_BATCH, "{} textes", group.len());
             assert!(
-                group.len() == 1 || cost(group, &lengths) <= ATTENTION_BUDGET,
+                group.len() == 1 || cost(group, &lengths) <= PIECE_BUDGET,
                 "un lot de {} coûte {}",
                 group.len(),
                 cost(group, &lengths)
@@ -501,6 +515,66 @@ mod tests {
                 .all(|group| group.len() <= MAX_BATCH)
         );
         assert_eq!(plan(&[10; 64]).len(), 1);
+    }
+
+    #[test]
+    fn no_batch_costs_more_than_four_long_texts_on_either_term() {
+        // Le défaut que la relecture du 2026-09-25 a mesuré : un budget sur le seul terme
+        // quadratique laissait passer soixante-quatre textes de soixante-quatre pièces d'un bloc,
+        // le pire lot permis. Les deux termes sont vérifiés ici, sur toutes les longueurs.
+        for length in 1..=MAX_TOKENS {
+            for group in plan(&vec![length; MAX_BATCH]) {
+                let pieces = group.len() * length;
+                assert!(
+                    pieces <= PIECE_BUDGET,
+                    "{} × {length} = {pieces} pièces",
+                    group.len()
+                );
+                assert!(
+                    pieces * length <= 4 * MAX_TOKENS * MAX_TOKENS,
+                    "{} × {length}² dépasse quatre longs textes",
+                    group.len()
+                );
+            }
+        }
+        // Le cas qui passait : il est maintenant coupé en lots de seize.
+        assert_eq!(
+            plan(&[64; 64]).iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![16, 16, 16, 16]
+        );
+    }
+
+    #[test]
+    fn a_window_split_into_several_batches_keeps_every_vector_in_its_place() {
+        // Les tests d'encodage précédents tiennent en un seul lot. Celui-ci en force plusieurs, de
+        // longueurs différentes, pour que la reconstruction par lot — longueur, remplissage,
+        // masque — et le retour dans l'ordre d'origine soient exercés au-delà du premier.
+        let (_dir, bert) = tiny();
+        let mut texts: Vec<String> = (0..70).map(|_| "bon".to_owned()).collect();
+        texts.insert(35, "bonjour été bonjour été bonjour été 😀".to_owned());
+        texts.insert(3, "été bonjour".to_owned());
+        let lengths: Vec<usize> = texts
+            .iter()
+            .map(|text| bert.tokens(text, Role::Passage).unwrap().len())
+            .collect();
+        assert!(
+            plan(&lengths).len() >= 2,
+            "un seul lot : le test ne prouverait rien"
+        );
+
+        let together = bert.encode_as(&texts, Role::Passage).unwrap();
+        assert_eq!(together.len(), texts.len());
+        for (text, vector) in texts.iter().zip(&together) {
+            let alone = bert
+                .encode_as(std::slice::from_ref(text), Role::Passage)
+                .unwrap();
+            let gap = alone[0]
+                .iter()
+                .zip(vector)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(gap < 1e-5, "{text:?} : écart de {gap}");
+        }
     }
 
     #[test]

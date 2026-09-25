@@ -135,11 +135,18 @@ pub fn check(
         unknown_pieces += b.iter().filter(|piece| *piece == "<unk>").count() as u64;
         let latin = text.chars().all(mailvec::trim::is_kept);
         let same = a == b;
-        let removed = a
+        // Les caractères que le modèle entier voit **et que le taillé a perdus** : présents dans
+        // ses pièces, absents de celles du taillé. Pas une seconde copie de la règle de la taille —
+        // la première version comptait par `is_kept`, et nommait « retirés » les caractères que
+        // la normalisation fait garder, `μ` compris.
+        let kept_here: std::collections::HashSet<char> =
+            b.iter().flat_map(|piece| piece.chars()).collect();
+        let removed: std::collections::BTreeSet<u32> = a
             .iter()
             .flat_map(|piece| piece.chars())
-            .filter(|c| !mailvec::trim::is_kept(*c))
-            .map(u32::from);
+            .filter(|c| !kept_here.contains(c))
+            .map(u32::from)
+            .collect();
         for code in removed {
             *lost.entry(code).or_default() += 1;
             if latin && !same {
@@ -239,19 +246,32 @@ fn against_store(
 ) -> Result<()> {
     use mailvec::pass::Encoder;
 
-    println!(
-        "
---- étage 3 : le code d'aujourd'hui contre le magasin du corpus ---"
-    );
+    println!("\n--- étage 3 : le code d'aujourd'hui contre le magasin du corpus ---");
     let path = store.vectors_path();
     let digest = full.identity().digest;
     let Some(summary) = mailcore::vectors::summary_of(&path)? else {
         println!("Pas de magasin — rien à comparer");
         return Ok(());
     };
-    let written_by = summary.provenance.as_ref().map(|p| p.digest.clone());
-    if written_by.as_deref() != Some(digest.as_str()) || summary.dim != full.dim() {
-        println!("Magasin écrit par un autre modèle ({written_by:?}) — rien à comparer");
+    // Même modèle **et même composition du texte** : un magasin d'un autre budget ou d'une autre
+    // révision porte d'autres textes, et ses écarts accuseraient le code à tort.
+    let budget = mailvec::text::Budget::default();
+    let Some(provenance) = summary.provenance.as_ref() else {
+        println!("Magasin sans provenance — rien à comparer");
+        return Ok(());
+    };
+    if provenance.digest != digest || summary.dim != full.dim() {
+        println!(
+            "Magasin écrit par un autre modèle ({}) — rien à comparer",
+            provenance.digest
+        );
+        return Ok(());
+    }
+    if provenance.budget != budget.body || provenance.revision != mailvec::text::REVISION {
+        println!(
+            "Magasin d'une autre composition (budget {}, révision {}) — rien à comparer",
+            provenance.budget, provenance.revision
+        );
         return Ok(());
     }
     let stored = mailcore::vectors::Vectors::load(&path, full.dim())?;
@@ -259,12 +279,10 @@ fn against_store(
     let mut absent = 0;
     for (chunk_ids, chunk) in ids.chunks(64).zip(texts.chunks(64)) {
         for (id, vector) in chunk_ids.iter().zip(full.encode_as(chunk, Role::Passage)?) {
-            match stored
-                .search(&vector, 5)?
-                .into_iter()
-                .find(|hit| hit.id == *id)
-            {
-                Some(hit) => cosines.push(hit.score),
+            // Le vecteur rangé **de ce message**, et non le plus proche : une recherche rendait
+            // un doublon exact à sa place, et un message absent se confondait avec un écart.
+            match stored.get(*id) {
+                Some(row) => cosines.push(cosine(&vector, row)),
                 None => absent += 1,
             }
         }
@@ -272,10 +290,13 @@ fn against_store(
     cosines.sort_by(f32::total_cmp);
     let close = cosines.iter().filter(|c| **c >= 0.999_99).count();
     println!(
-        "{} messages : {close} à cosinus ≥ 0,99999, minimal {:.6}, absents du voisinage {absent}",
+        "{} messages : {close} à cosinus ≥ 0,99999, minimal {:.6}, absents du magasin {absent}",
         ids.len(),
         cosines.first().copied().unwrap_or(f32::NAN)
     );
+    if close != ids.len() {
+        println!("ANOMALIE          le code d'aujourd'hui ne rend pas les vecteurs du magasin");
+    }
     Ok(())
 }
 

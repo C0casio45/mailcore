@@ -60,6 +60,16 @@ impl VectorWriter {
     /// n'est pas celui d'un magasin de cette version, de cette dimension ou de cette provenance.
     pub fn open(path: impl AsRef<Utf8Path>, dim: usize, provenance: &Provenance) -> Result<Self> {
         let path = path.as_ref().to_owned();
+
+        // **Un magasin neuf naît avec son en-tête entier**, écrit à côté puis renommé. Écrit en
+        // place, un en-tête coupé par une coupure de courant laissait un fichier de vingt octets
+        // que la lecture refusait à chaque passe, pour toujours — le cas du fichier vide, traité
+        // le matin du 2026-09-25, n'en était qu'une moitié. Une relecture a trouvé l'autre.
+        let fresh = std::fs::metadata(&path).map_or(true, |meta| meta.len() == 0);
+        if fresh {
+            create_with_header(&path, dim, provenance)?;
+        }
+
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -251,14 +261,30 @@ fn write_header(
     header[12..16].copy_from_slice(&declared.to_le_bytes());
     header[16..20].copy_from_slice(&block_len.to_le_bytes());
 
-    file.write_all(&header).map_err(|e| Error::Io {
-        path: path.to_owned(),
-        source: e,
-    })?;
-    file.write_all(block.as_bytes()).map_err(|e| Error::Io {
+    // Un seul tampon, une seule écriture.
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(block.as_bytes());
+    file.write_all(&bytes).map_err(|e| Error::Io {
         path: path.to_owned(),
         source: e,
     })
+}
+
+/// Crée le magasin à `path` avec son seul en-tête : écrit sous un nom provisoire, rendu durable,
+/// puis renommé — donc jamais visible à moitié.
+fn create_with_header(path: &Utf8Path, dim: usize, provenance: &Provenance) -> Result<()> {
+    let io = |source| Error::Io {
+        path: path.to_owned(),
+        source,
+    };
+    let mut name = path.file_name().unwrap_or("vectors.bin").to_owned();
+    name.push_str(".partial");
+    let partial = path.with_file_name(name);
+    let mut file = File::create(&partial).map_err(io)?;
+    write_header(&mut file, &partial, dim, provenance)?;
+    file.sync_all().map_err(io)?;
+    drop(file);
+    std::fs::rename(&partial, path).map_err(io)
 }
 
 /// Ce qu'un en-tête déclare.
@@ -385,6 +411,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.path().join("vectors.bin")).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn a_new_store_is_born_whole_and_leaves_no_partial_file() {
+        let (dir, path) = scratch();
+        drop(VectorWriter::open(&path, 4, &prov()).unwrap());
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["vectors.bin".to_owned()]);
+        // L'en-tête entier : la provenance se relit, et le magasin est vide de records.
+        let summary = crate::vectors::summary_of(&path).unwrap().unwrap();
+        assert_eq!((summary.dim, summary.records), (4, 0));
+        assert_eq!(summary.provenance, Some(prov()));
     }
 
     #[test]

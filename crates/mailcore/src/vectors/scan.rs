@@ -176,6 +176,17 @@ impl Vectors {
         self.dim
     }
 
+    /// Le vecteur rangé d'un message, normalisé, s'il y en a un.
+    ///
+    /// **Un parcours**, pas une table : la recherche balaie tout de toute façon, et garder une
+    /// table d'identifiants pour les seuls outils de vérification coûterait sa taille à chaque
+    /// processus qui cherche.
+    #[must_use]
+    pub fn get(&self, id: MessageId) -> Option<&[f32]> {
+        let row = self.ids.iter().position(|found| *found == id)?;
+        self.data.get(row * self.dim..(row + 1) * self.dim)
+    }
+
     /// Combien de messages le magasin porte.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -2152,3 +2152,92 @@ premiers de ce fichier : un transformeur minuscule — dimension 8, une couche �
 et lu par le même `Bert::load` que le modèle livré. Deux contrôles inverses ont été vérifiés en
 réintroduisant le défaut : une table décalée d'une ligne fait tomber deux tests, une règle sans la
 normalisation en fait tomber un.
+
+### 2026-09-25 (suite) — la relecture a réfuté « borné par construction », et la passe est repartie de zéro
+
+**En clair d'abord.** Le verdict du critère 5 écrit ce matin reposait sur deux phrases fausses.
+La crête n'était pas « bornée par construction » : le budget des lots ne bornait qu'un des deux
+termes de la mémoire, et la **composition** du texte d'un gros message coûtait, à elle seule,
+davantage que la marge mesurée. Une relecture contradictoire — quatre angles, un vérificateur par
+constat, vingt-six agents — a trouvé les deux, les a **mesurées**, et en a trouvé dix-sept autres.
+Tout est corrigé ; la passe complète, lancée sur un verdict faux, a été arrêtée et sera relancée.
+
+#### Les deux constats qui retirent le verdict
+
+- **Le budget des lots bornait l'attention, pas le reste.** `textes × pièces²` est le terme
+  quadratique ; le linéaire — couches denses, états cachés — croît avec `textes × pièces`. À
+  budget quadratique égal, soixante-quatre textes de soixante-quatre pièces passaient d'un bloc :
+  **125,5 Mio** de tas pour la passe avant, contre **88,2** pour quatre textes de 256. Trente-sept
+  de plus que le « pire cas » annoncé, et la marge mesurée était de 21 à 25. Le budget porte
+  maintenant sur `textes × longueur du plus long` ≤ 1 024 pièces : les deux termes sont bornés à
+  la fois, au cas de quatre longs textes, qui devient le pire lot quel que soit le corpus. Un test
+  vérifie les deux termes pour chaque longueur de 1 à 256.
+- **La composition d'un message n'était bornée par rien.** `mail-parser` décode toutes les parties
+  avant qu'on en lise une, et la sanitisation d'un corps coûte une vingtaine de fois sa taille avant
+  que le budget ne la tronque. Mesuré par le vérificateur : +217 Mio pour un corps HTML de 9,5 Mio,
+  +209 pour un message de 124 Mio. Mille premiers messages ne pouvaient pas le voir. Le message est
+  maintenant lu sur ses **16 premiers Mio**, et la source du corps sur son **premier Mio** ; la
+  révision de la composition passe à 3. Ce que ça coûte est écrit en test : un texte qui n'arrive
+  qu'après un mébioctet de source n'entre plus dans le vecteur.
+
+Et la phrase du banc — « la crête d'un lot est bornée par la troncature, pas par le corpus » — est
+retirée de son aide : une passe bornée compare deux réglages, elle ne tranche pas le critère, et
+le relevé le dit maintenant à côté de la crête.
+
+#### Un défaut que le contrôle du matin avait introduit
+
+**`pass::pending` pouvait déclarer divergent un magasin sain**, et l'effacer. Les deux comptes —
+messages, messages à faire — étaient pris dans deux instantanés ; une moisson qui validait entre
+les deux faisait compter des messages « marqués » qui n'existaient pas au premier. Reproduit par le
+vérificateur : 112 faux positifs sur 23 198 appels en quatre secondes. Chaque faux positif est une
+passe complète de quatre heures. Les deux comptes sont maintenant **une seule instruction**, donc un
+seul instantané, et la taille du fichier est lue après. Le test — une seconde connexion insère
+pendant qu'on interroge — trouve 18 fausses divergences en une seconde et demie avec l'ancien code,
+aucune avec le nouveau.
+
+#### Le reste, corrigé
+
+- **la taille était « tout ou rien » à moitié** : une configuration illisible, lue après la mise en
+  place des poids, laissait un `model.safetensors` que la taille suivante refusait d'écraser. Tout
+  ce qui peut être refusé l'est maintenant avant la première écriture, et un échec retire ce que
+  l'appel a écrit ;
+- **la normalisation compose aussi** : le signe ohm suivi d'un accent — deux caractères gardés —
+  devient `Ώ`. Les paires lettre-signe sont essayées ; aucune ne compose sous le normaliseur de
+  `e5`, huit le font sous NFKC ;
+- **« jamais un symbole » était faux** : le caractère de remplacement `�`, la ponctuation
+  supplémentaire, les formes verticales, les étiquettes des drapeaux manquaient. Soixante pièces de
+  plus ;
+- **l'identifiant de remplissage** de `config.json` n'était pas réécrit, et `Bert` le lit ;
+- **l'empreinte dépendait d'une option de compilation** de `serde_json` : les clés sont rangées à la
+  main ;
+- **la table se relisait un mébioctet par ligne gardée** — cent douze gibioctets pour en écrire cent
+  soixante-huit mébioctets ; elle se lit en avançant. La taille prend cinq secondes ;
+- **les poids** : une dimension nulle cachait un débordement dans `candle`, un tenseur vide voisin
+  d'un autre était refusé à tort ;
+- **le magasin de vecteurs** naît avec son en-tête entier, par renommage : un en-tête coupé laissait
+  un fichier que la lecture refusait pour toujours ;
+- **le banc** : deux liens vers les blobs du corpus traînaient dans `%TEMP%`, laissés par des
+  mesures arrêtées — retirés, et le banc travaille maintenant sous `target/measure-vectors/`, où
+  chaque exécution balaie les précédentes, liens d'abord ; `--limit` pendait pour toujours si la
+  passe paniquait ; `--keep` n'était vérifié qu'au bout de la passe ; `mklink` interprétait `&` ;
+  l'étage 3 de la vérification comparait par recherche et sans regarder la composition.
+
+Trois constats ont été réfutés par leur vérificateur, avec la mesure qui les réfute.
+
+#### La méthode
+
+**Un nom de constante n'est pas une borne.** `ATTENTION_BUDGET` disait ce qu'il bornait, et c'est
+précisément ce qui cachait ce qu'il ne bornait pas. La question à poser à toute borne annoncée
+« par construction » : **quels termes la construction couvre-t-elle** — et en écrire le test sur
+chacun.
+
+**Un échantillon ne rend pas un verdict.** Le relevé de ce matin portait sur les mille premiers
+messages, et le coût dépend de la taille du plus gros : le verdict ne pouvait venir que de la passe
+complète, et c'est elle qui le rendra.
+
+**Mes propres éditions ont fabriqué deux faux**, et c'est un contrôle inverse qui les a vus. Un
+`\u` interprété par `perl` a remplacé le texte d'un test — `Ω` et son accent — par `{2126}{301}`,
+de l'ASCII : le test passait, et il ne testait rien. Le contrôle inverse, qui retire les paires, a
+échoué — mais sur la dernière assertion, pas sur celle qui portait la preuve ; c'est ce détail qui
+l'a trahi. **Un contrôle inverse doit faire tomber l'assertion qui porte l'affirmation**, pas une
+assertion voisine.

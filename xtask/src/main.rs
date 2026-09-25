@@ -440,9 +440,10 @@ enum Command {
         /// se devine pas depuis le répertoire.
         #[arg(long)]
         bert: bool,
-        /// Arrêter la passe après ce nombre de messages. Une mesure de mémoire n'a pas besoin des
-        /// quatre heures d'une passe transformeur complète : la crête d'un lot est bornée par la
-        /// troncature, pas par le corpus.
+        /// Arrêter la passe après ce nombre de messages. Pour comparer deux réglages sans les
+        /// quatre heures d'une passe complète — **pas pour trancher le critère 5** : la
+        /// composition d'un message coûte selon sa taille, et les premiers messages ne sont pas
+        /// les plus gros.
         #[arg(long)]
         limit: Option<u64>,
         /// Enchaîner le contrôle de reprise, qui refait une passe complète puis une seconde.
