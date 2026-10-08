@@ -63,7 +63,7 @@ fn report(stats: &ImportStats, elapsed: std::time::Duration) {
     }
     if stats.orphan_folders_skipped > 0 {
         println!(
-            "Orphelins écartés  {} dossier(s) de comptes absents de prefs.js — \n             --include-orphans pour les importer",
+            "Orphelins écartés  {} dossier(s) de comptes absents de prefs.js —  --include-orphans pour les importer",
             stats.orphan_folders_skipped
         );
     }

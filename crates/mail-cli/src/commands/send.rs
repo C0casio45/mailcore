@@ -389,7 +389,7 @@ fn show(store: &Store, draft: &Draft, now: i64, recipients: &[String]) -> Result
         // demanderait un second chemin d'assemblage qui lise depuis un fichier, donc une
         // deuxième implémentation de ce que le critère 3 vient de rendre correct.
         println!(
-            "Les pièces jointes ont été rangées dans le magasin — `mail doctor` les compte \n             comme orphelines tant qu'aucun message ne les désigne."
+            "Les pièces jointes ont été rangées dans le magasin — `mail doctor` les compte  comme orphelines tant qu'aucun message ne les désigne."
         );
     }
     Ok(())

@@ -222,7 +222,7 @@ Sonde SMTP — authentification réelle, aucun envoi…"
     }
     anyhow::ensure!(
         exercised > 0,
-        "aucun compte n'a de serveur d'envoi : le chemin SMTP n'est pas mesuré, et un balayage \n         qui ne le traverse pas ne dit rien du critère 7"
+        "aucun compte n'a de serveur d'envoi : le chemin SMTP n'est pas mesuré, et un balayage  qui ne le traverse pas ne dit rien du critère 7"
     );
 
     // **Le jeton d'accès a pu tourner pendant la passe.** Chercher seulement celui d'avant
@@ -293,7 +293,7 @@ Sonde SMTP — authentification réelle, aucun envoi…"
     // `%TEMP%` en a toujours quelques-uns sur une machine qui sert.
     if store_unreadable > 0 || temp_unreadable > 0 {
         println!(
-            "  {store_unreadable} fichier(s) du store et {temp_unreadable} de `%TEMP%` n'ont \n             pas pu être lus — verrouillés par un autre processus. Non inspectés."
+            "  {store_unreadable} fichier(s) du store et {temp_unreadable} de `%TEMP%` n'ont  pas pu être lus — verrouillés par un autre processus. Non inspectés."
         );
     }
 

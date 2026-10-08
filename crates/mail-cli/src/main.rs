@@ -39,6 +39,19 @@ struct Cli {
     command: Command,
 }
 
+/// Les sous-commandes du modèle.
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Installe le modèle depuis un répertoire où ses trois fichiers ont été téléchargés.
+    ///
+    /// Sans `--from`, dit quoi télécharger, d'où, et combien ça pèse.
+    Install {
+        /// Le répertoire qui contient `config.json`, `tokenizer.json` et `model.safetensors`.
+        #[arg(long)]
+        from: Option<Utf8PathBuf>,
+    },
+}
+
 /// Les sous-commandes de gestion d'un démon.
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
@@ -213,6 +226,14 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Le modèle de la recherche sémantique : ce qu'il faut télécharger, et son installation.
+    ///
+    /// `mail` ne télécharge rien : il dit quels fichiers récupérer et d'où, puis vérifie chacun
+    /// contre une empreinte écrite dans le code avant de l'installer dans le store.
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
     },
     /// Gestion des comptes IMAP : déclaration, secret, mise en pause.
     Account {
@@ -607,16 +628,20 @@ fn main() -> Result<()> {
         // frontière de processus, et une commande qui ferait croire le contraire écrirait
         // ailleurs que là où l'utilisateur regarde.
         (Command::Attach { .. }, Some(_)) => anyhow::bail!(
-            "les pièces jointes vivent dans le store du démon, et s'enregistreraient sur sa \n             machine. Lancer `mail attach` sur la machine du démon, sans --daemon."
+            "les pièces jointes vivent dans le store du démon, et s'enregistreraient sur sa  machine. Lancer `mail attach` sur la machine du démon, sans --daemon."
+        ),
+        (Command::Model { .. }, Some(_)) => anyhow::bail!(
+            "le modèle s'installe sur la machine du démon, dans son store : c'est elle qui \
+             vectorise. Lancer `mail model install` sur cette machine, sans --daemon."
         ),
         (Command::Vectors { .. }, Some(_)) => anyhow::bail!(
-            "la vectorisation vit du côté du démon : c'est son store qui porte les messages et \n             sa machine qui porte le modèle. Lancer `mail vectors` sur la machine du démon, \n             sans --daemon."
+            "la vectorisation vit du côté du démon : c'est son store qui porte les messages et  sa machine qui porte le modèle. Lancer `mail vectors` sur la machine du démon,  sans --daemon."
         ),
         (Command::Contacts { .. }, Some(_)) => anyhow::bail!(
-            "le carnet vit dans le store du démon : c'est lui qui le reconstruit. Lancer \n             `mail contacts` sur la machine du démon, sans --daemon."
+            "le carnet vit dans le store du démon : c'est lui qui le reconstruit. Lancer  `mail contacts` sur la machine du démon, sans --daemon."
         ),
         (Command::Send { .. } | Command::Outbox { .. }, Some(_)) => anyhow::bail!(
-            "l'envoi vit du côté du démon : c'est son trousseau qui porte le secret et son \n             store qui porte la file d'envoi. Lancer `mail send` sur la machine du démon, \n             sans --daemon."
+            "l'envoi vit du côté du démon : c'est son trousseau qui porte le secret et son  store qui porte la file d'envoi. Lancer `mail send` sur la machine du démon,  sans --daemon."
         ),
         (Command::Account { .. }, Some(_)) => anyhow::bail!(
             "ce qui touche à un compte vit du côté du démon : c'est lui qui se connecte au \
@@ -684,6 +709,9 @@ fn main() -> Result<()> {
             },
             None,
         ) => commands::vectors::run(store, model.as_ref(), *rebuild, *budget, *bert),
+        (Command::Model { command }, None) => match command {
+            ModelCommand::Install { from } => commands::model::install(store, from.as_ref()),
+        },
         (Command::Search { query, limit }, None) => {
             commands::search::run(store, &query.join(" "), *limit)
         }

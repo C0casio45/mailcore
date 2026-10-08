@@ -1226,7 +1226,7 @@ impl Shell {
             if ui
                 .add_enabled(can_send, egui::Button::new("✉ Écrire"))
                 .on_disabled_hover_text(
-                    "Aucun compte n'a de serveur d'envoi configuré. Voir `mail account \n                     submission`.",
+                    "Aucun compte n'a de serveur d'envoi configuré. Voir `mail account  submission`.",
                 )
                 .clicked()
             {

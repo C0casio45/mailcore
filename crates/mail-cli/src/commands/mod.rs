@@ -9,6 +9,7 @@ pub mod contacts;
 pub mod doctor;
 pub mod import;
 pub mod index;
+pub mod model;
 pub mod probe;
 pub mod remote;
 pub mod search;
