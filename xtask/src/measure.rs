@@ -162,11 +162,15 @@ impl RssSampler {
     }
 
     /// Échantillonne en rangeant chaque relevé dans la tranche d'avancement où il a été pris.
-    pub(crate) fn start_tracking(progress: Arc<mailcore::Progress>) -> Self {
-        Self::launch(Some(progress))
+    ///
+    /// `span` est ce sur quoi les tranches se découpent quand la passe s'arrête avant la fin :
+    /// sans lui, une passe bornée à 5 000 messages sur 73 658 rangeait tout dans les deux premières
+    /// tranches — le premier relevé, le 2026-10-08.
+    pub(crate) fn start_tracking(progress: Arc<mailcore::Progress>, span: Option<u64>) -> Self {
+        Self::launch(Some((progress, span)))
     }
 
-    fn launch(progress: Option<Arc<mailcore::Progress>>) -> Self {
+    fn launch(progress: Option<(Arc<mailcore::Progress>, Option<u64>)>) -> Self {
         let peak = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let timeline = progress
@@ -186,10 +190,14 @@ impl RssSampler {
                 if let Some(process) = system.process(pid) {
                     let rss = process.memory();
                     thread_peak.fetch_max(rss, Ordering::Relaxed);
-                    if let (Some(progress), Some(timeline)) = (&progress, &thread_timeline)
+                    if let (Some((progress, span)), Some(timeline)) = (&progress, &thread_timeline)
                         && let Ok(mut timeline) = timeline.lock()
                     {
-                        timeline.record(rss, progress.done(), progress.total());
+                        let total = match span {
+                            Some(span) => (*span).min(progress.total()),
+                            None => progress.total(),
+                        };
+                        timeline.record(rss, progress.done(), total);
                     }
                 }
                 std::thread::sleep(SAMPLE_INTERVAL);

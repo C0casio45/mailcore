@@ -179,7 +179,7 @@ fn run<E: Encoder>(
     let rss_model = current_rss();
 
     let progress = std::sync::Arc::new(Progress::new());
-    let sampler = RssSampler::start_tracking(std::sync::Arc::clone(&progress));
+    let sampler = RssSampler::start_tracking(std::sync::Arc::clone(&progress), options.limit);
     let at = Instant::now();
     let stats = bounded(options.limit, &progress, || {
         mailvec::pass::update_with(store, &encoder, mailvec::text::Budget::default(), &progress)

@@ -2537,11 +2537,37 @@ Il range maintenant chaque relevé dans le **vingtième de la passe** où il a �
 combien de messages la crête a été atteinte. Une passe bornée à 5 000 messages devait trancher ce
 soir ; elle a été arrêtée en route, la machine manquant de mémoire pour tout le monde.
 
-**Le remède n'est pas choisi**, et c'est délibéré. Il y en a deux, de natures différentes :
-réduire le lot à trois longs textes — une ligne, environ 22 Mio de moins au pire lot, sans toucher
-aux vecteurs — soigne un pic ; faire la passe explicite en **enfants successifs**, comme la passe
-de fond qui ne traite jamais plus de mille messages par processus, soigne une dérive. La chronologie
-dira lequel.
+Deux remèdes, de natures différentes : réduire le lot à trois longs textes — une ligne, sans
+toucher aux vecteurs — soigne un pic ; faire la passe explicite en **enfants successifs**, comme la
+passe de fond qui ne traite jamais plus de mille messages par processus, soigne une dérive.
+
+#### Le relevé de 5 000 messages : les deux à la fois
+
+Relancé à 21 h 27, la machine ayant retrouvé de la mémoire :
+
+| | 5 000 messages | 73 658 messages |
+|---|---:|---:|
+| modèle chargé | 343,1 Mio | 357,3 |
+| crête de la passe | 450,4 | 481,9 |
+| crête − modèle | 107 | 125 |
+| passe finie − modèle | **33** | **47** |
+
+**Le reste grandit avec le corpus** — 33 Mio après 5 000 messages, 47 après 73 658 — et c'est lui
+qui fait l'essentiel de l'écart entre les deux crêtes : 14 des 18 mébioctets. C'est donc une
+dérive, lente, et non un lot plus lourd que les autres. Le modèle chargé, lui, revient à 343 : les
+14 Mio de la passe complète ne se reproduisent pas, et rien ne les explique encore.
+
+Ce relevé a aussi trouvé un défaut de la chronologie, au premier passage : elle découpait la passe
+en vingtièmes **du corpus**, et une passe bornée à 5 000 messages tombait tout entière dans les
+deux premières tranches. Elle se découpe maintenant sur la borne.
+
+**Le choix : trois longs textes par lot, maintenant ; les enfants successifs, consignés.** Trois
+retire du pire lot un long texte — une quinzaine de mébioctets d'après la pente de huit à quatre —
+et rend une marge de cet ordre, sans toucher à aucun vecteur. Il ne borne pas la dérive : sur un
+corpus deux fois plus grand, le reste en reprendrait une partie. Les enfants successifs la
+bornent, au prix d'un chantier sur `mail vectors` lui-même — il charge aujourd'hui le modèle dans
+son propre processus. Une passe complète de vérification tourne au moment où j'écris, avec la
+chronologie.
 
 #### Le critère 1, refait sur les vecteurs du modèle taillé
 
@@ -2589,6 +2615,7 @@ resté. Leur hôte reste : un compte IMAP sans hôte est refusé comme incohére
 
 #### Reste
 
-- la chronologie de la mémoire, sur 5 000 messages puis sur la passe complète s'il le faut, et le
-  remède qu'elle désignera ;
+- le verdict du critère 5 avec des lots de trois longs textes, sur la passe complète ;
+- la passe explicite en enfants successifs, si la dérive doit être bornée et non seulement
+  devancée ;
 - les critères 2, 4 et 7, machine au repos.

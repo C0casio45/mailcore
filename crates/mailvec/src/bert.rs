@@ -286,8 +286,8 @@ impl Bert {
     }
 }
 
-/// Ce qu'un lot peut porter : **textes × longueur du plus long**, soit quatre textes de la longueur
-/// maximale — 1 024 pièces, remplissage compris.
+/// Ce qu'un lot peut porter : **textes × longueur du plus long**, soit trois textes de la longueur
+/// maximale — 768 pièces, remplissage compris.
 ///
 /// ## Pourquoi un budget, et pas un nombre de textes
 ///
@@ -303,7 +303,7 @@ impl Bert {
 /// l'intérieur d'une passe (2026-09-22).
 ///
 /// Les textes sont donc **triés par longueur**, puis regroupés tant que le lot tient dans ce
-/// budget : quatre textes de 256 pièces, seize de 64, et presque aucun remplissage.
+/// budget : trois textes de 256 pièces, douze de 64, et presque aucun remplissage.
 ///
 /// ## Pourquoi un budget de pièces, et pas d'attention
 ///
@@ -315,16 +315,24 @@ impl Bert {
 /// critère 5. « Borné par construction » était faux.
 ///
 /// Borner le produit textes × longueur borne **les deux termes à la fois** : le linéaire à
-/// 1 024 pièces, le quadratique à 1 024 × 256 — exactement le cas de quatre longs textes, qui
-/// devient le pire lot, quel que soit le corpus.
+/// 768 pièces, le quadratique à 768 × 256 — exactement le cas de trois longs textes, qui devient
+/// le pire lot, quel que soit le corpus.
 ///
-/// ## Pourquoi quatre, et pas huit
+/// ## Pourquoi trois, et pas huit ni quatre
 ///
 /// Huit a été mesuré d'abord, sur le modèle taillé : crête de passe de 517 à 525 Mio, soit 182
 /// au-dessus des 343 du modèle chargé — et le seuil du critère 5 est de 500 Mo, 476,8 Mio.
 /// Quatre divise par deux ce qui dépassait. Le prix est un lot plus petit pour les seuls longs
 /// textes, là où le calcul est de toute façon dominé par leurs propres pièces.
-const PIECE_BUDGET: usize = 4 * MAX_TOKENS;
+///
+/// Quatre a tenu sur mille messages, à 451–456 Mio, puis la passe complète du 2026-10-08 a crevé
+/// le seuil de 5 Mio : 481,9. Le corpus entier coûte une quinzaine de mébioctets de plus que son
+/// début, et l'essentiel de l'écart est un **reste** — ce que la passe laisse résident, 33 Mio
+/// après 5 000 messages, 47 après 73 658 —, pas un lot plus lourd. Trois retire un long texte du
+/// pire lot, environ seize mébioctets d'après la pente de huit à quatre, et ne touche pas aux
+/// vecteurs : un lot ne change pas ce que chaque texte devient. Le reste, lui, n'est pas borné
+/// par ce réglage — voir docs/PHASE-4.md, 2026-10-08.
+const PIECE_BUDGET: usize = 3 * MAX_TOKENS;
 
 /// Plafond de textes par lot, même très courts, et taille de la fenêtre que la passe remet d'un
 /// coup — voir [`crate::pass::Encoder::batch`].
@@ -512,7 +520,7 @@ mod tests {
         let groups = plan(&[MAX_TOKENS; 16]);
         assert_eq!(
             groups.iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![4, 4, 4, 4]
+            vec![3, 3, 3, 3, 3, 1]
         );
         // Et des textes courts se regroupent jusqu'au plafond.
         assert!(
@@ -524,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn no_batch_costs_more_than_four_long_texts_on_either_term() {
+    fn no_batch_costs_more_than_three_long_texts_on_either_term() {
         // Le défaut que la relecture du 2026-09-25 a mesuré : un budget sur le seul terme
         // quadratique laissait passer soixante-quatre textes de soixante-quatre pièces d'un bloc,
         // le pire lot permis. Les deux termes sont vérifiés ici, sur toutes les longueurs.
@@ -537,16 +545,16 @@ mod tests {
                     group.len()
                 );
                 assert!(
-                    pieces * length <= 4 * MAX_TOKENS * MAX_TOKENS,
-                    "{} × {length}² dépasse quatre longs textes",
+                    pieces * length <= 3 * MAX_TOKENS * MAX_TOKENS,
+                    "{} × {length}² dépasse trois longs textes",
                     group.len()
                 );
             }
         }
-        // Le cas qui passait : il est maintenant coupé en lots de seize.
+        // Le cas qui passait : il est maintenant coupé en lots de douze.
         assert_eq!(
             plan(&[64; 64]).iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![16, 16, 16, 16]
+            vec![12, 12, 12, 12, 12, 4]
         );
     }
 
