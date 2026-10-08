@@ -320,7 +320,7 @@ fn store_root() -> Result<Utf8PathBuf> {
 /// # Errors
 ///
 /// Si le store est inutilisable ou si Tauri ne démarre pas.
-pub fn run() -> Result<()> {
+pub fn run(launch: maild::vectors::Launch) -> Result<()> {
     // Avant toute autre chose : c'est le zéro du critère 1.
     let started = Instant::now();
 
@@ -347,7 +347,7 @@ pub fn run() -> Result<()> {
     let profiles = discover_profiles();
     tracing::info!(store = %store, profils = profiles.len(), "mode embarqué");
 
-    let service = maild::Service::open(&store, profiles.clone())?;
+    let service = maild::Service::open(&store, profiles.clone(), launch)?;
     tracing::info!(depuis_ms = since(started), "store ouvert");
 
     // Nommée `requested` et non `bench` : une variable locale du même nom que la commande

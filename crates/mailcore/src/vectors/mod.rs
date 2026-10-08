@@ -139,6 +139,54 @@ pub fn summary_of(path: &camino::Utf8Path) -> crate::Result<Option<Summary>> {
     }))
 }
 
+/// Le droit exclusif d'écrire le magasin de vecteurs d'un store.
+///
+/// ## Pourquoi un verrou, depuis le 2026-10-08
+///
+/// Le démon vectorise maintenant tout seul, et `mail vectors` existe toujours : deux écrivains
+/// sur un même fichier en ajout seul mêleraient leurs records, et la remise à zéro de l'un
+/// effacerait le fichier sous l'autre. Le verrou est pris **avant** toute décision qui écrit —
+/// la relecture de ce qu'il y a à faire comprise —, et tenu jusqu'à la fin de la passe.
+///
+/// ## Pourquoi un fichier à côté, et pas le magasin lui-même
+///
+/// Sous Windows, un verrou de fichier est **obligatoire** : verrouiller `vectors.bin` empêcherait
+/// la recherche de le lire pendant une passe. `vectors.lock` ne sert qu'à ça, et on ne le
+/// supprime jamais — supprimer un fichier verrouillé réussit sous Windows, et la passe suivante
+/// en créerait un neuf que personne ne tient.
+///
+/// Le système le rend à la mort du processus : une passe tuée ne laisse pas de verrou orphelin.
+#[derive(Debug)]
+pub struct VectorLock {
+    _file: std::fs::File,
+}
+
+impl VectorLock {
+    /// Prend le verrou du magasin `vectors_path`, sans attendre.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::VectorsBusy`] si une autre passe le tient, [`crate::Error::Io`] si le
+    /// fichier de verrou n'est pas ouvrable.
+    pub fn try_acquire(vectors_path: &camino::Utf8Path) -> crate::Result<Self> {
+        let path = vectors_path.with_file_name("vectors.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.as_std_path())
+            .map_err(|source| crate::Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(crate::Error::VectorsBusy { path }),
+            Err(std::fs::TryLockError::Error(source)) => Err(crate::Error::Io { path, source }),
+        }
+    }
+}
+
 /// Ce qui a écrit un magasin de vecteurs.
 ///
 /// Elle répond à une seule question, celle que le 2026-09-22 n'a pas pu trancher :
@@ -255,9 +303,20 @@ impl Provenance {
     /// lendemain de celle qu'elle continue est la même passe, et refuser sur la date rendrait
     /// le critère 3 — « tuée au milieu, elle repart où elle en était » — impossible à tenir dès
     /// qu'une coupure passe minuit.
+    ///
+    /// **Le nom du modèle en est exclu aussi**, depuis le 2026-10-08. C'est le dernier segment du
+    /// répertoire d'où le modèle a été chargé : le même fichier de poids, rangé sous
+    /// `model-bert/` par le démon et sous `multilingual-e5-small-latin/` par le banc, donnait
+    /// deux provenances « incomparables » pour des vecteurs identiques, et le démon aurait refusé
+    /// pour toujours de continuer un magasin que le banc avait écrit. Le nom sert à lire un
+    /// relevé ; **l'empreinte** sert à refuser — c'est ce que `pass::Identity` disait déjà.
+    ///
+    /// Et une empreinte **inconnue** ne se compare à rien, pas même à elle-même : le nom ne la
+    /// remplace plus.
     #[must_use]
     pub fn comparable_to(&self, other: &Self) -> bool {
-        self.model == other.model
+        let known = |digest: &str| !digest.is_empty() && digest != "inconnue";
+        known(&self.digest)
             && self.family == other.family
             && self.digest == other.digest
             && self.budget == other.budget

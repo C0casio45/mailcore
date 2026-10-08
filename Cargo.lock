@@ -4455,6 +4455,7 @@ dependencies = [
  "mailmcp",
  "mailsmtp",
  "mailsync",
+ "mailvec",
  "rmcp",
  "rustls",
  "serde",

@@ -131,6 +131,9 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // **En première ligne**, avant l'analyse des arguments : lancé en passe de fond des
+    // vecteurs, ce même exécutable fait la passe et termine ici. Voir `maild::vectors`.
+    let launch = maild::vectors::Launch::dispatch();
     let cli = Cli::parse();
 
     // Le transport stdio **est** la sortie standard : y écrire un journal corromprait le
@@ -178,6 +181,7 @@ fn main() -> Result<()> {
                 allow_plaintext: false,
             },
             protocol,
+            launch,
         ),
         Command::Http {
             listen,
@@ -196,6 +200,7 @@ fn main() -> Result<()> {
             },
             // Sans objet en HTTP : les deux protocoles sont servis, sur deux chemins.
             Protocol::Mcp,
+            launch,
         ),
     }
 }
@@ -284,7 +289,7 @@ fn check(requested: Requested) -> Result<()> {
 }
 
 /// Ouvre la boîte et sert le protocole.
-fn serve(requested: Requested, protocol: Protocol) -> Result<()> {
+fn serve(requested: Requested, protocol: Protocol, launch: maild::vectors::Launch) -> Result<()> {
     let config = resolve(requested)?;
 
     // Rappelé à chaque démarrage, pas seulement au premier : un drapeau posé une fois dans
@@ -302,7 +307,7 @@ fn serve(requested: Requested, protocol: Protocol) -> Result<()> {
     // Le montage vient de la bibliothèque, pas d'ici : c'est le même que celui dont se sert la
     // coquille Tauri en mode embarqué. Deux montages parallèles finiraient par diverger, et
     // celui de l'UI serait le moins relu des deux.
-    let service = Service::open(&config.store, config.profiles.clone())?;
+    let service = Service::open(&config.store, config.profiles.clone(), launch)?;
 
     if config.profiles.is_empty() {
         tracing::info!(

@@ -2241,3 +2241,89 @@ de l'ASCII : le test passait, et il ne testait rien. Le contrôle inverse, qui r
 échoué — mais sur la dernière assertion, pas sur celle qui portait la preuve ; c'est ce détail qui
 l'a trahi. **Un contrôle inverse doit faire tomber l'assertion qui porte l'affirmation**, pas une
 assertion voisine.
+
+### 2026-10-08 — l'étape 7 : les vecteurs suivent la moisson, dans un processus à part
+
+**En clair d'abord.** Un message qui arrive reçoit maintenant son vecteur tout seul, sans
+`mail vectors`. Le calcul ne se fait pas dans le démon ni dans la coquille, mais dans **un
+processus enfant** — le même exécutable, relancé —, en priorité minimale, qui rend toute sa
+mémoire en sortant. Et la passe de fond **n'efface jamais rien** : tout ce qui demanderait de
+repartir de zéro attend une commande.
+
+#### Le dessin, et la relecture qui l'a retourné
+
+Le premier dessin mettait la passe dans un fil du démon, le modèle chargé à la demande et gardé
+dix minutes. Une relecture contradictoire — trois critiques, une synthèse — l'a retourné sur
+trois points, chiffres et expériences à l'appui :
+
+- **la mémoire ne tient pas dans un seul processus.** Une passe monte à 456 Mio dans un processus
+  qui n'a rien d'autre ; la coquille y ajouterait sa fenêtre, une moisson jusqu'à 170 Mio, et le
+  seuil est de 500 Mo. Et décharger le modèle d'un processus ne rend pas tout au système — les
+  petites allocations du tokeniseur restent. Un enfant qui sort, si ;
+- **la passe de fond aurait effacé des magasins.** `update_with` remet tout à zéro sur un magasin
+  périmé, et la composition venait de passer à sa révision 3 : le premier démarrage du démon après
+  la mise à jour aurait effacé 108 Mio de vecteurs et relancé quatre heures de calcul, sans que
+  rien à l'écran ne le dise ;
+- **la provenance comparait le nom du répertoire du modèle.** Le banc écrit avec
+  `multilingual-e5-small-latin/`, le démon lit `model-bert/` : avec des poids identiques au bit
+  près, le démon aurait refusé pour toujours de continuer le magasin. Le nom n'est plus qu'une
+  étiquette ; l'empreinte décide, et une empreinte inconnue ne se compare à rien.
+
+#### Ce qui a été fait
+
+- **`mailvec::pass::plan` est le seul endroit qui décide** ce qu'une passe de fond peut faire :
+  rien, suivre — au plus `FOLLOW_LIMIT`, mille messages, ajoutés au magasin tel qu'il est —, ou
+  refuser avec une raison : arriéré, magasin périmé, plus récent que le binaire, divergent, d'un
+  autre modèle, de version 1. Le démon le demande sans modèle chargé ; l'enfant le redemande
+  verrou tenu, modèle chargé. `pass::follow` n'appelle jamais la remise à zéro ;
+- **un verrou** — `vectors.lock`, à côté du magasin, jamais supprimé — est pris par toute passe
+  qui écrit, avant toute décision. `mail vectors` et le démon ne peuvent plus écrire ensemble ;
+  le perdant attend son tour, ce n'est pas une panne ;
+- **le démon** : un fil, sur le modèle du facteur, et un **compteur d'activité** des jobs. Le fil
+  ne lance l'enfant que si aucun job n'est en file ni en cours, et le tue dès qu'un job arrive :
+  la crête est celle de la moisson **ou** de la passe, jamais leur somme. Il attend une minute
+  après le démarrage — rien avant la première image —, se réveille à chaque fin de job et toutes
+  les dix minutes, repasse aussitôt après un passage qui a avancé et jamais après un passage sans
+  progrès, recule de trente secondes à un quart d'heure après un échec passager, et ne relance
+  pas un refus durable tant que les fichiers du modèle et du magasin n'ont pas changé ;
+- **l'enfant** prend le verrou, pose la question, **puis seulement** charge le modèle — une passe
+  qui perd la course coûte un démarrage de processus, pas 343 Mio —, fait son passage et rend une
+  ligne d'un protocole fermé. Il sort si son parent meurt : l'entrée standard se ferme ;
+- **un message illisible ne bloque plus la passe** : il est marqué et compté. Les lignes reviennent
+  dans l'ordre des identifiants, et le même blob abîmé aurait arrêté chaque passe pour toujours ;
+- **l'état** est une énumération sans chaîne — modèle absent, en pause, au repos, au travail,
+  attendu, passe explicite demandée et pourquoi, échec et son code — : rien qui puisse porter un
+  chemin. Pas encore de méthode d'API ; c'est l'étape 8 qui l'affichera ;
+- `mail vectors --bert` lit par défaut **le même répertoire que le démon**, `model-bert/`.
+
+#### Les trois décisions de produit, prises sans attendre
+
+L'utilisateur a demandé de ne pas s'arrêter. Elles sont donc prises, avec la recommandation de la
+relecture, et réversibles :
+
+1. **Les grosses passes ne démarrent pas seules** — la première vectorisation, une reprise après
+   changement de composition ou de modèle, un arriéré. Rien à l'écran ne les montrerait, et
+   certaines effacent. `mail vectors` les lance ; l'étape 8 les montrera.
+2. **Le modèle n'est pas gardé chargé entre deux arrivées** : un enfant par passage, la mémoire
+   rendue aussitôt. Chaque arrivée paie donc le chargement du modèle, 0,24 s au repos — et le
+   critère 4, 200 ms, sera vraisemblablement **non tenu** dans ce cas. Il se mesurera et se dira.
+3. **La veille `IDLE` de la coquille est un défaut**, trouvé par la relecture : la coquille ne
+   garde que l'API et la boîte du service, et les veilleurs meurent au démarrage. Le courrier n'y
+   arrive donc que par une moisson demandée et le filet de dix minutes. Corrigé à part.
+
+#### Vérification
+
+Six tests d'intégration lancent **le vrai binaire `maild`** en enfant, sur un store où le
+transformeur minuscule des tests est installé dans `model-bert/` : le corpus se vectorise tout
+seul, et un message remis à faire suit sur un simple réveil ; rien ne part pendant un job, et
+tout part après ; sans modèle, rien n'est lancé et l'état le dit ; un magasin d'une autre
+composition est laissé **à l'octet près** ; un verrou tenu fait attendre, puis la passe se fait ;
+un lancement désactivé ne démarre rien. Le premier ne peut passer que si l'enfant a vraiment
+tourné : le parent n'encode rien.
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 542 tests verts**.
+
+Reste à mesurer, machine au repos et la passe complète finie : le critère 4 à froid sur des
+messages réels, la mémoire du parent et de l'enfant, le démarrage de la coquille avec et sans
+modèle, et le travail par image pendant une passe de fond.

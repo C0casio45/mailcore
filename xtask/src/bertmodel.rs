@@ -123,7 +123,7 @@ pub fn check(
             from_name: row.from_name.clone(),
         };
         let text = match mailvec::pass::compose(&store, &row, budget)? {
-            Composed::Missing => {
+            Composed::Missing | Composed::Unreadable => {
                 missing += 1;
                 continue;
             }

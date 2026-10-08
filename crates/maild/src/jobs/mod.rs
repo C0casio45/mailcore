@@ -248,6 +248,95 @@ impl Entry {
     }
 }
 
+/// Combien de jobs sont en file ou en cours — et qui prévenir quand l'un d'eux finit.
+///
+/// ## Pourquoi la passe de fond des vecteurs en a besoin
+///
+/// Une passe de vectorisation tient 343 Mio de modèle ; une moisson peut en demander 170. Les
+/// deux à la fois approchent le plafond de 500 Mo du démon (critère 2 de la phase 2). La passe de
+/// fond ne démarre donc que quand aucun job n'est actif, et s'arrête dès qu'un job arrive : la
+/// crête est celle du plus gros des deux, pas leur somme.
+///
+/// Compté **à la mise en file** et décompté **à la sortie du fil de travail**, par un gardien :
+/// chaque chemin de sortie de `run_one` — y compris le job annulé avant de démarrer — décompte.
+#[derive(Clone, Default)]
+pub struct Activity {
+    inner: Arc<ActivityInner>,
+}
+
+#[derive(Default)]
+struct ActivityInner {
+    active: AtomicU64,
+    listener: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for Activity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Activity")
+            .field("active", &self.active())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Activity {
+    /// Combien de jobs sont en file ou en cours.
+    #[must_use]
+    pub fn active(&self) -> u64 {
+        self.inner.active.load(Ordering::SeqCst)
+    }
+
+    /// Qui prévenir à la fin de chaque job, quel qu'en soit l'issue.
+    pub fn listen(&self, listener: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.inner.listener.lock() {
+            *slot = Some(Box::new(listener));
+        }
+    }
+
+    /// Compte un travail lourd fait **hors** des jobs, le temps que vit le gardien rendu : la
+    /// passe de fond des vecteurs attend qu'il finisse, comme pour un job.
+    #[must_use]
+    pub fn hold(&self) -> Held {
+        self.begin();
+        Held(self.clone())
+    }
+
+    fn begin(&self) {
+        self.inner.active.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        // Jamais sous zéro : un décompte de trop serait un défaut, pas une raison de paniquer.
+        let _ = self
+            .inner
+            .active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if let Ok(slot) = self.inner.listener.lock()
+            && let Some(listener) = slot.as_ref()
+        {
+            listener();
+        }
+    }
+}
+
+/// Un travail compté par [`Activity::hold`], décompté à sa destruction.
+#[derive(Debug)]
+pub struct Held(Activity);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
+/// Décompte un job à sa destruction, sur tous les chemins.
+struct Ended<'a>(&'a Activity);
+
+impl Drop for Ended<'_> {
+    fn drop(&mut self) {
+        self.0.end();
+    }
+}
+
 /// Le registre et la file des jobs.
 #[derive(Clone)]
 pub struct Jobs {
@@ -255,6 +344,7 @@ pub struct Jobs {
     next_id: Arc<AtomicU64>,
     queue: mpsc::Sender<u64>,
     sources: Arc<Sources>,
+    activity: Activity,
 }
 
 impl std::fmt::Debug for Jobs {
@@ -284,6 +374,17 @@ impl Jobs {
     /// remonter l'index après une réindexation, jamais pour écrire.
     #[must_use]
     pub fn start(mailbox: Arc<Mutex<Mailbox>>, store: Utf8PathBuf, sources: Sources) -> Self {
+        Self::start_with(mailbox, store, sources, Activity::default())
+    }
+
+    /// [`Self::start`], avec le compteur d'activité que la passe de fond des vecteurs lit.
+    #[must_use]
+    pub fn start_with(
+        mailbox: Arc<Mutex<Mailbox>>,
+        store: Utf8PathBuf,
+        sources: Sources,
+        activity: Activity,
+    ) -> Self {
         let (queue, receiver) = mpsc::channel::<u64>();
         let inner = Arc::new(Mutex::new(Vec::<Entry>::new()));
         let jobs = Self {
@@ -291,6 +392,7 @@ impl Jobs {
             next_id: Arc::new(AtomicU64::new(1)),
             queue,
             sources: Arc::new(sources),
+            activity: activity.clone(),
         };
 
         // Le fil vit aussi longtemps que le démon. Il se termine quand le dernier `Sender`
@@ -300,6 +402,7 @@ impl Jobs {
             mailbox,
             store,
             sources: Arc::clone(&jobs.sources),
+            activity,
         };
         std::thread::Builder::new()
             .name("mailcore-jobs".to_owned())
@@ -357,7 +460,12 @@ impl Jobs {
             prune(&mut registry);
         }
 
-        self.queue.send(id).map_err(|_| StartError::WorkerGone)?;
+        // Compté **avant** l'envoi : le fil de travail peut le décompter aussitôt reçu.
+        self.activity.begin();
+        if self.queue.send(id).is_err() {
+            self.activity.end();
+            return Err(StartError::WorkerGone);
+        }
         tracing::info!(id, kind = kind.as_str(), "job mis en file");
         Ok(id)
     }
@@ -424,6 +532,7 @@ struct Worker {
     mailbox: Arc<Mutex<Mailbox>>,
     store: Utf8PathBuf,
     sources: Arc<Sources>,
+    activity: Activity,
 }
 
 impl Worker {
@@ -437,6 +546,8 @@ impl Worker {
 
     /// Exécute un job et met le registre à jour.
     fn run_one(&self, id: u64) {
+        // Décompté à la sortie, quelle qu'elle soit — y compris le job annulé en file.
+        let _ended = Ended(&self.activity);
         let progress = Arc::new(Progress::new());
 
         // Passage en `running`, sauf si le client a annulé pendant l'attente en file.
@@ -977,6 +1088,57 @@ mod tests {
 
         let after = jobs.cancel(id).expect("le job existe encore");
         assert_eq!(after.state, State::Done, "l'état a été réécrit");
+    }
+
+    #[test]
+    fn the_activity_count_returns_to_zero_whatever_the_ending_and_each_end_is_heard() {
+        // Ce que la passe de fond des vecteurs lit : un compteur qui resterait au-dessus de zéro
+        // la bloquerait pour toujours. Un job réussi, un job échoué, un job annulé en file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap().to_owned();
+        let mailbox = Arc::new(Mutex::new(Mailbox::open(&root).unwrap()));
+        let activity = Activity::default();
+        let heard = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&heard);
+        activity.listen(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let jobs = Jobs::start_with(
+            mailbox,
+            root,
+            Sources::new(vec![Utf8PathBuf::from("/un/profil/qui/nexiste/pas")]),
+            activity.clone(),
+        );
+
+        let done = jobs.enqueue(Kind::Index).unwrap();
+        let failed = jobs
+            .enqueue(Kind::Import {
+                source: 0,
+                dry_run: false,
+                include_feeds: false,
+                include_orphans: false,
+            })
+            .unwrap();
+        let cancelled = jobs.enqueue(Kind::Thread).unwrap();
+        jobs.cancel(cancelled);
+        for id in [done, failed, cancelled] {
+            wait_final(&jobs, id);
+        }
+        // Le dernier décompte suit l'état final de très près : on lui laisse le temps.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (activity.active() != 0 || heard.load(Ordering::SeqCst) < 3)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(activity.active(), 0);
+        assert_eq!(heard.load(Ordering::SeqCst), 3);
+
+        // Le contrôle inverse : tenu, il compte.
+        let held = activity.hold();
+        assert_eq!(activity.active(), 1);
+        drop(held);
+        assert_eq!(activity.active(), 0);
     }
 
     #[test]

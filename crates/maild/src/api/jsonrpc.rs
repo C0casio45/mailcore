@@ -62,6 +62,9 @@ pub struct Api {
     /// pas l'envoi. Un `None` ne fait pas échouer `outbox.send` : le message est en file, et
     /// il partira au tic suivant plutôt que tout de suite.
     postman: Option<Arc<crate::outbox::Postman>>,
+    /// La passe de fond des vecteurs. Tenue ici pour qu'elle vive aussi longtemps que l'API —
+    /// la coquille embarquée ne garde rien d'autre du service. Sans méthode d'API à l'étape 7.
+    vectoriser: Option<Arc<crate::vectors::Vectoriser>>,
 }
 
 impl std::fmt::Debug for Api {
@@ -78,6 +81,7 @@ impl Api {
             mailbox,
             jobs,
             postman: None,
+            vectoriser: None,
         }
     }
 
@@ -88,6 +92,23 @@ impl Api {
             postman: Some(postman),
             ..self
         }
+    }
+
+    /// Attache la passe de fond des vecteurs, pour qu'elle vive aussi longtemps que l'API.
+    #[must_use]
+    pub fn with_vectoriser(self, vectoriser: Arc<crate::vectors::Vectoriser>) -> Self {
+        Self {
+            vectoriser: Some(vectoriser),
+            ..self
+        }
+    }
+
+    /// Où en est la passe de fond des vecteurs, si elle est montée.
+    #[must_use]
+    pub fn vectors_status(&self) -> Option<crate::vectors::Status> {
+        self.vectoriser
+            .as_ref()
+            .map(|vectoriser| vectoriser.status())
     }
 
     /// Traite un message et rend la réponse à écrire, s'il y en a une.

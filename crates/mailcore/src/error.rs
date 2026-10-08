@@ -132,6 +132,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// Une autre passe écrit déjà ce magasin de vecteurs — `mail vectors`, le démon, un banc.
+    ///
+    /// Pas une panne : la passe qui reçoit ce refus réessaiera plus tard. Deux écrivains à la fois
+    /// mêleraient leurs records, et l'un pourrait effacer le fichier sous l'autre.
+    #[error("une autre passe écrit déjà les vecteurs de ce store ({path})")]
+    VectorsBusy {
+        /// Le verrou tenu.
+        path: camino::Utf8PathBuf,
+    },
+
     /// Un vecteur n'a pas la dimension du magasin.
     ///
     /// Le cas réel est un modèle changé sans refaire la passe complète. Comparer les deux ne

@@ -51,6 +51,7 @@ pub mod api;
 pub mod config;
 pub mod jobs;
 pub mod outbox;
+pub mod vectors;
 pub mod watch;
 
 use std::sync::{Arc, Mutex};
@@ -82,6 +83,9 @@ pub struct Service {
     /// Partagé avec l'API, qui le réveille quand un client met un message en file. Le
     /// détruire l'arrête.
     pub postman: Arc<outbox::Postman>,
+    /// La passe de fond des vecteurs. Partagée avec l'API, qui la garde en vie — voir
+    /// [`vectors`].
+    pub vectoriser: Arc<vectors::Vectoriser>,
 }
 
 impl Service {
@@ -93,7 +97,11 @@ impl Service {
     /// # Errors
     ///
     /// Si le store est illisible.
-    pub fn open(store: &Utf8Path, profiles: Vec<camino::Utf8PathBuf>) -> Result<Self> {
+    pub fn open(
+        store: &Utf8Path,
+        profiles: Vec<camino::Utf8PathBuf>,
+        launch: vectors::Launch,
+    ) -> Result<Self> {
         let mailbox =
             Mailbox::open(store).with_context(|| format!("ouverture du store {store}"))?;
         let stats = mailbox.stats().context("lecture du store")?;
@@ -113,10 +121,14 @@ impl Service {
         // `Searcher` et deux connexions SQLite pour lire les mêmes octets.
         let shared = Arc::new(Mutex::new(mailbox));
 
-        let jobs = jobs::Jobs::start(
+        // Le compteur d'activité est créé **avant** les jobs : la passe de fond des vecteurs s'y
+        // abonne, et aucune fin de job ne doit lui échapper.
+        let activity = jobs::Activity::default();
+        let jobs = jobs::Jobs::start_with(
             Arc::clone(&shared),
             store.to_owned(),
             jobs::Sources::new(profiles),
+            activity.clone(),
         );
         let api = api::jsonrpc::Api::new(Arc::clone(&shared), jobs.clone());
 
@@ -129,12 +141,19 @@ impl Service {
         let postman = Arc::new(outbox::Postman::start(store));
         let api = api.with_postman(Arc::clone(&postman));
 
+        // La passe de fond des vecteurs, **accrochée à l'API** comme le facteur : la coquille
+        // embarquée ne garde que l'API et la boîte, et un fil tenu ailleurs mourrait au démarrage
+        // — c'est ce qui arrive à la veille `IDLE` dans la coquille.
+        let vectoriser = Arc::new(vectors::Vectoriser::start(store, activity, launch));
+        let api = api.with_vectoriser(Arc::clone(&vectoriser));
+
         Ok(Self {
             mailbox: shared,
             api,
             jobs,
             watchers,
             postman,
+            vectoriser,
         })
     }
 }

@@ -35,8 +35,8 @@ pub mod text;
 pub mod trim;
 mod weights;
 
-#[cfg(test)]
-mod testing;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 /// Ce qui peut échouer dans ce crate.
 #[derive(Debug, thiserror::Error)]

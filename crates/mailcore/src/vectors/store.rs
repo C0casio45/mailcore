@@ -414,6 +414,43 @@ mod tests {
     }
 
     #[test]
+    fn the_writing_lock_is_exclusive_and_released_with_its_holder() {
+        let (_dir, path) = scratch();
+        let held = crate::vectors::VectorLock::try_acquire(&path).unwrap();
+        assert!(matches!(
+            crate::vectors::VectorLock::try_acquire(&path),
+            Err(Error::VectorsBusy { .. })
+        ));
+        drop(held);
+        // Le contrôle inverse : rendu, il se reprend.
+        crate::vectors::VectorLock::try_acquire(&path).unwrap();
+    }
+
+    #[test]
+    fn provenance_compares_by_digest_and_not_by_directory_name() {
+        let base = prov();
+        // Les mêmes poids rangés ailleurs : le démon et le banc ne nomment pas leur répertoire
+        // pareil, et c'est le même modèle.
+        let moved = Provenance {
+            model: "model-bert".to_owned(),
+            ..base.clone()
+        };
+        assert!(base.comparable_to(&moved));
+        // Le même nom, d'autres poids : refusé.
+        let other = Provenance {
+            digest: "0123456789abcdef".to_owned(),
+            ..base.clone()
+        };
+        assert!(!base.comparable_to(&other));
+        // Une empreinte inconnue ne se compare à rien, pas même à elle-même.
+        let unknown = Provenance {
+            digest: "inconnue".to_owned(),
+            ..base
+        };
+        assert!(!unknown.comparable_to(&unknown));
+    }
+
+    #[test]
     fn a_new_store_is_born_whole_and_leaves_no_partial_file() {
         let (dir, path) = scratch();
         drop(VectorWriter::open(&path, 4, &prov()).unwrap());

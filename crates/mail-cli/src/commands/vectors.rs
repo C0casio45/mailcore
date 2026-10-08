@@ -34,6 +34,10 @@ fn explain(error: mailvec::Error) -> anyhow::Error {
              sans.\n\
              Installez-en un dans ce répertoire, ou désignez-en un autre avec `--model`."
         ),
+        mailvec::Error::Core(mailcore::Error::VectorsBusy { .. }) => anyhow::anyhow!(
+            "une autre passe écrit déjà les vecteurs de ce store — le démon, ou un autre \
+             `mail vectors`.\nRelancez quand elle aura fini : ce qu'elle a fait reste fait."
+        ),
         other => anyhow::Error::new(other).context("vectorisation"),
     }
 }
@@ -53,9 +57,16 @@ pub fn run(
 ) -> Result<()> {
     let root = crate::store_root(store_root)?;
     let store = Store::open(&root).with_context(|| format!("ouverture du store {root}"))?;
-    let model = model
-        .cloned()
-        .unwrap_or_else(|| mailvec::model::default_dir(&root));
+    // Le répertoire par défaut est **celui que le démon lit** pour la famille choisie : la passe
+    // explicite et la passe de fond doivent écrire avec le même modèle, sinon la seconde refuse
+    // de continuer ce que la première a commencé.
+    let model = model.cloned().unwrap_or_else(|| {
+        if bert {
+            mailvec::bert::default_dir(&root)
+        } else {
+            mailvec::model::default_dir(&root)
+        }
+    });
 
     // Le budget de texte : combien de caractères du corps entrent dans le vecteur. Changer sa
     // valeur change **tous** les vecteurs, donc il impose une reconstruction — c'est dit dans

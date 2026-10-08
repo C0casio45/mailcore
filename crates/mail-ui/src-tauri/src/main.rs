@@ -7,5 +7,8 @@
 #![forbid(unsafe_code)]
 
 fn main() -> anyhow::Result<()> {
-    mail_ui_lib::run()
+    // **En première ligne**, avant l'analyse des arguments : lancé en passe de fond des
+    // vecteurs, ce même exécutable fait la passe et termine ici. Voir `maild::vectors`.
+    let launch = maild::vectors::Launch::dispatch();
+    mail_ui_lib::run(launch)
 }

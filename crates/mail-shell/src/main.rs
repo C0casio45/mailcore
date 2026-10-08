@@ -150,7 +150,11 @@ fn store_root(requested: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> {
 }
 
 /// Monte le dos demandé : un démon distant, ou le service dans ce processus.
-fn open_backend(cli: &Cli, started: std::time::Instant) -> Result<worker::Backend> {
+fn open_backend(
+    cli: &Cli,
+    started: std::time::Instant,
+    launch: maild::vectors::Launch,
+) -> Result<worker::Backend> {
     if let Some(host) = &cli.daemon {
         // Le jeton vient du trousseau, jamais de la ligne de commande ni de l'environnement.
         // Son absence est une erreur exploitable : elle nomme la commande qui le dépose.
@@ -171,7 +175,7 @@ fn open_backend(cli: &Cli, started: std::time::Instant) -> Result<worker::Backen
     let profiles = maild::config::discover_profiles();
     tracing::info!(store = %store, profils = profiles.len(), "mode embarqué");
 
-    let service = maild::Service::open(&store, profiles)?;
+    let service = maild::Service::open(&store, profiles, launch)?;
     tracing::info!(
         "{MARK} coquille etape=store ms={:.1}",
         started.elapsed().as_secs_f64() * 1000.0
@@ -182,6 +186,9 @@ fn open_backend(cli: &Cli, started: std::time::Instant) -> Result<worker::Backen
 fn main() -> Result<()> {
     // Avant toute autre chose : c'est le zéro du critère 1.
     let started = std::time::Instant::now();
+    // Lancé en passe de fond des vecteurs, cet exécutable fait la passe et s'arrête ici, avant
+    // toute fenêtre. Voir `maild::vectors`.
+    let launch = maild::vectors::Launch::dispatch();
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         // Même raison que dans le démon : `html5ever` avertit à chaque tableau mal formé, ce
@@ -207,7 +214,7 @@ fn main() -> Result<()> {
     }
 
     let bench = Bench::from_env();
-    let backend = match open_backend(&cli, started) {
+    let backend = match open_backend(&cli, started, launch) {
         Ok(backend) => backend,
         // **Un échec au démarrage se voit.** Sans console en release, l'erreur rendue par `main`
         // ne va nulle part : voir `failure`. Un banc, lui, lit la sortie et n'a personne pour

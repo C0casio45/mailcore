@@ -735,6 +735,7 @@ fn opaque(source: mailcore::Error) -> Error {
             "la configuration d'un compte est invalide"
         }
         mailcore::Error::ModseqOutOfRange { .. } => "un serveur a répondu hors spécification",
+        mailcore::Error::VectorsBusy { .. } => "une passe de vectorisation est déjà en cours",
         // Une ligne du store porte une valeur d'une forme impossible. Le message reste vague
         // pour la même raison, et la cause est déjà journalisée juste au-dessus — c'est là
         // qu'on la lira, pas chez le client.

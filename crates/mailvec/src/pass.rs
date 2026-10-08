@@ -24,7 +24,7 @@
 //! tourner un job de fond pour toujours, affiché « en cours », donc invisible. C'est le contrôle
 //! négatif du 2026-09-11, qui n'avait fait échouer aucun test mais les avait fait **pendre**.
 
-use mailcore::vectors::VectorWriter;
+use mailcore::vectors::{VectorLock, VectorWriter};
 use mailcore::{Progress, Store};
 
 use crate::model::Model;
@@ -178,6 +178,13 @@ pub struct Stats {
     /// sans le chiffre on l'attribuerait au modèle. Un message vide de texte existe pour de bon
     /// — une pièce jointe seule, un corps perdu au transport — mais il doit rester marginal.
     pub empty: u64,
+    /// Combien ont été sautés parce que leur blob n'a pas pu être lu — fichier abîmé,
+    /// décompression impossible.
+    ///
+    /// **Marqués quand même**, depuis le 2026-10-08 : l'erreur arrêtait la passe, et comme les
+    /// lignes reviennent dans l'ordre des identifiants, le même message en tête de chaque passe
+    /// l'aurait arrêtée pour toujours. Une passe de fond ne doit pas s'enrayer sur un message.
+    pub unreadable: u64,
 }
 
 /// Vectorise ce qui ne l'est pas encore, et s'arrête là.
@@ -185,8 +192,8 @@ pub struct Stats {
 /// # Errors
 ///
 /// [`Error::Model`] si le modèle n'est pas chargeable, [`Error::Core`] si le store ou le magasin
-/// est illisible, [`Error::Encode`] si la bibliothèque rend autre chose que ce qu'on lui a
-/// demandé.
+/// est illisible — ou si une autre passe tient le verrou, `mailcore::Error::VectorsBusy` —,
+/// [`Error::Encode`] si la bibliothèque rend autre chose que ce qu'on lui a demandé.
 pub fn update(
     store: &Store,
     model_dir: &camino::Utf8Path,
@@ -195,35 +202,22 @@ pub fn update(
 ) -> Result<Stats> {
     // **La question la moins chère en premier.** Charger le modèle coûte une cinquantaine de
     // millisecondes et une centaine de mébioctets ; le `COUNT` qui dit s'il y a du travail coûte
-    // des microsecondes. La passe tourne après chaque moisson, et la grande majorité des
-    // moissons n'apportent rien.
+    // des microsecondes. Et ce qui est là doit encore être valable : voir [`Pending`].
     //
-    // **Mais il y a plus urgent que « y a-t-il du nouveau » : « ce qui est là est-il encore
-    // valable ».** Trouvé le 2026-09-23, en changeant la composition du texte : tous les messages
-    // étaient marqués vectorisés, donc ce `COUNT` rendait zéro, donc la passe annonçait « rien à
-    // faire » sur un magasin devenu périmé. Le refus de `VectorWriter::open` ne servait à rien —
-    // il n'était jamais atteint.
-    //
-    // C'est la forme exacte du défaut du critère 9 : un drapeau qui dit « fait » à côté d'une
-    // donnée qui ne correspond plus, et rien pour le signaler. Le contrôle est donc **avant** le
-    // raccourci, et il reste bon marché : lire un en-tête de vingt octets, pas cent treize
-    // mébioctets de vecteurs.
-    // Le raccourci ne s'applique que si ce qui est là est encore valable — voir [`Pending`]. La
-    // remise à zéro, elle, est faite par `update_with` : c'est le passage obligé des deux
-    // chemins, celui-ci et celui du transformeur que `mail vectors --bert` appelle directement.
+    // Le verrou d'abord : la réponse à « que reste-t-il à faire » ne vaut que tant que personne
+    // d'autre n'écrit.
+    let lock = VectorLock::try_acquire(&store.vectors_path())?;
     if pending(store, budget)?.is_empty() {
         return Ok(Stats::default());
     }
-
     let model = Model::load(model_dir)?;
-    update_with(store, &model, budget, progress)
+    update_locked(store, &model, budget, progress, &lock)
 }
 
 /// [`update`] avec un encodeur déjà construit.
 ///
-/// Sert les tests et le banc, qui ont besoin d'un encodeur qu'ils contrôlent. Le raccourci du
-/// `COUNT` n'est **pas** ici : il a pour but d'éviter de charger le modèle, et à ce point il
-/// l'est déjà.
+/// Sert les tests, le banc et `mail vectors --bert`. Le raccourci du `COUNT` n'est **pas** ici :
+/// il a pour but d'éviter de charger le modèle, et à ce point il l'est déjà.
 ///
 /// # Errors
 ///
@@ -233,6 +227,18 @@ pub fn update_with(
     model: &impl Encoder,
     budget: crate::text::Budget,
     progress: &Progress,
+) -> Result<Stats> {
+    let lock = VectorLock::try_acquire(&store.vectors_path())?;
+    update_locked(store, model, budget, progress, &lock)
+}
+
+/// Le corps de [`update_with`], verrou tenu.
+fn update_locked(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+    _lock: &VectorLock,
 ) -> Result<Stats> {
     let path = store.vectors_path();
     let found = pending(store, budget)?;
@@ -248,8 +254,10 @@ pub fn update_with(
     // même répartition que pour l'index plein texte, et elle a la même raison.
     //
     // **Le second cas de divergence, trouvé le 2026-09-23** : un magasin *présent* mais écrit par
-    // une autre composition de texte. Même conséquence, même réponse — et les deux sont traités
-    // ici, le passage obligé des deux chemins, celui du modèle statique et celui du transformeur.
+    // une autre composition de texte. Même conséquence, même réponse.
+    //
+    // Ce chemin est **explicite** — `mail vectors`, un banc. Le démon ne le prend jamais : il
+    // passe par [`follow`], qui refuse de remettre quoi que ce soit à zéro.
     if found.diverged || found.stale {
         if found.diverged {
             tracing::warn!(
@@ -262,24 +270,28 @@ pub fn update_with(
                  autre budget : passe complète"
             );
         }
+        // **Le fichier d'abord, les drapeaux ensuite** — l'ordre de [`rebuild_with`]. Dans
+        // l'ordre inverse, une coupure entre les deux laissait des drapeaux remis à zéro à côté
+        // d'un magasin ancien, que la passe suivante aurait continué. Dans celui-ci, elle laisse
+        // des drapeaux sans records, ce que le contrôle de divergence voit.
+        remove_store(&path)?;
         store.reset_vectorised()?;
-        // Le magasin est retiré dans les deux cas, et c'est le même geste que `rebuild`,
-        // déclenché par une divergence au lieu d'une demande. Périmé, `VectorWriter::open`
-        // refuserait d'y ajouter — à juste titre : ses records et ceux qu'on s'apprête à écrire
-        // ne se comparent pas. Plus court que les drapeaux, il ne contient plus ce qu'on croit :
-        // une copie ancienne porte des records que plus rien ne désigne, et les garder ferait
-        // remonter des messages disparus.
-        if path.exists() {
-            std::fs::remove_file(&path).map_err(|source| {
-                Error::Core(mailcore::Error::Io {
-                    path: path.clone(),
-                    source,
-                })
-            })?;
-        }
     }
 
     advance(store, model, budget, progress)
+}
+
+/// Retire le magasin, s'il existe.
+fn remove_store(path: &camino::Utf8Path) -> Result<()> {
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|source| {
+            Error::Core(mailcore::Error::Io {
+                path: path.to_owned(),
+                source,
+            })
+        })?;
+    }
+    Ok(())
 }
 
 /// Refait tous les vecteurs, depuis zéro.
@@ -297,8 +309,9 @@ pub fn rebuild(
     budget: crate::text::Budget,
     progress: &Progress,
 ) -> Result<Stats> {
+    let lock = VectorLock::try_acquire(&store.vectors_path())?;
     let model = Model::load(model_dir)?;
-    rebuild_with(store, &model, budget, progress)
+    rebuild_locked(store, &model, budget, progress, &lock)
 }
 
 /// [`rebuild`] avec un encodeur déjà construit.
@@ -312,22 +325,216 @@ pub fn rebuild_with(
     budget: crate::text::Budget,
     progress: &Progress,
 ) -> Result<Stats> {
-    let path = store.vectors_path();
+    let lock = VectorLock::try_acquire(&store.vectors_path())?;
+    rebuild_locked(store, model, budget, progress, &lock)
+}
 
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|source| {
-            Error::Core(mailcore::Error::Io {
-                path: path.clone(),
-                source,
-            })
-        })?;
-    }
+/// Le corps de [`rebuild_with`], verrou tenu.
+fn rebuild_locked(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+    _lock: &VectorLock,
+) -> Result<Stats> {
     // Vider le magasin **et** remettre les drapeaux : les deux vont ensemble. N'en faire qu'un
     // donnerait soit un magasin vide que rien ne remplit, soit une revectorisation qui ne se
     // déclenche jamais.
+    remove_store(&store.vectors_path())?;
     store.reset_vectorised()?;
-
     advance(store, model, budget, progress)
+}
+
+/// Combien de messages une passe de fond accepte de faire d'elle-même.
+///
+/// Mille, soit trois à quatre minutes au débit mesuré de la passe complète. Au-delà, ce n'est
+/// plus suivre la moisson, c'est vectoriser un corpus : une passe de plusieurs heures, qui se
+/// décide — `mail vectors` —, et ne démarre pas parce qu'une fenêtre s'est ouverte.
+pub const FOLLOW_LIMIT: u64 = 1_000;
+
+/// Pourquoi une passe de fond refuse, et demande une passe explicite.
+///
+/// Chaque raison est un cas où continuer **effacerait ou mélangerait** : la passe explicite
+/// remet tout à zéro, ce qu'une passe de fond ne fait jamais — le 2026-09-25, le passage de la
+/// composition à sa révision 3 aurait fait effacer 108 Mio de vecteurs et relancer quatre heures
+/// de calcul au premier démarrage du démon, sans que personne ne le sache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Explicit {
+    /// Plus de [`FOLLOW_LIMIT`] messages à faire — la première passe, un rattrapage.
+    Backlog,
+    /// Le magasin a été écrit par une composition de texte plus ancienne, ou un autre budget.
+    Stale,
+    /// Le magasin a été écrit par une composition **plus récente** que ce binaire : on n'y touche
+    /// pas, ni pour le continuer ni pour le refaire.
+    Newer,
+    /// Moins de records que de messages marqués : les deux magasins se contredisent.
+    Diverged,
+    /// Un autre modèle — famille, poids ou dimension — que celui qui l'a écrit.
+    ModelChanged,
+    /// Un magasin de version 1, sans provenance : impossible de savoir ce qu'on continuerait.
+    Legacy,
+}
+
+impl Explicit {
+    /// Un mot qui le désigne, pour un journal ou un protocole — jamais un chemin.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Stale => "stale",
+            Self::Newer => "newer",
+            Self::Diverged => "diverged",
+            Self::ModelChanged => "model-changed",
+            Self::Legacy => "legacy",
+        }
+    }
+
+    /// L'inverse de [`Self::code`].
+    #[must_use]
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            Self::Backlog,
+            Self::Stale,
+            Self::Newer,
+            Self::Diverged,
+            Self::ModelChanged,
+            Self::Legacy,
+        ]
+        .into_iter()
+        .find(|reason| reason.code() == code)
+    }
+}
+
+/// Ce qu'une passe de fond ferait maintenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// Rien : tout est vectorisé, et le magasin est valable.
+    Nothing,
+    /// Suivre : `pending` messages au plus, ajoutés au magasin tel qu'il est.
+    Follow {
+        /// Combien de messages attendent.
+        pending: u64,
+    },
+    /// Refuser, et demander une passe explicite.
+    Explicit {
+        /// Pourquoi.
+        reason: Explicit,
+        /// Combien de messages attendent.
+        pending: u64,
+    },
+}
+
+/// Ce qu'une passe de fond ferait maintenant — **le seul endroit qui en décide**.
+///
+/// Le démon le demande avant de lancer quoi que ce soit, sans modèle chargé (`model` à `None`) ;
+/// la passe de fond le redemande verrou tenu, modèle chargé, pour vérifier aussi que le magasin
+/// est bien le sien. Deux appels, une seule règle.
+///
+/// # Errors
+///
+/// [`Error::Core`] si le store ou l'en-tête du magasin est illisible.
+pub fn plan(
+    store: &Store,
+    budget: crate::text::Budget,
+    model: Option<(&Identity, usize)>,
+) -> Result<Plan> {
+    let counts = store.vector_counts()?;
+    let summary = mailcore::vectors::summary_of(&store.vectors_path())?;
+    let pending = counts.unvectorised;
+    let explicit = |reason| Ok(Plan::Explicit { reason, pending });
+
+    if let Some(summary) = &summary {
+        let Some(found) = &summary.provenance else {
+            return explicit(Explicit::Legacy);
+        };
+        if found.revision > crate::text::REVISION {
+            return explicit(Explicit::Newer);
+        }
+        if stale_against(found, budget) {
+            return explicit(Explicit::Stale);
+        }
+        if let Some((identity, dim)) = model {
+            let theirs = mailcore::vectors::Provenance {
+                model: identity.name.clone(),
+                family: identity.family.clone(),
+                digest: identity.digest.clone(),
+                budget: budget.body,
+                revision: crate::text::REVISION,
+                written: String::new(),
+            };
+            if summary.dim != dim || !found.comparable_to(&theirs) {
+                return explicit(Explicit::ModelChanged);
+            }
+        }
+    }
+    let records = summary.as_ref().map_or(0, |summary| summary.records);
+    if records < counts.marked() {
+        return explicit(Explicit::Diverged);
+    }
+    if pending == 0 {
+        return Ok(Plan::Nothing);
+    }
+    if pending > FOLLOW_LIMIT {
+        return explicit(Explicit::Backlog);
+    }
+    Ok(Plan::Follow { pending })
+}
+
+/// Ce qu'une passe de fond a fait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Followed {
+    /// Elle a suivi — `Stats::default()` s'il n'y avait rien.
+    Done(Stats),
+    /// Elle a refusé, sans rien écrire.
+    Explicit {
+        /// Pourquoi.
+        reason: Explicit,
+        /// Combien de messages attendent.
+        pending: u64,
+    },
+    /// Une autre passe tient le verrou ; rien n'a été fait, et ce n'est pas une panne.
+    Busy,
+}
+
+/// La passe de fond : ajoute au magasin ce qui manque, **sans jamais rien effacer ni remettre à
+/// zéro**, et refuse tout ce qui le demanderait. Voir [`plan`].
+///
+/// # Errors
+///
+/// Les mêmes que [`update_with`], hors verrou tenu, qui rend [`Followed::Busy`].
+pub fn follow(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+) -> Result<Followed> {
+    let lock = match VectorLock::try_acquire(&store.vectors_path()) {
+        Ok(lock) => lock,
+        Err(mailcore::Error::VectorsBusy { .. }) => return Ok(Followed::Busy),
+        Err(other) => return Err(other.into()),
+    };
+    follow_locked(store, model, budget, progress, &lock)
+}
+
+/// [`follow`], verrou déjà tenu — pour qui le prend **avant** de charger le modèle, et ne paie
+/// donc pas 343 Mio pour découvrir qu'une autre passe tourne.
+///
+/// # Errors
+///
+/// Les mêmes que [`follow`].
+pub fn follow_locked(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+    _lock: &VectorLock,
+) -> Result<Followed> {
+    let identity = model.identity();
+    match plan(store, budget, Some((&identity, model.dim())))? {
+        Plan::Nothing => Ok(Followed::Done(Stats::default())),
+        Plan::Explicit { reason, pending } => Ok(Followed::Explicit { reason, pending }),
+        Plan::Follow { .. } => Ok(Followed::Done(advance(store, model, budget, progress)?)),
+    }
 }
 
 /// Ce qu'une passe aurait à faire si on la lançait maintenant.
@@ -482,6 +689,8 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 pub enum Composed {
     /// Le blob est absent : rien à lire.
     Missing,
+    /// Le blob est là et ne se lit pas. Rendu par la boucle seulement ; [`compose`] rend l'erreur.
+    Unreadable,
     /// Le texte que le modèle recevra — vide, parfois.
     Text(String),
 }
@@ -583,7 +792,16 @@ fn advance(
                 cancelled = true;
                 break;
             }
-            match compose_with(store, row, &parser, budget)? {
+            match compose_with(store, row, &parser, budget).unwrap_or_else(|error| {
+                tracing::warn!(%error, id = row.id.0, "blob illisible, message non vectorisé");
+                Composed::Unreadable
+            }) {
+                Composed::Unreadable => {
+                    stats.unreadable += 1;
+                    absent += 1;
+                    ids.push(row.id);
+                    texts.push(String::new());
+                }
                 Composed::Missing => {
                     // Un blob absent est diagnostiquable par `mail doctor`. Ce n'est pas de quoi
                     // interrompre une passe de soixante-treize mille messages.
@@ -870,6 +1088,164 @@ mod tests {
         assert_eq!(done.vectorised, 2);
     }
 
+    /// Les octets du magasin, pour vérifier qu'un refus n'a rien écrit.
+    fn snapshot(store: &Store) -> (Option<Vec<u8>>, u64) {
+        (
+            std::fs::read(store.vectors_path().as_std_path()).ok(),
+            store.unvectorised_total().unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_background_pass_follows_a_valid_store() {
+        let (_dir, store) = corpus(5);
+        let fake = Fake::new(8);
+        update_with(&store, &fake, budget(), &Progress::new()).unwrap();
+        // Les drapeaux remis, les records gardés : cinq messages à suivre, sur un magasin valable.
+        store.reset_vectorised().unwrap();
+        assert_eq!(
+            plan(&store, budget(), None).unwrap(),
+            Plan::Follow { pending: 5 }
+        );
+        match follow(&store, &fake, budget(), &Progress::new()).unwrap() {
+            Followed::Done(stats) => assert_eq!(stats.vectorised, 5),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(plan(&store, budget(), None).unwrap(), Plan::Nothing);
+    }
+
+    #[test]
+    fn the_background_pass_refuses_whatever_would_erase_or_mix() {
+        // Chaque cas, préparé par un chemin explicite, puis soumis à la passe de fond : elle doit
+        // refuser **sans rien écrire ni encoder**. Le contrôle inverse est l'existant :
+        // `update_with` refait ces magasins-là.
+        let other_budget = crate::text::Budget::of(150);
+
+        // Périmé : écrit avec un autre budget.
+        let (_a, stale) = corpus(4);
+        update_with(&stale, &Fake::new(8), other_budget, &Progress::new()).unwrap();
+        stale.reset_vectorised().unwrap();
+
+        // Divergent : moins de records que de drapeaux.
+        let (_b, diverged) = corpus(4);
+        update_with(&diverged, &Fake::new(8), budget(), &Progress::new()).unwrap();
+        std::fs::write(diverged.vectors_path().as_std_path(), []).unwrap();
+
+        // Un autre modèle.
+        let (_c, other_model) = corpus(4);
+        update_with(
+            &other_model,
+            &Fake::named(8, "autre"),
+            budget(),
+            &Progress::new(),
+        )
+        .unwrap();
+        other_model.reset_vectorised().unwrap();
+
+        // Plus récent que ce binaire.
+        let (_d, newer) = corpus(4);
+        let ahead = mailcore::vectors::Provenance {
+            revision: crate::text::REVISION + 1,
+            ..provenance_of(&Fake::new(8), budget())
+        };
+        drop(VectorWriter::open(newer.vectors_path(), 8, &ahead).unwrap());
+
+        // De version 1, sans provenance.
+        let (_e, legacy) = corpus(4);
+        let mut v1 = b"MAILVEC1".to_vec();
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&8u32.to_le_bytes());
+        std::fs::write(legacy.vectors_path().as_std_path(), v1).unwrap();
+
+        for (store, expected) in [
+            (&stale, Explicit::Stale),
+            (&diverged, Explicit::Diverged),
+            (&other_model, Explicit::ModelChanged),
+            (&newer, Explicit::Newer),
+            (&legacy, Explicit::Legacy),
+        ] {
+            let fake = Fake::new(8);
+            let before = snapshot(store);
+            let followed = follow(store, &fake, budget(), &Progress::new()).unwrap();
+            assert!(
+                matches!(followed, Followed::Explicit { reason, .. } if reason == expected),
+                "{expected:?} : {followed:?}"
+            );
+            assert_eq!(
+                snapshot(store),
+                before,
+                "{expected:?} : la passe de fond a écrit"
+            );
+            assert_eq!(
+                fake.encoded.get(),
+                0,
+                "{expected:?} : la passe de fond a encodé"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backlog_is_left_to_an_explicit_pass_from_one_message_over_the_limit() {
+        let limit = usize::try_from(FOLLOW_LIMIT).unwrap();
+        let (_dir, store) = corpus(limit);
+        assert_eq!(
+            plan(&store, budget(), None).unwrap(),
+            Plan::Follow {
+                pending: FOLLOW_LIMIT
+            }
+        );
+        let (_d2, over) = corpus(limit + 1);
+        assert_eq!(
+            plan(&over, budget(), None).unwrap(),
+            Plan::Explicit {
+                reason: Explicit::Backlog,
+                pending: FOLLOW_LIMIT + 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_pass_holding_the_lock_makes_the_others_wait_without_writing() {
+        let (_dir, store) = corpus(3);
+        let held = VectorLock::try_acquire(&store.vectors_path()).unwrap();
+        let fake = Fake::new(8);
+        assert_eq!(
+            follow(&store, &fake, budget(), &Progress::new()).unwrap(),
+            Followed::Busy
+        );
+        assert!(matches!(
+            update_with(&store, &fake, budget(), &Progress::new()),
+            Err(Error::Core(mailcore::Error::VectorsBusy { .. }))
+        ));
+        assert!(matches!(
+            rebuild_with(&store, &fake, budget(), &Progress::new()),
+            Err(Error::Core(mailcore::Error::VectorsBusy { .. }))
+        ));
+        assert_eq!(fake.encoded.get(), 0);
+        assert!(!store.vectors_path().exists());
+        // Le contrôle inverse : rendu, la passe se fait.
+        drop(held);
+        assert!(matches!(
+            follow(&store, &fake, budget(), &Progress::new()).unwrap(),
+            Followed::Done(stats) if stats.vectorised == 3
+        ));
+    }
+
+    #[test]
+    fn one_unreadable_message_does_not_stop_the_pass() {
+        let (_dir, store) = corpus(4);
+        // Le blob du premier message, remplacé par des octets qu'aucun décompresseur ne lit.
+        let first = store.unvectorised(1).unwrap().remove(0);
+        let path = store.root().join("blobs").join(first.blob.shard_path());
+        std::fs::write(path.as_std_path(), b"pas du zstd").unwrap();
+
+        let stats = update_with(&store, &Fake::new(8), budget(), &Progress::new()).unwrap();
+        assert_eq!(stats.unreadable, 1);
+        assert_eq!(stats.vectorised, 3);
+        // Marqué, pour ne pas revenir en tête de chaque passe.
+        assert_eq!(store.unvectorised_total().unwrap(), 0);
+    }
+
     /// Un message plus long que la borne de lecture arrive **tronqué** à `mail-parser` : c'est une
     /// entrée malformée, et le corps, qui la précède, doit en sortir intact.
     #[test]
@@ -902,7 +1278,7 @@ mod tests {
         };
         match compose(&store, &row, budget()).unwrap() {
             Composed::Text(text) => assert!(text.contains("chaudiere"), "{text}"),
-            Composed::Missing => panic!("le blob est là"),
+            Composed::Missing | Composed::Unreadable => panic!("le blob est là"),
         }
     }
 

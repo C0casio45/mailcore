@@ -36,6 +36,13 @@ serde_json.workspace   = true
 thiserror.workspace = true
 tracing.workspace   = true
 camino.workspace    = true
+# Seulement pour `test-support` : le corpus jetable et le transformeur minuscule des tests.
+tempfile = { workspace = true, optional = true }
+
+[features]
+# Expose `testing` — le corpus jetable et le transformeur minuscule — aux tests d'un autre
+# crate. Le démon s'en sert pour tester sa passe de fond contre un vrai `Bert::load`.
+test-support = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile.workspace = true
