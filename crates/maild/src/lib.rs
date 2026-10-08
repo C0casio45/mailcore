@@ -77,7 +77,7 @@ pub struct Service {
     ///
     /// Ils ne sont là que pour être tenus en vie : tout ce qu'ils font passe par `jobs`.
     /// Les détruire les arrête.
-    pub watchers: watch::Watchers,
+    pub watchers: Arc<watch::Watchers>,
     /// Le facteur : le fil qui vide la file d'envoi.
     ///
     /// Partagé avec l'API, qui le réveille quand un client met un message en file. Le
@@ -134,12 +134,17 @@ impl Service {
 
         // La veille est montée **après** les jobs, parce qu'elle en dépend : un veilleur ne
         // synchronise pas, il met un job en file.
-        let watchers = watch::Watchers::start(store, jobs.clone());
+        let watchers = Arc::new(watch::Watchers::start(store, jobs.clone()));
 
         // Le facteur est monté avec le reste, et **partagé avec l'API** : `outbox.send` écrit
         // la ligne puis le réveille. Sans ce partage, un envoi attendrait le tic suivant.
         let postman = Arc::new(outbox::Postman::start(store));
-        let api = api.with_postman(Arc::clone(&postman));
+        // Les veilleurs aussi, depuis le 2026-10-08 : la coquille embarquée ne garde que l'API et
+        // la boîte, et des veilleurs tenus seulement par `Service` mouraient à son démarrage —
+        // le courrier n'y arrivait que sur une moisson demandée. Une relecture l'a trouvé.
+        let api = api
+            .with_postman(Arc::clone(&postman))
+            .with_watchers(Arc::clone(&watchers));
 
         // La passe de fond des vecteurs, **accrochée à l'API** comme le facteur : la coquille
         // embarquée ne garde que l'API et la boîte, et un fil tenu ailleurs mourrait au démarrage
@@ -155,5 +160,31 @@ impl Service {
             postman,
             vectoriser,
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::Service;
+
+    #[test]
+    fn what_an_embedding_shell_keeps_keeps_the_background_alive() {
+        // La coquille embarquée ne garde que l'API et la boîte du service, et détruit le reste.
+        // Les veilleurs `IDLE` mouraient ainsi au démarrage, et le courrier n'arrivait plus que sur
+        // une moisson demandée. Le défaut, reproduit ici : ne garder que l'API.
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+        let service = Service::open(root, Vec::new(), crate::vectors::Launch::disabled()).unwrap();
+        let api = service.api.clone();
+        drop(service);
+        assert!(
+            api.watchers_running(),
+            "les veilleurs sont morts avec le service"
+        );
+        assert!(
+            api.vectors_status().is_some(),
+            "la passe de fond est morte avec le service"
+        );
     }
 }

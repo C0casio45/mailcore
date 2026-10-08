@@ -65,6 +65,8 @@ pub struct Api {
     /// La passe de fond des vecteurs. Tenue ici pour qu'elle vive aussi longtemps que l'API —
     /// la coquille embarquée ne garde rien d'autre du service. Sans méthode d'API à l'étape 7.
     vectoriser: Option<Arc<crate::vectors::Vectoriser>>,
+    /// Les veilleurs `IDLE`, tenus ici pour la même raison que la passe de fond.
+    watchers: Option<Arc<crate::watch::Watchers>>,
 }
 
 impl std::fmt::Debug for Api {
@@ -82,6 +84,7 @@ impl Api {
             jobs,
             postman: None,
             vectoriser: None,
+            watchers: None,
         }
     }
 
@@ -101,6 +104,23 @@ impl Api {
             vectoriser: Some(vectoriser),
             ..self
         }
+    }
+
+    /// Attache les veilleurs `IDLE`, pour qu'ils vivent aussi longtemps que l'API.
+    #[must_use]
+    pub fn with_watchers(self, watchers: Arc<crate::watch::Watchers>) -> Self {
+        Self {
+            watchers: Some(watchers),
+            ..self
+        }
+    }
+
+    /// Vrai si des veilleurs `IDLE` sont attachés et tournent.
+    #[must_use]
+    pub fn watchers_running(&self) -> bool {
+        self.watchers
+            .as_ref()
+            .is_some_and(|watchers| watchers.running())
     }
 
     /// Où en est la passe de fond des vecteurs, si elle est montée.

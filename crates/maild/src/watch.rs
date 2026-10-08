@@ -84,13 +84,13 @@ const MIN_ARM: Duration = Duration::from_secs(1);
 pub struct Watchers {
     stop: Arc<AtomicBool>,
     /// Le fil de supervision, qui possède et joint ceux des comptes.
-    supervisor: Option<std::thread::JoinHandle<()>>,
+    supervisor: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for Watchers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Watchers")
-            .field("en_vie", &self.supervisor.is_some())
+            .field("en_vie", &self.supervisor.lock().is_ok_and(|s| s.is_some()))
             .finish()
     }
 }
@@ -128,19 +128,33 @@ impl Watchers {
                 None
             }
         };
-        Self { stop, supervisor }
+        Self {
+            stop,
+            supervisor: std::sync::Mutex::new(supervisor),
+        }
+    }
+
+    /// Vrai tant que personne n'a demandé l'arrêt.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        !self.stop.load(Ordering::Relaxed)
     }
 
     /// Demande l'arrêt et attend que les fils sortent.
     ///
     /// L'attente est bornée par [`TICK`] : un fil bloqué sur une lecture sort à la fin de sa
     /// tranche.
-    pub fn stop(mut self) {
+    ///
+    /// Par `&self` : les veilleurs sont partagés avec l'API, qui les garde en vie — voir
+    /// `Service`. Appelé deux fois, le second appel n'attend rien.
+    pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        // La poignée est **retirée** plutôt que déstructurée : `Drop` est implémenté, donc on
-        // ne peut pas sortir un champ de `self`. Et c'est très bien ainsi — le `Drop` reposera
-        // le drapeau, ce qui est idempotent.
-        if let Some(handle) = self.supervisor.take() {
+        let handle = self
+            .supervisor
+            .lock()
+            .ok()
+            .and_then(|mut supervisor| supervisor.take());
+        if let Some(handle) = handle {
             // Un veilleur qui a paniqué ne doit pas empêcher le démon de s'arrêter.
             drop(handle.join());
         }
