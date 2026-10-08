@@ -31,6 +31,7 @@ mod replies;
 mod scan;
 mod schema;
 mod secrets;
+mod semantic;
 mod ui;
 mod vectors;
 mod words;
@@ -458,6 +459,78 @@ enum Command {
         keep: Option<Utf8PathBuf>,
     },
 
+    /// Critère 2 de `docs/PHASE-4.md` : la recherche hybride de bout en bout, par l'API que la
+    /// coquille emprunte, le sens servi par l'exécutable `maild` relancé en enfant.
+    ///
+    /// Travaille sur une réplique jetable sous `target/` ; le store n'est que lu.
+    MeasureSemanticSearch {
+        /// Le store d'origine. Lu, jamais écrit.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le magasin de vecteurs à servir, tel que `measure-vectors --keep` l'a gardé.
+        #[arg(long, default_value = "measurements/vectors-e5-latin.bin")]
+        vectors: Utf8PathBuf,
+        /// Le modèle qui l'a écrit.
+        #[arg(
+            long,
+            default_value = "measurements/models/multilingual-e5-small-latin"
+        )]
+        model: Utf8PathBuf,
+        /// Le jeu de requêtes du critère 1 : seuls les textes sont lus.
+        #[arg(long, default_value = "measurements/phase4-queries.toml")]
+        queries: Utf8PathBuf,
+        /// L'exécutable `maild` à relancer. Par défaut, celui de `target/release`.
+        #[arg(long)]
+        maild: Option<Utf8PathBuf>,
+        /// Tours du jeu de requêtes ; le premier est jeté.
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+    },
+
+    /// Critère 7 de `docs/PHASE-4.md` : le démarrage de la coquille livrée sur une réplique, avec
+    /// le modèle et les vecteurs, puis sans. **Ne compile pas** : compiler d'abord, laisser la
+    /// machine retomber, puis lancer.
+    MeasureStartupModel {
+        /// Le store d'origine. Lu, jamais écrit — et refusé s'il porte un compte IMAP.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le magasin de vecteurs, tel que `measure-vectors --keep` l'a gardé.
+        #[arg(long, default_value = "measurements/vectors-e5-latin.bin")]
+        vectors: Utf8PathBuf,
+        /// Le modèle qui l'a écrit.
+        #[arg(
+            long,
+            default_value = "measurements/models/multilingual-e5-small-latin"
+        )]
+        model: Utf8PathBuf,
+        /// Exécutions par configuration ; la première est le démarrage à froid.
+        #[arg(long, default_value_t = 5)]
+        runs: usize,
+    },
+
+    /// Critère 4 de `docs/PHASE-4.md` : ce que coûte un message qui arrive — l'enfant de la passe
+    /// de fond lancé comme le démon le lance, sur une réplique où un seul message attend.
+    MeasureArrival {
+        /// Le store d'origine. Lu, jamais écrit.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le magasin de vecteurs du corpus, tel que `measure-vectors --keep` l'a gardé.
+        #[arg(long, default_value = "measurements/vectors-e5-latin.bin")]
+        vectors: Utf8PathBuf,
+        /// Le modèle qui l'a écrit.
+        #[arg(
+            long,
+            default_value = "measurements/models/multilingual-e5-small-latin"
+        )]
+        model: Utf8PathBuf,
+        /// L'exécutable `maild` à relancer. Par défaut, celui de `target/release`.
+        #[arg(long)]
+        maild: Option<Utf8PathBuf>,
+        /// Combien d'arrivées ; la première est jetée.
+        #[arg(long, default_value_t = 4)]
+        arrivals: usize,
+    },
+
     /// Recense les pièces jointes du corpus : types, nombres, volumes.
     ///
     /// L'étape 6 quater de `docs/PHASE-4.md`, **avant** d'écrire un extracteur. Combien de
@@ -738,6 +811,52 @@ fn main() -> Result<()> {
         Command::MeasureInvitations { store, gaps } => calendar::measure(&store, gaps),
         Command::MeasureReplies { store, limit } => replies::measure(&store, limit),
         Command::MeasureFollowup { messages } => followup::measure(messages),
+        Command::MeasureSemanticSearch {
+            store,
+            vectors,
+            model,
+            queries,
+            maild,
+            rounds,
+        } => semantic::measure_search(
+            &semantic::Sources {
+                store,
+                vectors,
+                model,
+                maild,
+            },
+            &queries,
+            rounds,
+        ),
+        Command::MeasureStartupModel {
+            store,
+            vectors,
+            model,
+            runs,
+        } => semantic::measure_startup(
+            &semantic::Sources {
+                store,
+                vectors,
+                model,
+                maild: None,
+            },
+            runs,
+        ),
+        Command::MeasureArrival {
+            store,
+            vectors,
+            model,
+            maild,
+            arrivals,
+        } => semantic::measure_arrival(
+            &semantic::Sources {
+                store,
+                vectors,
+                model,
+                maild,
+            },
+            arrivals,
+        ),
         Command::SchemaCheck { db, work } => schema::check(&db, &work),
         Command::StoreFolders { store, min } => inspect::folders(&store, min),
         Command::BrowserProbe { length, wait } => {

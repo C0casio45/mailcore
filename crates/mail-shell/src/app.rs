@@ -38,6 +38,9 @@ pub const PAGE: u32 = 100;
 /// Résultats de recherche demandés.
 const RESULTS: u32 = 200;
 
+/// Après une recherche servie pendant que le sens démarrait, quand la refaire.
+const SEMANTIC_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Intervalle de relève des tâches de fond, tant qu'il y en a une active.
 const JOBS_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -175,6 +178,10 @@ pub struct Shell {
     /// Ce que le démon dit de la recherche par le sens pour la dernière requête. Affiché au-dessus
     /// des résultats quand elle n'a pas répondu, avec le geste qui la répare — le critère 7.
     semantic: Option<dto::Semantic>,
+    /// La recherche à refaire quand le sens démarrait : quand, laquelle, combien d'essais encore.
+    /// Sans elle, le sens n'apparaissait qu'à la frappe suivante — l'utilisateur aurait cru que
+    /// la première liste était tout ce qu'il y avait.
+    semantic_retry: Option<(Instant, String, u8)>,
     searching: bool,
     focus_search: bool,
 
@@ -468,6 +475,7 @@ impl Shell {
             query: String::new(),
             results: None,
             semantic: None,
+            semantic_retry: None,
             searching: false,
             focus_search: false,
             sources: Vec::new(),
@@ -843,6 +851,23 @@ impl Shell {
                         self.probe.search = Some("servi");
                     }
                     let results = *results;
+                    // Le sens démarrait : la même recherche est refaite dans une seconde, tant que
+                    // la saisie n'a pas changé — trente fois au plus, le temps d'un chargement lent.
+                    let starting = results
+                        .semantic
+                        .as_ref()
+                        .is_some_and(|it| it.state == dto::SemanticState::Starting);
+                    self.semantic_retry = match self.semantic_retry.take() {
+                        _ if !starting => None,
+                        Some((_, query, left)) if query == self.query.trim() => left
+                            .checked_sub(1)
+                            .map(|left| (Instant::now() + SEMANTIC_RETRY, query, left)),
+                        _ => Some((
+                            Instant::now() + SEMANTIC_RETRY,
+                            self.query.trim().to_owned(),
+                            30,
+                        )),
+                    };
                     self.semantic = results.semantic;
                     if results.search_available {
                         self.results = Some(results.rows);
@@ -1081,6 +1106,23 @@ impl Shell {
         crate::cache::save(&host, snapshot);
     }
 
+    /// Refait la recherche dont le sens démarrait, si la saisie n'a pas changé entre-temps.
+    fn retry_semantic(&mut self, ctx: &egui::Context) {
+        let Some((at, query, _)) = &self.semantic_retry else {
+            return;
+        };
+        if self.results.is_none() || self.query.trim() != query {
+            self.semantic_retry = None;
+            return;
+        }
+        let now = Instant::now();
+        if now < *at || self.searching {
+            ctx.request_repaint_after(at.saturating_duration_since(now));
+            return;
+        }
+        self.run_search();
+    }
+
     /// Relève les tâches de fond quand il y en a d'actives.
     ///
     /// Une minuterie ici, contrairement à l'abonnement : la révision du store ne change pas à
@@ -1118,6 +1160,7 @@ impl eframe::App for Shell {
 
         self.absorb();
         self.poll_jobs(&ctx);
+        self.retry_semantic(&ctx);
 
         if let Some(message) = self.fatal.clone() {
             fatal(root, &message);
@@ -3524,7 +3567,7 @@ fn semantic_banner(ui: &mut egui::Ui, semantic: &dto::Semantic) {
     use dto::SemanticState as State;
     match semantic.state {
         State::Ready | State::Disabled => {}
-        State::Working => {
+        State::Working | State::Starting => {
             ui.weak(&semantic.sentence);
         }
         State::ModelAbsent | State::NeedsPass | State::Unavailable => {
@@ -4356,6 +4399,7 @@ mod tests {
         for state in [
             State::Ready,
             State::Working,
+            State::Starting,
             State::ModelAbsent,
             State::NeedsPass,
             State::Unavailable,

@@ -155,7 +155,7 @@ impl Service {
         // — c'est ce qui arrive à la veille `IDLE` dans la coquille.
         // Le même exécutable sert la recherche par le sens, dans un autre enfant : monté avant que
         // `launch` ne parte à la passe de fond.
-        let semantic = Arc::new(semantic::Engine::start(store, &launch));
+        let semantic = Arc::new(semantic::Engine::start(store, &launch, activity.clone()));
         let vectoriser = Arc::new(vectors::Vectoriser::start(store, activity, launch));
         let api = api
             .with_vectoriser(Arc::clone(&vectoriser))

@@ -315,12 +315,20 @@ impl Provenance {
     /// remplace plus.
     #[must_use]
     pub fn comparable_to(&self, other: &Self) -> bool {
+        self.same_model(other) && self.budget == other.budget && self.revision == other.revision
+    }
+
+    /// Écrits par **le même modèle** : même famille, mêmes poids, et des poids connus.
+    ///
+    /// Ce qu'une **recherche** demande, là où [`Self::comparable_to`] est ce qu'une passe qui
+    /// **ajoute** demande. Des vecteurs d'une composition de texte plus ancienne restent dans
+    /// l'espace du modèle : une requête s'y compare. Des vecteurs d'un autre modèle, non. Une seule
+    /// définition pour les deux, depuis le 2026-10-08 : la recherche avait recopié la règle, et sa
+    /// copie acceptait l'empreinte « inconnue » que celle-ci refuse.
+    #[must_use]
+    pub fn same_model(&self, other: &Self) -> bool {
         let known = |digest: &str| !digest.is_empty() && digest != "inconnue";
-        known(&self.digest)
-            && self.family == other.family
-            && self.digest == other.digest
-            && self.budget == other.budget
-            && self.revision == other.revision
+        known(&self.digest) && self.family == other.family && self.digest == other.digest
     }
 
     /// Une ligne pour un relevé.

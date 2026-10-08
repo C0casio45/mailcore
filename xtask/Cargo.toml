@@ -31,6 +31,10 @@ serde_json.workspace = true
 toml.workspace = true
 safetensors.workspace = true
 mailvec.workspace = true
+# Les bancs des critères 2 et 4 de la phase 4 passent par l'API du démon et lancent ses enfants :
+# le chemin livré, pas une copie de banc.
+maild.workspace = true
+tokio.workspace = true
 model2vec-rs.workspace = true
 tokenizers.workspace = true
 mailapi = { workspace = true, features = ["token-store"] }

@@ -233,7 +233,7 @@ fn work_dir() -> Result<tempfile::TempDir> {
 
 /// [`work_dir`] sous une base donnée — pour que le balayage se teste ailleurs que sur les vraies
 /// exécutions.
-fn work_dir_in(base: &std::path::Path) -> Result<tempfile::TempDir> {
+pub(crate) fn work_dir_in(base: &std::path::Path) -> Result<tempfile::TempDir> {
     let base = base.to_path_buf();
     std::fs::create_dir_all(&base).with_context(|| format!("création de {}", base.display()))?;
     for entry in
@@ -467,7 +467,7 @@ fn report(r: &Reading) {
 }
 
 /// Copie `index.sqlite` du store vers la racine de travail.
-fn copy_index(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
+pub(crate) fn copy_index(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
     let source = from.join("index.sqlite");
     anyhow::ensure!(source.is_file(), "pas de store à {source}");
     std::fs::copy(&source, to.join("index.sqlite"))
@@ -486,7 +486,7 @@ fn copy_index(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
 /// le lien est donc retiré par ce gardien, seul, par [`unlink`] — qui retire un lien de
 /// répertoire sans jamais toucher sa cible. Il est déclaré après le répertoire jetable, donc détruit avant lui.
 #[must_use]
-struct Linked {
+pub(crate) struct Linked {
     path: Utf8PathBuf,
     /// Faux quand on a dû copier : une copie s'efface avec le reste, elle n'a rien d'original.
     link: bool,
@@ -512,7 +512,7 @@ impl Drop for Linked {
 /// **À appeler avant `Store::open`**, qui crée un `blobs/` vide s'il n'en trouve pas : le lien
 /// tombait alors sur un répertoire existant, échouait, et le banc recopiait tout le corpus à
 /// chaque exécution — ce qu'il faisait jusqu'au 2026-09-25, en l'attribuant à un privilège.
-fn link_blobs(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<Linked> {
+pub(crate) fn link_blobs(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<Linked> {
     // **Absolue**, la cible : un lien symbolique range un chemin relatif par rapport à *son
     // propre* répertoire, pas au répertoire courant. `measurements/store/blobs`, la valeur par
     // défaut, donnait donc un lien qui ne menait nulle part — et `Store::open`, trouvant un nom
@@ -611,7 +611,7 @@ fn junction(from: &Utf8PathBuf, to: &Utf8PathBuf) -> bool {
 ///
 /// `create_dir` et non `create_dir_all` : la copie refuse un répertoire qui existe déjà — un lien
 /// resté là la ferait écrire ailleurs que dans la copie.
-fn copy_tree(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
+pub(crate) fn copy_tree(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
     std::fs::create_dir(to.as_std_path()).with_context(|| format!("création de {to}"))?;
     for entry in
         std::fs::read_dir(from.as_std_path()).with_context(|| format!("lecture de {from}"))?

@@ -2430,3 +2430,67 @@ dit ; et un démon sans le moteur rend **exactement** l'ancien contrat. La coqui
 Reste à mesurer, au repos : la latence de bout en bout avec le modèle chaud et à froid (critère
 2), le démarrage de la coquille avec et sans modèle (critère 7), et le coût d'une arrivée
 (critère 4).
+
+### 2026-10-08 (suite) — la relecture de l'étape 8 : une recherche froide figeait toute la coquille
+
+**En clair d'abord.** La première recherche après cinq minutes de calme réveillait le modèle **dans
+la recherche elle-même** — jusqu'à une minute d'attente. Or la coquille sert ses demandes une à
+une : pendant ce temps, ni liste de dossier, ni ouverture de message, ni rien. C'est corrigé : la
+recherche qui réveille le sens répond tout de suite par les mots, dit « la recherche par le sens
+démarre », et la coquille la refait d'elle-même une seconde plus tard ; le sens arrive dès qu'il
+est prêt.
+
+#### Ce que la relecture a trouvé, et ce qui est fait
+
+Une relecture contradictoire, demandée à un agent qui n'avait pas écrit le code, a confirmé six
+défauts. Tous corrigés :
+
+1. **La recherche froide figeait la coquille** — le défaut ci-dessus. C'est, mot pour mot, la leçon
+   du 2026-09-11 sur le consentement OAuth2 — « la règle 3 vaut aussi pour le fil du service » —,
+   et elle n'a pas été appliquée trois semaines plus tard par celui qui l'avait écrite. Le
+   démarrage se fait maintenant sur un fil à lui, sans tenir le verrou du moteur ; une recherche
+   n'attend un enfant **chaud** que trois secondes au plus ;
+2. **chaque recherche payait un chargement complet quand le magasin était vide** — l'état normal
+   juste après `mail model install`. L'enfant chargeait 343 Mio, puis refusait. Le magasin vide se
+   voit maintenant en un `stat`, avant tout processus ; l'enfant lit les vecteurs avant le modèle ;
+   et **un refus se retient** avec l'empreinte des fichiers qui l'ont décidé, la règle des refus
+   durables de la passe de fond ;
+3. **après un changement de modèle, la commande recommandée ne faisait pas disparaître le
+   message** : un enfant chaud de l'ancien modèle répondait « autre modèle » aux vecteurs refaits
+   pour le nouveau, et la phrase redemandait la reconstruction qu'on venait de faire. Tout refus
+   tue maintenant l'enfant, et un test rejoue le scénario entier : nouveau modèle, refus avec le
+   bon geste, refus retenu sans relancer d'enfant, reconstruction, sens de retour ;
+4. **« le journal du démon dit pourquoi » était faux** : l'enfant avalait ses erreurs, le parent ne
+   journalisait ni un refus ni un délai dépassé, et le journal de l'enfant était relayé au niveau
+   `debug`, que le filtre par défaut cache. Les trois le disent maintenant — c'est la leçon des
+   refus d'envoi du 2026-09-10 : une phrase qui renvoie quelque part doit y trouver quelque chose ;
+5. **`server.hello` affirmait « les résultats mêlent les mots et le sens »** sans avoir rien
+   cherché, et ignorait un modèle que la passe de fond n'avait pas pu charger. La description
+   distingue maintenant ce qui a été **demandé** de ce qui **est** ;
+6. **une requête à opérateurs se voyait dire « le sens ne voit qu'une partie du courrier »**, alors
+   que le sens n'avait pas été demandé. Elle passe avant tout état des vecteurs.
+
+Et trois des points « plausibles » se sont révélés vrais à la lecture :
+
+- **la recherche avait recopié la règle « même modèle »** — et sa copie acceptait l'empreinte
+  `inconnue` que l'original refuse. `Provenance::same_model` est maintenant la seule définition ;
+  `comparable_to`, la règle d'ajout, la complète par le budget et la révision ;
+- **l'enfant de la recherche et celui de la passe pouvaient vivre ensemble** — deux copies du
+  modèle, plus de 800 Mio. L'enfant chaud compte maintenant comme un travail lourd : la passe de
+  fond attend qu'il meure, et un test vérifie qu'il compte, puis qu'il ne compte plus ;
+- **le canari pouvait se taire sous Linux** : une connexion avortée avant d'être acceptée rend une
+  erreur, et la boucle s'arrêtait à la première. Elle compte maintenant jusqu'à « rien en
+  attente ».
+
+Côté banc, les deux réserves sont levées : **chaque** réponse hybride doit venir du sens, sans
+quoi le relevé s'arrête — un enfant mort en cours de route aurait fait entrer des réponses des
+mots seuls dans le p95 —, et l'ordre des deux bras alterne, pour que le second ne profite pas
+toujours du cache chaud du premier.
+
+#### La méthode
+
+Le défaut le plus grave était décrit dans `CLAUDE.md`, et le code qui le reproduisait a été écrit
+par celui qui avait écrit la règle. Une règle écrite ne se relit pas toute seule au moment où elle
+s'applique : c'est la relecture par quelqu'un d'autre qui l'a rappelée. Et le test d'intégration
+ne pouvait pas le voir — il appelait l'API d'un démon, pas la coquille qui sert ses demandes une à
+une.

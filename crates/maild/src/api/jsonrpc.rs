@@ -368,18 +368,23 @@ impl Api {
 
     /// L'état de la recherche par le sens, en phrase. `None` quand elle n'est pas montée — un
     /// démon de test, un outil : le champ est alors absent, comme d'un démon plus ancien.
+    ///
+    /// `asked` : le sens a été demandé pour cette réponse. Sans recherche — `server.hello` —,
+    /// l'échec retenu est celui du dernier essai, que le moteur garde tant qu'il vaut.
     fn describe_semantic(
         &self,
-        failure: Option<crate::semantic::Unavailable>,
+        asked: Option<Option<crate::semantic::Unavailable>>,
         operators: bool,
     ) -> Option<mailapi::dto::Semantic> {
         let engine = self.semantic.as_ref()?;
+        let failure = asked.unwrap_or_else(|| engine.standing());
         Some(crate::semantic::describe(&crate::semantic::Facts {
             enabled: engine.enabled(),
             model_installed: engine.model_installed(),
             vectors_present: engine.vectors_present(),
             status: self.vectors_status(),
             failure,
+            asked: asked.is_some(),
             operators,
         }))
     }
@@ -491,7 +496,7 @@ impl Api {
             count: rows.len(),
             search_available,
             rows,
-            semantic: self.describe_semantic(failure, operators),
+            semantic: self.describe_semantic((!operators).then_some(failure), operators),
         })
     }
 

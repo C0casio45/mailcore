@@ -55,9 +55,16 @@ impl Canary {
     fn hits(&self) -> usize {
         // Un délai pour qu'une connexion partie juste avant le relevé ait le temps d'arriver.
         std::thread::sleep(Duration::from_millis(300));
+        // Jusqu'à « rien en attente », et pas jusqu'à la première erreur : une connexion avortée
+        // avant d'être acceptée rend `ECONNABORTED` sous Linux, et c'est **une connexion**. S'arrêter
+        // dessus ferait taire le canari sur celles qui suivent.
         let mut count = 0;
-        while self.listener.accept().is_ok() {
-            count += 1;
+        for _ in 0..10_000 {
+            match self.listener.accept() {
+                Ok(_) => count += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => count += 1,
+            }
         }
         count
     }

@@ -281,6 +281,27 @@ le cas dérivé qui ne rentrait pas dans le moule des deux autres — trois leç
   doublon de `In-Reply-To` et `References`, corrigé le même jour — deux sources qui nomment la
   même chose doivent être réduites, au point d'écriture.
 
+**La recherche par le sens est dans l'application depuis le 2026-10-08** (`maild::semantic`,
+`maild::vectors`), et trois règles en sortent, à ne pas défaire :
+
+- **le modèle vit dans des processus enfants, jamais dans le démon ni la coquille** — le même
+  exécutable relancé, `--mailcore-vectorise` pour la passe de fond, `--mailcore-search` pour la
+  recherche. 343 Mio de modèle et 108 de vecteurs ne tiennent pas sous le seuil de 500 Mo à côté
+  d'une fenêtre. Un enfant chaud compte dans `jobs::Activity` : la passe et la recherche ne
+  tiennent jamais deux copies du modèle ;
+- **aucune recherche n'attend un démarrage.** La première version réveillait le modèle dans la
+  recherche, et la coquille sert ses demandes une à une : une recherche froide figeait tout, une
+  minute. C'est la règle du fil du service du 2026-09-11, et elle a été oubliée par celui qui
+  l'avait écrite ; une relecture l'a rattrapée. La recherche qui réveille répond par les mots et le
+  dit ; un **refus** se retient avec l'empreinte des fichiers qui l'ont décidé ;
+- **une phrase sur le sens se compose à un seul endroit**, `semantic::describe`, après la décision,
+  sans chemin, et elle distingue ce qui a été **demandé** de ce qui **est** : `server.hello` n'a rien
+  cherché et ne parle pas de résultats.
+
+Et une leçon sur les modèles : **la fenêtre du tokeniseur ne dépasse jamais les positions du
+modèle.** Elle était fixée à 256 ; un modèle qui en aurait eu moins échouait sur tout courrier un
+peu long, à chaque passe, sans fin.
+
 ## Règles absolues
 
 1. **Ne jamais écrire dans le profil Thunderbird.** Il est en production, l'utilisateur

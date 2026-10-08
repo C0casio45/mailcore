@@ -49,6 +49,8 @@ pub enum SemanticState {
     Ready,
     /// Elle répond, et rattrape des messages arrivés.
     Working,
+    /// Elle démarre : la recherche qui l'a réveillée a été servie par les mots seuls.
+    Starting,
     /// Aucun modèle installé.
     ModelAbsent,
     /// Une passe explicite est nécessaire avant qu'elle voie tout le courrier.

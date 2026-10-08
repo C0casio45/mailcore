@@ -122,6 +122,12 @@ pub fn status(daemon: &str) -> Result<()> {
             "index absent — lancer `mail index`"
         }
     );
+    if let Some(semantic) = &hello.semantic {
+        println!("Sens        {}", semantic.sentence);
+        if let Some(gesture) = &semantic.gesture {
+            println!("            sur la machine du démon : {gesture}");
+        }
+    }
     println!("Révision    {}", hello.revision);
 
     let sources: Vec<dto::Source> = client.typed("jobs.sources", json!(null))?;
@@ -185,11 +191,29 @@ pub fn search(daemon: &str, query: &str, limit: usize) -> Result<()> {
         return Ok(());
     }
 
-    println!("{} résultat(s) en {elapsed:.1?}\n", results.count);
+    println!("{} résultat(s) en {elapsed:.1?}", results.count);
+    // L'état du sens, quand il n'a pas répondu : la phrase et la commande viennent du démon.
+    if let Some(semantic) = results
+        .semantic
+        .as_ref()
+        .filter(|it| it.state != dto::SemanticState::Ready)
+    {
+        println!("{}", semantic.sentence);
+        if let Some(gesture) = &semantic.gesture {
+            println!("Sur la machine du démon : {gesture}");
+        }
+    }
+    println!();
     for row in &results.rows {
         let who = row.from_name.as_deref().unwrap_or(&row.from);
+        // « ≈ » : trouvé par le sens, pas par les mots cherchés.
+        let meaning = if row.found_by == Some(dto::FoundBy::Meaning) {
+            "≈ "
+        } else {
+            ""
+        };
         println!(
-            "{}  {}  {}",
+            "{}  {}  {meaning}{}",
             human::date(row.date),
             truncate(who, 28),
             row.subject
