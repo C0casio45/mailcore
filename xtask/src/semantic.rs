@@ -412,16 +412,35 @@ pub fn measure_startup(sources: &Sources, runs: usize) -> Result<()> {
     let replica = Replica::build(sources, "target/measure-startup-model", true)?;
     {
         let store = Store::open(&replica.root).context("ouverture de la réplique")?;
-        let imap: Vec<String> = store
-            .accounts()?
+        // **Les comptes à serveur sont désactivés, dans la réplique.** Le corpus de mesure en
+        // porte neuf, et la coquille ouvrirait leurs veilles et leurs moissons — des connexions
+        // réelles, avec les secrets du trousseau, pendant un chronométrage. Un compte désactivé
+        // n'est ni veillé ni moissonné (`maild::watch`, `maild::jobs`) ; son hôte reste, parce
+        // qu'un compte `imap` sans hôte est refusé comme incohérent et ferait échouer le démarrage
+        // au lieu de le mesurer. La réplique est jetable : l'original n'est pas ouvert.
+        let accounts = store.full_accounts()?;
+        let writer = store.writer().context("écriture dans la réplique")?;
+        for account in accounts
+            .iter()
+            .filter(|it| it.kind != mailcore::AccountKind::Mbox)
+        {
+            writer
+                .set_account_enabled(account.id, false)
+                .context("désactivation d'un compte de la réplique")?;
+        }
+        writer.commit().context("validation")?;
+        // Relu, et non supposé : un `UPDATE` qui n'aurait rien touché laisserait la coquille se
+        // connecter.
+        let live: Vec<String> = store
+            .full_accounts()?
             .into_iter()
-            .filter(|(_, kind, _)| kind != "mbox")
-            .map(|(_, kind, _)| kind)
+            .filter(|it| it.kind != mailcore::AccountKind::Mbox && it.enabled)
+            .map(|it| it.display_name)
             .collect();
         anyhow::ensure!(
-            imap.is_empty(),
-            "la réplique porte des comptes {imap:?} : la coquille s'y connecterait. Ce banc ne \
-             tourne que sur un store importé de fichiers mbox."
+            live.is_empty(),
+            "{} compte(s) à serveur encore actifs dans la réplique : la coquille s'y connecterait",
+            live.len()
         );
         anyhow::ensure!(
             store.outbox()?.is_empty(),

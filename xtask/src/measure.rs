@@ -109,16 +109,73 @@ fn verdict(number: u8, label: &str, measured: &str, threshold: &str, passed: boo
 pub(crate) struct RssSampler {
     peak: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    timeline: Option<Arc<std::sync::Mutex<Timeline>>>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Combien de tranches d'avancement [`Timeline`] distingue.
+pub(crate) const SLICES: usize = 20;
+
+/// **Quand** la crête a eu lieu, et pas seulement sa hauteur.
+///
+/// Le critère 5 a été crevé de 5 Mio sur la passe complète du 2026-10-08, et une crête seule ne
+/// dit pas si c'est **un** message — un pic, quelque part dans le corpus — ou une mémoire que la
+/// passe **accumule** — une dérive, qui monte d'une tranche à l'autre. Les deux n'ont pas le même
+/// remède, et la passe complète coûte trois heures et demie : elle doit répondre à la question du
+/// premier coup.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Timeline {
+    /// Le plus haut relevé dans chaque vingtième de la passe, en messages faits.
+    pub(crate) slices: [u64; SLICES],
+    /// Messages faits au moment du plus haut relevé de tous.
+    pub(crate) at_peak: u64,
+    /// Le plus haut relevé, vu par ce suivi.
+    peak: u64,
+}
+
+impl Timeline {
+    fn record(&mut self, rss: u64, done: u64, total: u64) {
+        if rss > self.peak {
+            self.peak = rss;
+            self.at_peak = done;
+        }
+        let slice = slice_of(done, total);
+        if let Some(cell) = self.slices.get_mut(slice) {
+            *cell = (*cell).max(rss);
+        }
+    }
+}
+
+/// La tranche d'un avancement : `done` sur `total`, ramené à `0..SLICES`. Un total inconnu
+/// range tout dans la première ; un avancement au-delà du total, dans la dernière.
+fn slice_of(done: u64, total: u64) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    let slice = u128::from(done) * SLICES as u128 / u128::from(total);
+    usize::try_from(slice).unwrap_or(SLICES).min(SLICES - 1)
 }
 
 impl RssSampler {
     pub(crate) fn start() -> Self {
+        Self::launch(None)
+    }
+
+    /// Échantillonne en rangeant chaque relevé dans la tranche d'avancement où il a été pris.
+    pub(crate) fn start_tracking(progress: Arc<mailcore::Progress>) -> Self {
+        Self::launch(Some(progress))
+    }
+
+    fn launch(progress: Option<Arc<mailcore::Progress>>) -> Self {
         let peak = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let timeline = progress
+            .as_ref()
+            .map(|_| Arc::new(std::sync::Mutex::new(Timeline::default())));
 
         let thread_peak = Arc::clone(&peak);
         let thread_stop = Arc::clone(&stop);
+        let thread_timeline = timeline.clone();
         let pid = Pid::from_u32(std::process::id());
 
         let handle = std::thread::spawn(move || {
@@ -127,7 +184,13 @@ impl RssSampler {
             while !thread_stop.load(Ordering::Relaxed) {
                 system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh);
                 if let Some(process) = system.process(pid) {
-                    thread_peak.fetch_max(process.memory(), Ordering::Relaxed);
+                    let rss = process.memory();
+                    thread_peak.fetch_max(rss, Ordering::Relaxed);
+                    if let (Some(progress), Some(timeline)) = (&progress, &thread_timeline)
+                        && let Ok(mut timeline) = timeline.lock()
+                    {
+                        timeline.record(rss, progress.done(), progress.total());
+                    }
                 }
                 std::thread::sleep(SAMPLE_INTERVAL);
             }
@@ -136,18 +199,28 @@ impl RssSampler {
         Self {
             peak,
             stop,
+            timeline,
             handle: Some(handle),
         }
     }
 
-    pub(crate) fn stop(mut self) -> u64 {
+    pub(crate) fn stop(self) -> u64 {
+        self.stop_tracked().0
+    }
+
+    /// La crête, et la chronologie si l'échantillonneur suivait un avancement.
+    pub(crate) fn stop_tracked(mut self) -> (u64, Option<Timeline>) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
             // Un fil d'échantillonnage qui s'est arrêté tout seul ne doit pas faire échouer
             // la mesure qu'il vient de prendre.
             drop(handle.join());
         }
-        self.peak.load(Ordering::Relaxed)
+        let timeline = self
+            .timeline
+            .as_ref()
+            .and_then(|timeline| timeline.lock().ok().map(|t| t.clone()));
+        (self.peak.load(Ordering::Relaxed), timeline)
     }
 }
 
@@ -1020,5 +1093,38 @@ impl mailsmtp::queue::Transport for Discarding {
             self.written = self.written.saturating_add(read as u64);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_is_sliced_into_twentieths() {
+        assert_eq!(slice_of(0, 1_000), 0);
+        assert_eq!(slice_of(49, 1_000), 0);
+        assert_eq!(slice_of(50, 1_000), 1);
+        assert_eq!(slice_of(999, 1_000), SLICES - 1);
+        // Le dernier message fait, et au-delà — une passe bornée peut dépasser d'un lot.
+        assert_eq!(slice_of(1_000, 1_000), SLICES - 1);
+        assert_eq!(slice_of(5_000, 1_000), SLICES - 1);
+        // Un total inconnu ne fait pas diviser par zéro.
+        assert_eq!(slice_of(12, 0), 0);
+        assert_eq!(slice_of(u64::MAX, u64::MAX), SLICES - 1);
+    }
+
+    #[test]
+    fn the_timeline_remembers_where_the_peak_was() {
+        let mut timeline = Timeline::default();
+        timeline.record(100, 0, 100);
+        timeline.record(300, 42, 100);
+        timeline.record(200, 99, 100);
+        assert_eq!(timeline.at_peak, 42);
+        assert_eq!(timeline.slices[0], 100);
+        assert_eq!(timeline.slices[8], 300);
+        assert_eq!(timeline.slices[SLICES - 1], 200);
+        // Une tranche jamais vue reste à zéro : « pas de relevé », pas « rien de résident ».
+        assert_eq!(timeline.slices[3], 0);
     }
 }

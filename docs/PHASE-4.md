@@ -85,11 +85,11 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand. **Refait le 2026-10-08 sur les vecteurs du modèle taillé : chiffres identiques**, 26,9 % et 1 contre 9 à p = 0,021 |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
-| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
+| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente. **Modèle taillé et lots triés, 2026-10-08 : au moins 5,78 msg/s, 3 h 33** — un plancher, la passe tournant en priorité minimale sur une machine qui servait |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
-| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **tenu avec l'embedding statique, NON TENU avec le transformeur (2026-09-22)**. Statique : **117 Mio** de crête — 8,7 au démarrage, 12,7 store ouvert, 69,5 modèle chargé, 117 passe finie. Transformeur : **1 304 Mio** de crête et 985 de résident, soit **2,6 fois le seuil**. Le remède est celui du 2026-09-15 — tailler le vocabulaire — et il porte ici sur deux fichiers, le `tokenizer.json` de 17 Mo et `embeddings.word_embeddings.weight`. Le relevé du 2026-09-22 établit au passage que **ce rognage ne coûte rien en rappel** : taillé contre brut, 3 680 contre 3 901 sur les cibles françaises, l'écart est du côté du bruit |
+| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **NON TENU, de 5 Mio, sur la passe complète du 2026-10-08** — transformeur taillé : **481,9 Mio** de crête pour 476,8 permis (500 Mo), soit 1 % de trop. 9,3 au démarrage, 10,7 store ouvert, 357,3 modèle chargé, 404,1 passe finie. Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. Ce qui reste à trancher : la crête est-elle **un pic** — un lot, un message — ou **une dérive** — 47 Mio restent résidents après la passe, et ce reste croîtrait avec le corpus ? Le banc dit maintenant **quand** la crête a lieu ; le remède dépend de la réponse. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | **tenu le 2026-10-08, et verrouillé en CI.** Comportement : un canari sur le bouclage, désigné d'une quarantaine de façons par trois messages hostiles, traverse la vraie moisson, les passes dérivées et la passe de fond dans l'exécutable `maild` relancé — **0 connexion**, contrôles positifs compris (`maild/tests/contenu_hors_ligne.rs`). Surface : l'analyse de source étendue à `mailsmtp`, `mailcal`, `mailvec`, et ni `hf-hub` ni `ureq` dans le graphe. **L'installation du modèle ne fait aucune requête** : `mail model install` dit quoi télécharger et vérifie les empreintes |
 | 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | **deux tiers tenus le 2026-10-08, vérifiés par test** : sans modèle, les mots répondent seuls, et la ligne au-dessus des résultats dit « Aucun modèle n'est installé… » avec la commande `mail model install` — `server.hello` le dit aussi avant toute recherche. **Le démarrage reste à mesurer**, au repos ; par construction rien ne se charge au démarrage, l'enfant du sens ne naît qu'à la première recherche |
 | 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | à faire |
@@ -2494,3 +2494,101 @@ par celui qui avait écrit la règle. Une règle écrite ne se relit pas toute s
 s'applique : c'est la relecture par quelqu'un d'autre qui l'a rappelée. Et le test d'intégration
 ne pouvait pas le voir — il appelait l'API d'un démon, pas la coquille qui sert ses demandes une à
 une.
+
+### 2026-10-08 (soir) — la passe complète du modèle taillé : le critère 5 crevé de 5 Mio
+
+**En clair d'abord.** La passe complète a vectorisé les 73 658 messages avec le modèle taillé. Elle
+a dit deux choses. **La mémoire dépasse le seuil d'un cheveu** : 481,9 Mio pour 476,8 permis, soit
+un pour cent de trop — le critère 5 n'est pas tenu. **La qualité, elle, n'a pas bougé** : le
+critère 1 refait sur ces vecteurs rend exactement les chiffres du modèle entier. Les trois mesures
+de temps — recherche, arrivée, démarrage — n'ont pas pu être prises ce soir : la machine servait à
+autre chose, et un relevé pris sur une machine occupée ne vaut rien.
+
+#### Le critère 5, sur le corpus entier
+
+`cargo xtask measure-vectors --bert`, modèle `multilingual-e5-small-latin` (empreinte
+`a043ccf1d02843c5`), lots triés, quatre longs textes au plus, composition en révision 3 :
+
+| | passe complète, 2026-10-08 | mille messages, 2026-09-25 |
+|---|---:|---:|
+| au démarrage | 9,3 Mio | 8,7 |
+| store ouvert | 10,7 | 12,7 |
+| modèle chargé | **357,3** | 343 |
+| crête de la passe | **481,9** | 451–456 |
+| passe finie | 404,1 | — |
+
+**Non tenu, de 5,1 Mio.** Ce que le tableau dit, et ce qu'il ne dit pas :
+
+- **la crête dépasse le modèle chargé de 125 Mio**, contre 108 à 113 sur mille messages. Le corpus
+  entier coûte donc une quinzaine de mébioctets de plus que son début, et c'est ce que le 2026-09-25
+  annonçait : un échantillon ne rend pas un verdict ;
+- **47 Mio restent résidents une fois la passe finie**, alors que rien ne devrait l'être hormis le
+  modèle et le store. Le plus probable est un tas qui garde ce qu'il a servi — ce n'est **pas**
+  vérifié. Si c'est le cas, ce reste croît avec le corpus, et une marge gagnée sur le lot serait
+  reprise par le courrier de l'année suivante ;
+- **le modèle chargé pèse 14 Mio de plus** qu'au 2026-09-25. La taille a changé depuis — deux
+  cent huit pièces de plus, d'après la relecture —, mais deux cents lignes de 384 flottants font
+  0,3 Mio, pas quatorze. Non expliqué.
+
+Le banc ne pouvait pas en dire davantage : il rendait **une** crête, sans dire **quand** elle avait
+eu lieu. Un pic — un message, une fois — et une dérive — une mémoire qui monte d'un bout à l'autre
+— ne se soignent pas pareil, et une passe de trois heures et demie doit répondre du premier coup.
+Il range maintenant chaque relevé dans le **vingtième de la passe** où il a été pris, et dit après
+combien de messages la crête a été atteinte. Une passe bornée à 5 000 messages devait trancher ce
+soir ; elle a été arrêtée en route, la machine manquant de mémoire pour tout le monde.
+
+**Le remède n'est pas choisi**, et c'est délibéré. Il y en a deux, de natures différentes :
+réduire le lot à trois longs textes — une ligne, environ 22 Mio de moins au pire lot, sans toucher
+aux vecteurs — soigne un pic ; faire la passe explicite en **enfants successifs**, comme la passe
+de fond qui ne traite jamais plus de mille messages par processus, soigne une dérive. La chronologie
+dira lequel.
+
+#### Le critère 1, refait sur les vecteurs du modèle taillé
+
+Le 2026-09-25 promettait de vérifier « en une commande » que la taille ne déplace pas le rappel.
+C'est fait, sur les 26 requêtes de `phase4-queries-v2.toml` :
+
+- **hybride dans les dix premiers pour 26,9 %** du jeu, 0 % sur les dix requêtes sans mot commun —
+  **identique** au relevé du modèle entier ;
+- **comparaison primaire : 1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut —
+  identique ;
+- les rangs du sens sur les requêtes de synonymie passent de 94, 1 296 et 1 792 à **94, 1 292 et
+  1 794**. Quatre places sur des milliers : la taille est invisible au critère qui décide.
+
+Et le premier relevé a accusé le banc, une fois de plus : **les trois moteurs rendaient « absente »
+chacune des dix cibles dures**, plein texte compris — un chiffre impossible, puisque le plein texte
+ne lit pas les vecteurs et classait ces cibles 3 095ᵉ ou 13 316ᵉ. La valeur par défaut de
+`--limit` était 50 : toute cible classée au-delà s'affichait comme absente. C'est **mot pour mot**
+l'absence fabriquée que le 2026-09-23 avait retirée — « ce qui tronque doit le dire » —, et la
+leçon avait été appliquée au code et pas à la valeur par défaut qui le réglait. Le banc classe
+maintenant tout le corpus sauf demande contraire, et une profondeur coupée est écrite en tête du
+relevé.
+
+#### Le critère 3, avec sa réserve
+
+La passe a duré **3 h 33** — 12 754 s, **5,78 messages/s** —, chargement 0,73 s. Ce n'est pas une
+mesure du critère : elle tournait en priorité minimale sur une machine qui servait, et le
+chargement, que la charge ne touche pas au repos, a pris trois fois son temps du 2026-09-25. C'est
+donc **un plancher** : au repos, la passe va au moins aussi vite, et déjà plus vite que les
+4,68 messages/s du modèle entier sans tri des lots.
+
+#### Les mesures de temps, prises et jetées
+
+Les bancs des critères 2 et 4 ont tourné à 19 h 30, et leurs chiffres sont mauvais — recherche
+hybride à 65–80 ms de p95, une arrivée à 1,2–1,6 s. Ils ne sont **pas** retenus : un jeu occupait
+sept cœurs, la machine était chargée à 96 %, et le chargement du modèle mesuré seul y prenait 0,5 à
+0,6 s contre 0,24 au repos. L'enfant de la passe de fond tourne en priorité minimale, donc c'est lui
+que la charge écrase le plus. **Ce ne sont pas des verdicts**, dans un sens ni dans l'autre : ils se
+refont machine libre.
+
+Le banc du critère 7 a refusé de tourner : le corpus de mesure porte neuf comptes IMAP, et la
+coquille s'y serait connectée pendant le chronométrage. Il les **désactive** maintenant dans sa
+réplique — un compte désactivé n'est ni veillé ni moissonné —, puis relit qu'aucun ne l'est
+resté. Leur hôte reste : un compte IMAP sans hôte est refusé comme incohérent, et le démarrage
+échouerait au lieu de se mesurer.
+
+#### Reste
+
+- la chronologie de la mémoire, sur 5 000 messages puis sur la passe complète s'il le faut, et le
+  remède qu'elle désignera ;
+- les critères 2, 4 et 7, machine au repos.

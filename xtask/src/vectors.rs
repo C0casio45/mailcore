@@ -178,15 +178,15 @@ fn run<E: Encoder>(
     let load_peak = sampler.stop();
     let rss_model = current_rss();
 
-    let progress = Progress::new();
-    let sampler = RssSampler::start();
+    let progress = std::sync::Arc::new(Progress::new());
+    let sampler = RssSampler::start_tracking(std::sync::Arc::clone(&progress));
     let at = Instant::now();
     let stats = bounded(options.limit, &progress, || {
         mailvec::pass::update_with(store, &encoder, mailvec::text::Budget::default(), &progress)
     })
     .context("passe")?;
     let elapsed = at.elapsed();
-    let pass_peak = sampler.stop();
+    let (pass_peak, timeline) = sampler.stop_tracked();
     let rss_done = current_rss();
 
     report(&Reading {
@@ -203,6 +203,7 @@ fn run<E: Encoder>(
         model: rss_model,
         pass_peak,
         done: rss_done,
+        timeline,
     });
 
     if let Some(keep) = &options.keep {
@@ -388,6 +389,7 @@ struct Reading {
     model: u64,
     pass_peak: u64,
     done: u64,
+    timeline: Option<crate::measure::Timeline>,
 }
 
 /// Écrit le relevé.
@@ -437,6 +439,30 @@ fn report(r: &Reading) {
             "{label:<18}{}",
             mib(usize::try_from(rss).unwrap_or(usize::MAX))
         );
+    }
+    if let Some(timeline) = &r.timeline {
+        // Un pic se voit comme une tranche qui dépasse ses voisines ; une dérive, comme des
+        // tranches qui montent l'une après l'autre. Le remède n'est pas le même.
+        println!(
+            "\ncrête atteinte    après {} messages sur {}",
+            timeline.at_peak, r.total
+        );
+        println!("crête par vingtième de la passe, en Mio :");
+        #[allow(clippy::cast_precision_loss)]
+        let cells: Vec<String> = timeline
+            .slices
+            .iter()
+            .map(|rss| {
+                if *rss == 0 {
+                    "—".to_owned()
+                } else {
+                    format!("{:.0}", *rss as f64 / (1024.0 * 1024.0))
+                }
+            })
+            .collect();
+        for row in cells.chunks(10) {
+            println!("                  {}", row.join("  "));
+        }
     }
     // Les deux crêtes échantillonnées, et les deux paliers au cas où l'échantillonneur aurait
     // manqué un instant : la crête est le plus grand de tout ce qui a été vu.

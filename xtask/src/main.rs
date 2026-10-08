@@ -308,10 +308,12 @@ enum Command {
         /// Le jeu de requêtes et leurs réponses attendues.
         #[arg(long, default_value = "measurements/phase4-queries.toml")]
         queries: Utf8PathBuf,
-        /// Combien de résultats demander au moteur. Au-delà du top mesuré, pour voir de
-        /// combien une cible manquée est manquée.
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
+        /// Combien de résultats demander au moteur. **Par défaut, tout le corpus** : une cible
+        /// classée au-delà de la limite s'affiche comme absente, et c'est l'absence fabriquée
+        /// que le 2026-09-23 avait retirée — la valeur par défaut de 50 la refabriquait le
+        /// 2026-10-08. Une limite donnée est rappelée en tête du relevé.
+        #[arg(long)]
+        limit: Option<usize>,
         /// Le répertoire du modèle. **Sans lui, le banc mesure tantivy seul** — c'est le relevé
         /// de référence du 2026-09-15, rejouable avec le code d'aujourd'hui.
         #[arg(long)]

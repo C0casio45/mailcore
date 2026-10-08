@@ -145,7 +145,7 @@ impl Outcome {
 pub fn measure(
     store_root: &Utf8PathBuf,
     queries: &Utf8PathBuf,
-    limit: usize,
+    limit: Option<usize>,
     model: Option<&Utf8PathBuf>,
     k: f32,
     bert: bool,
@@ -170,6 +170,27 @@ pub fn measure(
 
     // L'index doit couvrir le store, sinon ce banc ment sans le dire — voir `check_coverage`.
     check_coverage(&mailbox, store_root)?;
+
+    // **Toute la profondeur, sauf demande contraire.** Un rang coupé n'est pas une absence, et le
+    // relevé les confondait : la valeur par défaut de 50 rendait « absente » chez les trois
+    // moteurs une cible que le plein texte classait 3 095ᵉ — le 2026-10-08, sur le relevé qui
+    // devait refaire celui du 2026-09-23. La leçon de ce jour-là, « ce qui tronque doit le
+    // dire », valait pour le code et pas pour la valeur par défaut qui le réglait.
+    let messages = mailbox
+        .store()
+        .message_count()
+        .context("compte des messages")?;
+    let corpus = usize::try_from(messages).unwrap_or(usize::MAX);
+    let limit = limit.unwrap_or(corpus).max(1);
+    let truncated = limit < corpus;
+    println!(
+        "Profondeur         {limit} résultats par moteur — {}",
+        if truncated {
+            "COUPÉE : « — » veut dire classée au-delà, pas absente"
+        } else {
+            "tout le corpus, chaque rang est le vrai"
+        }
+    );
 
     // Le moteur sémantique est **optionnel** ici comme dans le produit : sans modèle, le banc
     // rend le relevé de référence, celui du 2026-09-15. C'est ce qui permet de rejouer l'ancien
