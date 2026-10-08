@@ -156,9 +156,17 @@ impl Launch {
     #[must_use]
     pub fn dispatch() -> Self {
         let mut args = std::env::args_os().skip(1);
-        if args.next().as_deref() == Some(std::ffi::OsStr::new(CHILD_FLAG)) {
+        let flag = args.next();
+        let serve: Option<fn(&Utf8Path) -> i32> = match flag.as_deref() {
+            Some(f) if f == std::ffi::OsStr::new(CHILD_FLAG) => Some(child::run),
+            Some(f) if f == std::ffi::OsStr::new(crate::semantic::CHILD_FLAG) => {
+                Some(crate::semantic::child::run)
+            }
+            _ => None,
+        };
+        if let Some(serve) = serve {
             let code = match args.next().map(OsString::into_string) {
-                Some(Ok(root)) => child::run(Utf8Path::new(&root)),
+                Some(Ok(root)) => serve(Utf8Path::new(&root)),
                 _ => 2,
             };
             std::process::exit(code);

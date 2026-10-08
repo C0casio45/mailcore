@@ -28,8 +28,54 @@
 use mailcore::{FolderSummary, ListItem, MessageFlags, StoreStats};
 use serde::{Deserialize, Serialize};
 
-/// Ce que le démon dit de lui-même, en un aller-retour.
+/// Ce qu'un résultat de recherche doit à chaque moteur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FoundBy {
+    /// Les mots seuls.
+    Words,
+    /// Le sens seul — le message ne partage aucun mot cherché, ou trop loin dans la liste.
+    Meaning,
+    /// Les deux.
+    Both,
+}
+
+/// L'état de la recherche par le sens, **dit par le démon** : un client l'affiche, il ne le
+/// déduit pas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticState {
+    /// Elle répond.
+    Ready,
+    /// Elle répond, et rattrape des messages arrivés.
+    Working,
+    /// Aucun modèle installé.
+    ModelAbsent,
+    /// Une passe explicite est nécessaire avant qu'elle voie tout le courrier.
+    NeedsPass,
+    /// Elle ne répond pas, pour une raison que le démon journalise.
+    Unavailable,
+    /// Ce démon ne la propose pas.
+    Disabled,
+}
+
+/// La recherche par le sens : son état, une phrase pour l'humain, et le geste qui la répare.
 ///
+/// **La phrase est composée par le démon, après la décision** — la leçon des refus d'envoi du
+/// 2026-09-10 —, et elle ne porte jamais de chemin : `docs/PRIVACY.md`, §8. Le geste est une
+/// commande à lancer sur la machine du démon, ou rien quand il n'y a rien à faire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Semantic {
+    /// L'état, pour décider.
+    pub state: SemanticState,
+    /// Une phrase, pour l'afficher.
+    pub sentence: String,
+    /// La commande qui répare, s'il y en a une.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gesture: Option<String>,
+}
+
+/// Ce que le démon dit de lui-même, en un aller-retour.///
 /// Appelé en premier par un client : il y trouve de quoi décider s'il peut parler à ce
 /// démon, s'il peut chercher, et si son cache de lecture est encore à jour — sans avoir
 /// enchaîné trois requêtes (critère 1 de `docs/PHASE-1.md`).
@@ -48,6 +94,9 @@ pub struct Hello {
     pub revision: String,
     /// Nombre de messages, pour afficher quelque chose immédiatement.
     pub messages: u64,
+    /// La recherche par le sens, quand le démon la connaît. Absent d'un démon plus ancien.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<Semantic>,
 }
 
 /// Un dossier et ses compteurs.
@@ -113,6 +162,10 @@ pub struct Row {
     /// seulement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f32>,
+    /// Pour un résultat de recherche : ce qu'il doit à chaque moteur. Absent hors recherche, et
+    /// d'un démon sans recherche par le sens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub found_by: Option<FoundBy>,
 }
 
 impl Row {
@@ -132,6 +185,7 @@ impl Row {
             unread: !item.flags.contains(MessageFlags::SEEN),
             flagged: item.flags.contains(MessageFlags::FLAGGED),
             score,
+            found_by: None,
         }
     }
 }
@@ -338,6 +392,10 @@ pub struct Results {
     /// Faux quand l'index plein texte est absent. Une liste vide et une recherche
     /// impossible ne doivent pas se ressembler côté client.
     pub search_available: bool,
+    /// La recherche par le sens, pour **cette** requête : prête, absente, ou en échec — un
+    /// client dit alors que les résultats ne viennent que des mots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic: Option<Semantic>,
 }
 
 /// L'état du store.

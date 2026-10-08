@@ -67,6 +67,8 @@ pub struct Api {
     vectoriser: Option<Arc<crate::vectors::Vectoriser>>,
     /// Les veilleurs `IDLE`, tenus ici pour la même raison que la passe de fond.
     watchers: Option<Arc<crate::watch::Watchers>>,
+    /// La recherche par le sens. `None` : `search.query` reste le plein texte du répartiteur.
+    semantic: Option<Arc<crate::semantic::Engine>>,
 }
 
 impl std::fmt::Debug for Api {
@@ -85,6 +87,7 @@ impl Api {
             postman: None,
             vectoriser: None,
             watchers: None,
+            semantic: None,
         }
     }
 
@@ -111,6 +114,15 @@ impl Api {
     pub fn with_watchers(self, watchers: Arc<crate::watch::Watchers>) -> Self {
         Self {
             watchers: Some(watchers),
+            ..self
+        }
+    }
+
+    /// Attache la recherche par le sens : `search.query` fusionne alors les deux moteurs.
+    #[must_use]
+    pub fn with_semantic(self, semantic: Arc<crate::semantic::Engine>) -> Self {
+        Self {
+            semantic: Some(semantic),
             ..self
         }
     }
@@ -161,11 +173,30 @@ impl Api {
         let outcome = if mailapi::method::SERVED_BY_TRANSPORT.contains(&request.method.as_str()) {
             self.transport_method(&request.method, request.params.clone())
                 .await
+        } else if request.method == mailapi::method::SEARCH_QUERY
+            && let Some(engine) = self.semantic.clone()
+        {
+            self.hybrid_search(engine, request.params.clone()).await
         } else {
             let method = request.method.clone();
             let params = request.params.clone();
-            self.read(move |mailbox| mailapi::call(mailbox, &method, params))
-                .await
+            let outcome = self
+                .read(move |mailbox| mailapi::call(mailbox, &method, params))
+                .await;
+            // `server.hello` dit aussi où en est la recherche par le sens : c'est le démon qui le
+            // sait, et un client ne doit pas avoir à le deviner.
+            match outcome {
+                Ok(mut value) if request.method == mailapi::method::SERVER_HELLO => {
+                    if let Some(semantic) = self.describe_semantic(None, false)
+                        && let Ok(encoded) = encode(&semantic)
+                        && let Some(object) = value.as_object_mut()
+                    {
+                        object.insert("semantic".to_owned(), encoded);
+                    }
+                    Ok(value)
+                }
+                other => other,
+            }
         };
 
         // Le nom de la méthode se journalise, ses paramètres non : un identifiant de message
@@ -333,6 +364,135 @@ impl Api {
             }
             tokio::time::sleep(remaining.min(POLL_INTERVAL)).await;
         }
+    }
+
+    /// L'état de la recherche par le sens, en phrase. `None` quand elle n'est pas montée — un
+    /// démon de test, un outil : le champ est alors absent, comme d'un démon plus ancien.
+    fn describe_semantic(
+        &self,
+        failure: Option<crate::semantic::Unavailable>,
+        operators: bool,
+    ) -> Option<mailapi::dto::Semantic> {
+        let engine = self.semantic.as_ref()?;
+        Some(crate::semantic::describe(&crate::semantic::Facts {
+            enabled: engine.enabled(),
+            model_installed: engine.model_installed(),
+            vectors_present: engine.vectors_present(),
+            status: self.vectors_status(),
+            failure,
+            operators,
+        }))
+    }
+
+    /// `search.query` quand la recherche par le sens est montée : les deux moteurs, fusionnés.
+    ///
+    /// ## Le plein texte décide de la validité
+    ///
+    /// Une requête que tantivy refuse est une erreur, et le sens n'est même pas demandé : un refus
+    /// se corrige, une liste « par le sens » à la place se croirait — `mailvec::search::Hybrid`
+    /// porte la même règle, pour la même raison.
+    ///
+    /// ## Le sens ne tient jamais le verrou de la boîte
+    ///
+    /// Il attend un autre processus — jusqu'à une minute quand le modèle se charge. Tenu sous le
+    /// verrou, il figerait toutes les autres lectures, la liste d'un dossier comprise : la règle 3
+    /// appliquée au démon. Il est donc demandé **entre** deux lectures, sur un fil à lui.
+    async fn hybrid_search(
+        &self,
+        engine: Arc<crate::semantic::Engine>,
+        params: Value,
+    ) -> Result<Value, Error> {
+        let params: mailapi::dispatch::SearchParams =
+            serde_json::from_value(params).map_err(Error::invalid_params)?;
+        let limit = params
+            .limit
+            .unwrap_or(mailapi::dispatch::DEFAULT_RESULTS)
+            .min(mailcore::query::MAX_RESULTS);
+        let depth = mailvec::search::depth(mailvec::search::DEPTH, limit);
+        let query = params.query;
+
+        let asked = query.clone();
+        let (found, search_available) = self
+            .read(move |mailbox| match mailbox.search_deep(&asked, depth) {
+                Ok(found) => Ok((found, mailbox.search_available())),
+                Err(mailcore::Error::Query(source)) => Err(Error::invalid_params(source)),
+                Err(source) => Err(mailapi::dispatch::opaque(source)),
+            })
+            .await?;
+
+        let operators = mailvec::search::uses_operators(&query);
+        let semantic = if operators {
+            None
+        } else {
+            let ranked = tokio::task::spawn_blocking(move || engine.ranked(&query, depth)).await;
+            Some(ranked.unwrap_or(Err(crate::semantic::Unavailable::Failed)))
+        };
+        let failure = match &semantic {
+            Some(Err(why)) => Some(*why),
+            _ => None,
+        };
+        let meaning = semantic.and_then(Result::ok);
+
+        let words: Vec<mailcore::MessageId> = found.iter().map(|hit| hit.item.id).collect();
+        // Par identifiant, pas par rang : les rangs de la fusion commencent à un, et un index qui
+        // les prendrait pour des positions perdrait le dernier résultat des mots — c'est arrivé.
+        let by_id: std::collections::HashMap<mailcore::MessageId, &mailcore::SearchResult> =
+            found.iter().map(|hit| (hit.item.id, hit)).collect();
+        let fused =
+            mailvec::search::fuse_lists(&words, meaning.as_deref(), mailcore::fusion::K, limit);
+
+        // Les messages trouvés par le sens seul n'ont pas encore leur ligne : une seule lecture
+        // pour tous.
+        let missing: Vec<mailcore::MessageId> = fused
+            .iter()
+            .filter(|hit| hit.ranks.first().copied().flatten().is_none())
+            .map(|hit| hit.id)
+            .collect();
+        let extra = self
+            .read(move |mailbox| {
+                missing
+                    .into_iter()
+                    .map(|id| mailbox.item(id).map(|item| (id, item)))
+                    .collect::<Result<std::collections::HashMap<_, _>, _>>()
+                    .map_err(mailapi::dispatch::opaque)
+            })
+            .await?;
+
+        let rows: Vec<mailapi::dto::Row> = fused
+            .iter()
+            .filter_map(|hit| {
+                let by_words = hit.ranks.first().copied().flatten();
+                let by_meaning = hit.ranks.get(1).copied().flatten();
+                let (item, words_score) = match by_id.get(&hit.id) {
+                    Some(found) => (found.item.clone(), Some(found.score)),
+                    // Un vecteur pour un message que le store n'a plus : écarté, comme le fait
+                    // `Mailbox::search` pour un document d'index obsolète.
+                    None => (extra.get(&hit.id)?.clone()?, None),
+                };
+                // Sans liste du sens, le score reste le BM25 que le client recevait avant : la
+                // fusion d'une seule liste ne change pas l'ordre, elle n'a pas à changer l'échelle.
+                let score = if meaning.is_some() {
+                    hit.score
+                } else {
+                    words_score.unwrap_or(hit.score)
+                };
+                let mut row = mailapi::dto::Row::new(&item, Some(score));
+                row.found_by = Some(match (by_words, by_meaning) {
+                    (Some(_), Some(_)) => mailapi::dto::FoundBy::Both,
+                    (None, Some(_)) => mailapi::dto::FoundBy::Meaning,
+                    _ => mailapi::dto::FoundBy::Words,
+                });
+                Some(row)
+            })
+            .collect();
+
+        encode(&mailapi::dto::Results {
+            truncated: mailcore::query::truncated(rows.len(), limit),
+            count: rows.len(),
+            search_available,
+            rows,
+            semantic: self.describe_semantic(failure, operators),
+        })
     }
 
     /// Exécute une lecture sur la boîte, hors du fil du runtime.

@@ -543,6 +543,15 @@ impl Mailbox {
         }
     }
 
+    /// La ligne de liste d'un message, sans relire son blob — ce qu'une recherche rend.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn item(&self, id: MessageId) -> Result<Option<ListItem>> {
+        self.store.message(id)
+    }
+
     /// Ouvre un message : corps en texte, pièces jointes listées, dossiers.
     ///
     /// # Errors

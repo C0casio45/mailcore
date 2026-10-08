@@ -51,6 +51,7 @@ pub mod api;
 pub mod config;
 pub mod jobs;
 pub mod outbox;
+pub mod semantic;
 pub mod vectors;
 pub mod watch;
 
@@ -86,6 +87,9 @@ pub struct Service {
     /// La passe de fond des vecteurs. Partagée avec l'API, qui la garde en vie — voir
     /// [`vectors`].
     pub vectoriser: Arc<vectors::Vectoriser>,
+    /// La recherche par le sens, partagée avec l'API pour la même raison. L'enfant qui la sert
+    /// ne naît qu'à la première requête.
+    pub semantic: Arc<semantic::Engine>,
 }
 
 impl Service {
@@ -149,8 +153,13 @@ impl Service {
         // La passe de fond des vecteurs, **accrochée à l'API** comme le facteur : la coquille
         // embarquée ne garde que l'API et la boîte, et un fil tenu ailleurs mourrait au démarrage
         // — c'est ce qui arrive à la veille `IDLE` dans la coquille.
+        // Le même exécutable sert la recherche par le sens, dans un autre enfant : monté avant que
+        // `launch` ne parte à la passe de fond.
+        let semantic = Arc::new(semantic::Engine::start(store, &launch));
         let vectoriser = Arc::new(vectors::Vectoriser::start(store, activity, launch));
-        let api = api.with_vectoriser(Arc::clone(&vectoriser));
+        let api = api
+            .with_vectoriser(Arc::clone(&vectoriser))
+            .with_semantic(Arc::clone(&semantic));
 
         Ok(Self {
             mailbox: shared,
@@ -159,6 +168,7 @@ impl Service {
             watchers,
             postman,
             vectoriser,
+            semantic,
         })
     }
 }

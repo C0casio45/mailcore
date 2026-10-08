@@ -23,6 +23,12 @@
 //! passe et ce qu'on lit. Aucune option n'ignore un certificat, aucun repli en clair ne rattrape
 //! un échec, et un serveur qui n'annonce pas `STARTTLS` alors que le compte le demande fait
 //! échouer la connexion.
+//!
+//! ## D'où vient l'adresse
+//!
+//! De la configuration de soumission du compte, que l'utilisateur écrit avec
+//! `mail account submission` — **jamais déduite du serveur IMAP**, et jamais d'un message. C'est ce
+//! que `xtask/tests/reseau.rs` demande à tout fichier livré qui ouvre une connexion.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;

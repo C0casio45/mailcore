@@ -44,6 +44,12 @@ const SHIPPED: &[&str] = &[
     "maild",
     "mail-cli",
     "mail-shell",
+    // Livrés depuis la phase 3 — l'envoi et les invitations — et la phase 4 — les vecteurs. La
+    // liste ne les portait pas : le test vérifiait la surface de la phase 2, plus celle du projet.
+    // Trouvé le 2026-10-08 en l'étendant au critère 6 de `docs/PHASE-4.md`.
+    "mailsmtp",
+    "mailcal",
+    "mailvec",
 ];
 
 /// Les seuls fichiers livrés autorisés à ouvrir une connexion sortante.
@@ -55,16 +61,20 @@ const SHIPPED: &[&str] = &[
 /// - `mailauth/src/http.rs` — le point de terminaison de jeton OAuth2. L'adresse vient d'une
 ///   **constante du code**, pas d'une donnée : un point de terminaison configurable serait le
 ///   moyen le plus simple de faire envoyer un jeton de rafraîchissement ailleurs ;
-/// - `mailsync/src/tls.rs` — le client IMAP. L'adresse vient de la configuration du compte.
+/// - `mailsync/src/tls.rs` — le client IMAP. L'adresse vient de la configuration du compte ;
+/// - `mailsmtp/src/tls.rs` — le client de soumission. L'adresse vient de la configuration de
+///   soumission du compte, écrite par l'utilisateur et **jamais déduite** du serveur IMAP.
 ///
-/// **Aucun des trois ne choisit son hôte librement.** C'est la formulation exacte de ce que le
+/// **Aucun des quatre ne choisit son hôte librement.** C'est la formulation exacte de ce que le
 /// critère peut garantir sur notre code.
 ///
 /// Le troisième a été ajouté le 2026-09-04, et **ce test a échoué d'abord** : la surface
-/// réseau d'un crate livré ne grandit pas sans que quelqu'un l'écrive ici.
+/// réseau d'un crate livré ne grandit pas sans que quelqu'un l'écrive ici. Le quatrième aussi, le
+/// 2026-10-08 — un mois après avoir été écrit, parce que `mailsmtp` n'était pas dans [`SHIPPED`].
 const MAY_CONNECT: &[&str] = &[
     "mailapi/src/client.rs",
     "mailauth/src/http.rs",
+    "mailsmtp/src/tls.rs",
     "mailsync/src/tls.rs",
 ];
 
@@ -91,6 +101,9 @@ const UNWANTED: &[&str] = &[
     "opentelemetry",
     "posthog",
     "analytics",
+    // Le téléchargeur de modèles de Hugging Face, que `tokenizers` et `candle` tirent par leurs
+    // fonctions par défaut. Le modèle s'installe **sur commande**, à la main : `mail model install`.
+    "hf-hub",
 ];
 
 /// La racine du workspace.
@@ -171,7 +184,7 @@ fn relative(path: &Path, root: &Path) -> String {
 }
 
 #[test]
-fn only_two_shipped_files_open_an_outbound_connection() {
+fn only_the_declared_shipped_files_open_an_outbound_connection() {
     let root = root();
     let mut found: Vec<String> = Vec::new();
 
@@ -198,7 +211,7 @@ fn only_two_shipped_files_open_an_outbound_connection() {
         .collect();
 
     // **Le contrôle positif.** Un chercheur qui ne trouve rien rendrait la liste vide, et le
-    // test passerait en ne vérifiant rien. Les deux fichiers autorisés doivent être trouvés.
+    // test passerait en ne vérifiant rien. Les fichiers autorisés doivent tous être trouvés.
     assert_eq!(
         found, expected,
         "la surface réseau des crates livrés a changé.\n\
@@ -237,6 +250,72 @@ fn no_shipped_crate_depends_on_an_http_client_or_a_telemetry_sdk() {
         "un client HTTP ou un SDK de télémétrie est arrivé dans un crate livré : {offenders:?}\n\
          Le critère 5 de docs/PHASE-2.md dit que l'application se connecte aux serveurs que \
          l'utilisateur a configurés et à rien d'autre."
+    );
+}
+
+/// **Critère 6 de `docs/PHASE-4.md`, côté dépendances** : rien dans le graphe ne sait télécharger
+/// un modèle.
+///
+/// `tokenizers` et `candle` savent aller chercher un modèle sur Hugging Face, par `hf-hub` et un
+/// client HTTP — mais seulement par leurs fonctions par défaut. Les désactiver est ce qui rend vraie
+/// la phrase « mailcore ne télécharge rien lui-même » de `mail model install` ; une ligne de
+/// manifeste qui les rallumerait la rendrait fausse sans qu'aucun code ne change.
+///
+/// Le fichier de verrouillage et non le manifeste d'un crate : le téléchargeur arriverait par une
+/// dépendance **transitive**, que l'analyse des manifestes ne voit pas. `reqwest`, lui, y est —
+/// par `tauri`, dans `mail-ui`, la coquille gardée pour éprouver la CSP et qui n'est pas livrée —,
+/// donc il ne peut pas être cherché ici ; l'analyse des manifestes le refuse dans tout crate livré.
+#[test]
+fn nothing_in_the_dependency_graph_can_download_a_model() {
+    let root = root();
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("Cargo.lock lisible");
+    let packages: Vec<&str> = lock
+        .lines()
+        .filter_map(|line| line.strip_prefix("name = \""))
+        .filter_map(|rest| rest.strip_suffix('"'))
+        .collect();
+    // Le contrôle positif : un lecteur qui ne trouve aucun paquet ne trouverait aucun coupable.
+    assert!(
+        packages.contains(&"tokenizers"),
+        "le lecteur du verrou ne voit rien"
+    );
+    for downloader in ["hf-hub", "ureq"] {
+        assert!(
+            !packages.contains(&downloader),
+            "{downloader} est dans le graphe : quelque chose sait télécharger un modèle"
+        );
+    }
+
+    let manifest =
+        std::fs::read_to_string(root.join("Cargo.toml")).expect("manifeste du workspace lisible");
+    let mut checked = 0;
+    for line in manifest
+        .lines()
+        .map(|it| it.split_once('#').map_or(it, |(a, _)| a))
+    {
+        let name = line.split('=').next().unwrap_or_default().trim();
+        if [
+            "tokenizers",
+            "candle-core",
+            "candle-nn",
+            "candle-transformers",
+        ]
+        .contains(&name)
+        {
+            checked += 1;
+            assert!(
+                line.contains("default-features = false"),
+                "{name} est compilé avec ses fonctions par défaut, donc son téléchargeur : {line}"
+            );
+            assert!(
+                !line.contains("http"),
+                "{name} a une fonction réseau : {line}"
+            );
+        }
+    }
+    assert_eq!(
+        checked, 4,
+        "une des dépendances du modèle n'est plus déclarée dans le workspace"
     );
 }
 

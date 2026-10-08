@@ -90,10 +90,10 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
 | 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **tenu avec l'embedding statique, NON TENU avec le transformeur (2026-09-22)**. Statique : **117 Mio** de crête — 8,7 au démarrage, 12,7 store ouvert, 69,5 modèle chargé, 117 passe finie. Transformeur : **1 304 Mio** de crête et 985 de résident, soit **2,6 fois le seuil**. Le remède est celui du 2026-09-15 — tailler le vocabulaire — et il porte ici sur deux fichiers, le `tokenizer.json` de 17 Mo et `embeddings.word_embeddings.weight`. Le relevé du 2026-09-22 établit au passage que **ce rognage ne coûte rien en rappel** : taillé contre brut, 3 680 contre 3 901 sur les cibles françaises, l'écart est du côté du bruit |
-| 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | à faire |
-| 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | à faire |
+| 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | **tenu le 2026-10-08, et verrouillé en CI.** Comportement : un canari sur le bouclage, désigné d'une quarantaine de façons par trois messages hostiles, traverse la vraie moisson, les passes dérivées et la passe de fond dans l'exécutable `maild` relancé — **0 connexion**, contrôles positifs compris (`maild/tests/contenu_hors_ligne.rs`). Surface : l'analyse de source étendue à `mailsmtp`, `mailcal`, `mailvec`, et ni `hf-hub` ni `ureq` dans le graphe. **L'installation du modèle ne fait aucune requête** : `mail model install` dit quoi télécharger et vérifie les empreintes |
+| 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | **deux tiers tenus le 2026-10-08, vérifiés par test** : sans modèle, les mots répondent seuls, et la ligne au-dessus des résultats dit « Aucun modèle n'est installé… » avec la commande `mail model install` — `server.hello` le dit aussi avant toute recherche. **Le démarrage reste à mesurer**, au repos ; par construction rien ne se charge au démarrage, l'enfant du sens ne naît qu'à la première recherche |
 | 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | à faire |
-| 9 | Les deux magasins ne se contredisent pas | drapeaux en SQLite, vecteurs ailleurs : le contrôle du 2026-09-11 sur l'index, refait ici. Un magasin de vecteurs vidé pendant que les drapeaux disent « fait » doit être **détecté au point d'usage**, pas laissé silencieux | à faire |
+| 9 | Les deux magasins ne se contredisent pas | drapeaux en SQLite, vecteurs ailleurs : le contrôle du 2026-09-11 sur l'index, refait ici. Un magasin de vecteurs vidé pendant que les drapeaux disent « fait » doit être **détecté au point d'usage**, pas laissé silencieux | **tenu, vérifié par test.** Au point d'usage, à trois endroits : la passe explicite le détecte et refait tout (`pass::update_with`) ; la passe de fond le détecte et **refuse** sans rien effacer (`pass::plan`, raison « divergent ») ; la recherche refuse des vecteurs d'un autre modèle. Dans les trois cas l'écran le dit, avec la commande qui répare — étape 8 |
 
 Le critère 1 est celui qui décide si la phase valait la peine. Les autres disent si elle est
 utilisable.
@@ -192,10 +192,14 @@ utilisable.
    synonymie française (étape 6 ter) et le contenu des pièces jointes, faute de quoi le banc reste
    muet sur ce qu'on vient de livrer.
 
-7. **La passe incrémentale** — critère 4 — sur le modèle des trois dérivés existants, et une
-   quatrième ligne dans `measure-followup`.
+7. ~~**La passe incrémentale** — critère 4 — sur le modèle des trois dérivés existants.~~ Fait le
+   2026-10-08 : dans un processus enfant, en priorité minimale, jamais pendant un job, et sans
+   jamais rien effacer. Le critère 4 reste à mesurer. Voir le journal.
 
-8. **L'API, la coquille, et l'absence de modèle** — critères 7 et 6.
+8. ~~**L'API, la coquille, et l'absence de modèle** — critères 7 et 6.~~ Fait le 2026-10-08 :
+   `search.query` fusionne les mots et le sens, dit ce que chaque résultat doit à chaque moteur,
+   et dit pourquoi le sens manque quand il manque ; `mail model install` dit quoi télécharger et
+   vérifie avant d'installer. Le critère 6 est verrouillé en deux moitiés. Voir le journal.
 
 Les étapes 1 et 2 sont ce qui rend la phase mesurable. Elles passent avant tout le reste pour la
 même raison que la file d'envoi passait avant l'interface à la phase 3 : c'est la partie qu'on ne
@@ -2327,3 +2331,102 @@ tourné : le parent n'encode rien.
 Reste à mesurer, machine au repos et la passe complète finie : le critère 4 à froid sur des
 messages réels, la mémoire du parent et de l'enfant, le démarrage de la coquille avec et sans
 modèle, et le travail par image pendant une passe de fond.
+
+### 2026-10-08 (suite) — l'étape 8 : chercher par le sens dans l'application, et le dire quand on ne peut pas
+
+**En clair d'abord.** La barre de recherche de la coquille cherche maintenant par les mots **et**
+par le sens, et fusionne les deux listes. Un message trouvé par le sens seul porte une marque,
+« ≈ sens », pour qu'il ne passe pas pour une erreur du moteur. Quand le sens ne peut pas répondre
+— pas de modèle, pas encore de vecteurs, des vecteurs d'un autre modèle —, les mots répondent
+seuls, et une ligne au-dessus des résultats dit **pourquoi** et **quelle commande** y remédie. Le
+modèle, lui, ne se télécharge jamais tout seul.
+
+#### Le dessin
+
+- **Le sens est servi par un second enfant**, `--mailcore-search`, sur le modèle de la passe de
+  fond : le modèle et les vecteurs pèsent 450 Mio, et le démon comme la coquille resteraient sinon
+  au-dessus du seuil de 500 Mo avant d'avoir rien affiché. L'enfant **naît à la première
+  recherche**, garde le modèle chaud tant qu'on cherche, et meurt après cinq minutes sans
+  requête. Rien ne se charge au démarrage — c'est la moitié du critère 7. Il relit le magasin
+  quand celui-ci a grandi — un `stat` et un en-tête par requête —, et **refuse des vecteurs d'un
+  autre modèle** : comparés à une requête encodée par celui-ci, ils rendraient un classement de
+  la bonne forme et sans aucun sens. C'est le critère 9 du côté de la lecture ;
+- **le sens n'est jamais demandé sous le verrou de la boîte.** Charger le modèle prend jusqu'à
+  une minute ; sous le verrou, la liste d'un dossier aurait attendu avec lui. Le démon fait donc
+  trois temps — les mots sous le verrou, le sens sur un fil à lui, les lignes manquantes sous le
+  verrou —, et la fusion est **la même fonction** que celle du banc du critère 1,
+  `mailvec::search::fuse_lists` : deux règles de fusion finiraient par ne pas classer pareil ;
+- **les mots décident de la validité.** Une requête que tantivy refuse reste une erreur, et le
+  sens n'est même pas demandé : la première version de `Hybrid` laissait le sens répondre seul à
+  `subject:(`, et la faute de frappe devenait une liste « par le sens » que rien ne signalait. Et
+  une requête **à opérateurs** — un champ, des guillemets, `AND`, `-mot` — ne passe pas par le
+  sens : qui écrit `from:banque` demande un filtre, pas un voisinage. `14:30` n'est pas un champ ;
+- **la phrase est composée par le démon, après la décision**, par une seule fonction pour
+  `server.hello` et `search.query` — `maild::semantic::describe`. Un état pour décider, une phrase
+  pour afficher, une commande quand il y en a une — `mail model install`, `mail vectors --bert`,
+  `mail vectors --bert --rebuild` — et **aucun chemin**. La phrase ne promet pas ce qui n'a pas eu
+  lieu : un arriéré dit « le sens ne voit qu'une partie du courrier » quand des vecteurs existent,
+  « les résultats viennent des mots seuls » quand il n'y en a pas, et un test vérifie les deux ;
+- **un démon sans le moteur garde l'ancien contrat** : ni champ `semantic`, ni attribution. Le
+  serveur MCP reste au plein texte : un modèle de langage à l'autre bout formule déjà ses propres
+  variantes, et lui donner une liste fusionnée dont il ne voit pas la règle n'apporterait rien
+  qu'on ait mesuré.
+
+#### Deux défauts trouvés en écrivant
+
+- **les rangs de la fusion commencent à un.** Le premier jet prenait le rang d'un message dans la
+  liste des mots pour une position, et perdait le dernier résultat des mots — à chaque requête.
+  Le test d'intégration l'a vu au premier passage (2 rendus sur 3) ; la ligne se retrouve
+  maintenant **par identifiant**, ce qui ne dépend d'aucune convention ;
+- **la fenêtre du tokeniseur dépassait les positions du modèle.** Elle était fixée à 256 jetons,
+  quel que soit le modèle. `multilingual-e5-small` en a 512, donc rien ne se voyait ; un modèle qui
+  en aurait moins aurait échoué sur tout courrier un peu long — **pour ce message, à chaque passe,
+  sans fin**. Le test du critère 6, sur le transformeur minuscule à 64 positions, l'a trouvé. La
+  fenêtre est maintenant la plus petite des deux bornes, et le contrôle négatif — remettre 256 —
+  fait tomber le test.
+
+#### Le critère 6, en deux moitiés
+
+Le harnais de `mailprivacy` met à l'épreuve un moteur de rendu ; il n'y a pas de rendu dans une
+moisson ni dans une passe. Le critère y est donc vérifié par **deux tests qui se complètent** :
+
+- **le comportement** — `maild/tests/contenu_hors_ligne.rs`. Un écouteur sur le bouclage, que seul
+  le courrier désigne : trois messages le pointent d'une quarantaine de façons — image, `srcset`, feuille
+  de style, `@import`, police, fond, cadre, vidéo, objet, `ping`, rafraîchissement, préchargement,
+  accusés de lecture, `List-Unsubscribe`, `Content-Base`, corps externe, `URL` et `ATTACH` d'une
+  invitation, `Content-Location` d'une image liée. Ils passent par la vraie moisson, les trois
+  passes dérivées, puis la passe de fond **dans l'exécutable `maild` relancé en enfant**.
+  **Zéro connexion.** Le contrôle positif est double : les trois messages ont leur vecteur et sont
+  trouvés par l'index — une passe qui n'aurait rien lu ne contacterait rien non plus —, et le
+  canari entend bien une connexion qu'on lui fait ;
+- **la surface** — `xtask/tests/reseau.rs`, l'analyse de source de la phase 2. **Elle ne couvrait
+  plus le projet** : sa liste de crates livrés datait de la phase 2, sans `mailsmtp`, `mailcal` ni
+  `mailvec`. Étendue, elle a **échoué d'abord** sur `mailsmtp/src/tls.rs`, qui ouvre des
+  connexions depuis un mois sans avoir été déclaré ; son en-tête dit maintenant d'où vient son
+  adresse — la configuration de soumission, jamais déduite. Et un test nouveau verrouille la
+  phrase de `mail model install` : **ni `hf-hub` ni `ureq` dans le graphe**, et `tokenizers` comme
+  `candle` compilés sans leurs fonctions par défaut, qui sont celles qui téléchargent. `reqwest` y
+  est, par `tauri`, dans `mail-ui` — la coquille gardée pour la CSP, qui n'est pas livrée — ; c'est
+  écrit dans le test.
+
+Ce que les deux ne prouvent pas, écrit en tête du premier : une **résolution de nom** tirée du
+courrier n'atteint pas le canari — l'analyse de source cherche `to_socket_addrs` pour ça —, et
+une adresse qui n'est pas celle du canari ne le touche pas.
+
+#### Vérification
+
+Sept tests d'intégration de la recherche lancent le vrai `maild` en enfant pour encoder la
+requête : les mots et le sens arrivent fusionnés et attribués — trois messages par les deux,
+deux par le sens seul, un message des deux moteurs en tête — ; une requête à opérateurs est
+servie par les mots seuls et le dit ; une requête refusée reste une erreur ; sans modèle, les
+mots répondent, `mail model install` est proposé et `server.hello` le dit avant toute recherche ;
+un modèle sans vecteurs demande `mail vectors --bert` ; un démon qui ne sait pas se relancer le
+dit ; et un démon sans le moteur rend **exactement** l'ancien contrat. La coquille dessine chaque
+état et la marque d'une ligne sans paniquer.
+
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` — **1 564 tests verts**.
+
+Reste à mesurer, au repos : la latence de bout en bout avec le modèle chaud et à froid (critère
+2), le démarrage de la coquille avec et sans modèle (critère 7), et le coût d'une arrivée
+(critère 4).

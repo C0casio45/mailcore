@@ -172,6 +172,9 @@ pub struct Shell {
     query: String,
     /// Les résultats de recherche, ou `None` quand on regarde un dossier.
     results: Option<Vec<dto::Row>>,
+    /// Ce que le démon dit de la recherche par le sens pour la dernière requête. Affiché au-dessus
+    /// des résultats quand elle n'a pas répondu, avec le geste qui la répare — le critère 7.
+    semantic: Option<dto::Semantic>,
     searching: bool,
     focus_search: bool,
 
@@ -464,6 +467,7 @@ impl Shell {
             thread: Vec::new(),
             query: String::new(),
             results: None,
+            semantic: None,
             searching: false,
             focus_search: false,
             sources: Vec::new(),
@@ -838,6 +842,8 @@ impl Shell {
                     if self.bench_state.phase == Phase::Probing {
                         self.probe.search = Some("servi");
                     }
+                    let results = *results;
+                    self.semantic = results.semantic;
                     if results.search_available {
                         self.results = Some(results.rows);
                     } else {
@@ -2624,6 +2630,11 @@ impl Shell {
                 }
             });
         });
+        if self.results.is_some()
+            && let Some(semantic) = &self.semantic
+        {
+            semantic_banner(ui, semantic);
+        }
         ui.separator();
 
         let mut to_open = None;
@@ -3482,6 +3493,12 @@ fn row_widget(ui: &mut egui::Ui, row: &dto::Row, selected: bool) -> bool {
             if row.has_attachments {
                 ui.label("📎");
             }
+            // Un résultat que les mots n'ont pas trouvé se signale : sans la marque, il ressemble
+            // à une erreur du moteur — « pourquoi celui-là ? ».
+            if row.found_by == Some(dto::FoundBy::Meaning) {
+                ui.weak("≈ sens")
+                    .on_hover_text("Trouvé par le sens, pas par les mots cherchés.");
+            }
         });
     });
 
@@ -3496,6 +3513,34 @@ fn row_widget(ui: &mut egui::Ui, row: &dto::Row, selected: bool) -> bool {
     // couvre aussi les blancs entre les colonnes — personne ne vise un mot.
     clicked |= row_area.response.interact(egui::Sense::click()).clicked();
     clicked
+}
+
+/// La ligne qui dit pourquoi la recherche par le sens n'a pas répondu, et comment l'obtenir.
+///
+/// Rien quand elle a répondu : une ligne qui dirait « tout va bien » au-dessus de chaque recherche
+/// serait du bruit, et le bruit apprend à ne plus lire la ligne le jour où elle compte. La phrase
+/// et le geste viennent du démon ; cette fonction ne les compose pas, elle les montre.
+fn semantic_banner(ui: &mut egui::Ui, semantic: &dto::Semantic) {
+    use dto::SemanticState as State;
+    match semantic.state {
+        State::Ready | State::Disabled => {}
+        State::Working => {
+            ui.weak(&semantic.sentence);
+        }
+        State::ModelAbsent | State::NeedsPass | State::Unavailable => {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(&semantic.sentence).color(ui.visuals().warn_fg_color));
+                if let Some(gesture) = &semantic.gesture {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(gesture).monospace()).selectable(true),
+                    );
+                    if ui.small_button("Copier").clicked() {
+                        ui.ctx().copy_text(gesture.clone());
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// L'en-tête d'un message ouvert.
@@ -4166,6 +4211,7 @@ mod tests {
                 unread: false,
                 flagged: false,
                 score: None,
+                found_by: None,
                 has_attachments: false,
             },
             message_id: Some("<parent@exemple.fr>".to_owned()),
@@ -4303,6 +4349,47 @@ mod tests {
     // Il n'y a pas de test « le dessin ne modifie pas la source » : `source_body` prend un
     // `&dto::MessageSource`, donc le compilateur le prouve déjà. Un test qui répète une
     // garantie du type ne vérifie rien et coûte une ligne à maintenir.
+
+    #[test]
+    fn every_semantic_state_draws_and_a_row_found_by_meaning_too() {
+        use dto::SemanticState as State;
+        for state in [
+            State::Ready,
+            State::Working,
+            State::ModelAbsent,
+            State::NeedsPass,
+            State::Unavailable,
+            State::Disabled,
+        ] {
+            for gesture in [None, Some("mail model install".to_owned())] {
+                let semantic = dto::Semantic {
+                    state,
+                    sentence: "Aucun modèle n'est installé.".to_owned(),
+                    gesture,
+                };
+                egui::__run_test_ui(|ui| semantic_banner(ui, &semantic));
+            }
+        }
+        let mut row = dto::Row {
+            id: 1,
+            date: 1_789_041_600,
+            from: "a@exemple.fr".to_owned(),
+            from_name: None,
+            subject: "Le sujet".to_owned(),
+            unread: true,
+            flagged: false,
+            score: Some(0.03),
+            found_by: Some(dto::FoundBy::Meaning),
+            has_attachments: false,
+        };
+        egui::__run_test_ui(|ui| {
+            row_widget(ui, &row, false);
+        });
+        row.found_by = Some(dto::FoundBy::Both);
+        egui::__run_test_ui(|ui| {
+            row_widget(ui, &row, true);
+        });
+    }
 
     #[test]
     fn a_date_without_a_value_is_a_dash_and_not_the_epoch() {

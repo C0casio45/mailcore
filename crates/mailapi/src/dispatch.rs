@@ -542,6 +542,7 @@ pub fn call(mailbox: &Mailbox, method: &str, params: Value) -> Result<Value, Err
                 search_available: mailbox.search_available(),
                 revision: mailbox.revision().map_err(opaque)?,
                 messages: stats.messages,
+                semantic: None,
             })
         }
 
@@ -644,6 +645,8 @@ pub fn call(mailbox: &Mailbox, method: &str, params: Value) -> Result<Value, Err
                 count: rows.len(),
                 search_available: mailbox.search_available(),
                 rows,
+                // La recherche par le sens est servie par le démon, qui remplit ce champ.
+                semantic: None,
             })
         }
 
@@ -716,7 +719,7 @@ fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, Error> {
 /// Ni l'un ni l'autre n'a à traverser le réseau ni à finir dans le journal d'un client
 /// (`docs/PRIVACY.md`, section 8). La cause réelle est journalisée ici, côté démon, où elle
 /// sert au débogage sans être exposée.
-fn opaque(source: mailcore::Error) -> Error {
+pub fn opaque(source: mailcore::Error) -> Error {
     tracing::warn!(%source, "méthode de l'API en échec");
     let message = match source {
         mailcore::Error::Query(_) => "requête de recherche invalide",

@@ -246,64 +246,100 @@ impl<'a> Hybrid<'a> {
 
     /// Cherche, et rend au plus `limit` messages classés.
     ///
-    /// ## Une requête que le plein texte refuse n'annule pas le sémantique
+    /// ## Une requête que le plein texte refuse est une erreur, sémantique ou pas
     ///
-    /// La grammaire de tantivy refuse certaines entrées — c'est le défaut de l'apostrophe trouvé
-    /// le 2026-09-15, corrigé mais pas disparu : `subject:(` reste une erreur, et elle doit le
-    /// rester. Ici, une requête que le plein texte rejette laisse quand même parler le
-    /// sémantique, qui n'a aucune grammaire et donc aucune raison de refuser. L'erreur n'est pas
-    /// avalée pour autant : elle est journalisée, et le résultat dit qu'un moteur a manqué.
+    /// La grammaire de tantivy refuse certaines entrées — `subject:(` —, et c'est voulu : un refus
+    /// se corrige, une liste sans rapport se croit. La première version laissait le sémantique
+    /// répondre seul dans ce cas, en rendant une liste vide à la place du plein texte : la faute de
+    /// frappe devenait une liste de résultats « par le sens » que rien ne signalait. Corrigé le
+    /// 2026-10-08 : le refus remonte, que le sémantique soit là ou non.
+    ///
+    /// Une requête **à opérateurs** — un champ, des guillemets, `AND` — ne passe pas par le
+    /// sémantique : voir [`uses_operators`].
     ///
     /// # Errors
     ///
-    /// [`Error::Core`] si **les deux** moteurs échouent, ou si le store est illisible — une liste
-    /// vide rendue sans rien dire serait le pire des deux mondes.
+    /// [`Error::Core`] si le plein texte refuse la requête ou si le store est illisible. Un échec
+    /// du sémantique, lui, est journalisé et laisse le plein texte répondre seul.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<mailcore::fusion::Fused>> {
-        let depth = self.depth.max(limit);
+        let depth = depth(self.depth, limit);
 
         // **Non plafonné, depuis le 2026-09-23.** `Mailbox::search` tronque à 500 pour protéger
-        // l'API d'un client qui voudrait vider le store ; la fusion, elle, tourne dans le même
-        // processus et a besoin du rang vrai. Sans ça, le banc du critère 1 lisait « absente »
-        // là où il fallait lire « au-delà de 500 », et deux entrées du journal en dépendaient.
-        // En régime ordinaire `depth` vaut cinquante, donc rien ne change pour un client.
-        let full_text = match self.mailbox.search_deep(query, depth) {
-            Ok(hits) => Ok(hits.into_iter().map(|hit| hit.item.id).collect::<Vec<_>>()),
-            Err(error) => {
-                tracing::warn!(%error, "le plein texte a refusé la requête");
-                Err(error)
-            }
-        };
+        // l'API d'un client qui voudrait vider le store ; la fusion a besoin du rang vrai.
+        let full_text: Vec<MessageId> = self
+            .mailbox
+            .search_deep(query, depth)?
+            .into_iter()
+            .map(|hit| hit.item.id)
+            .collect();
 
         let semantic = match &self.semantic {
-            Some(engine) => match engine.search(query, depth) {
+            Some(engine) if !uses_operators(query) => match engine.search(query, depth) {
                 Ok(hits) => Some(hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>()),
                 Err(error) => {
                     tracing::warn!(%error, "le sémantique a refusé la requête");
                     None
                 }
             },
-            None => None,
+            _ => None,
         };
 
-        // Les deux en échec : on rend l'erreur du plein texte, qui est celle qui parle de la
-        // requête. Rendre une liste vide ferait croire à zéro résultat.
-        let full_text = match (full_text, &semantic) {
-            (Ok(list), _) => list,
-            (Err(error), None) => return Err(error.into()),
-            (Err(_), Some(_)) => Vec::new(),
-        };
-
-        let mut lists: Vec<&[MessageId]> = vec![&full_text];
-        if let Some(list) = &semantic {
-            lists.push(list);
-        }
-
-        let mut fused = mailcore::fusion::fuse(&lists, self.k);
-        fused.truncate(limit);
-        Ok(fused)
+        Ok(fuse_lists(&full_text, semantic.as_deref(), self.k, limit))
     }
 }
 
+/// La profondeur demandée à chaque moteur pour rendre `limit` résultats : jamais moins que la
+/// limite, jamais moins que `minimum`.
+#[must_use]
+pub fn depth(minimum: usize, limit: usize) -> usize {
+    minimum.max(limit)
+}
+
+/// **La règle de fusion de la recherche**, la seule du projet : le banc du critère 1 et le démon
+/// l'appellent tous deux, le second avec une liste sémantique calculée dans un autre processus.
+///
+/// Sans liste sémantique, le résultat est exactement le plein texte, dans son ordre.
+#[must_use]
+pub fn fuse_lists(
+    full_text: &[MessageId],
+    semantic: Option<&[MessageId]>,
+    k: f32,
+    limit: usize,
+) -> Vec<mailcore::fusion::Fused> {
+    let mut lists: Vec<&[MessageId]> = vec![full_text];
+    if let Some(list) = semantic {
+        lists.push(list);
+    }
+    let mut fused = mailcore::fusion::fuse(&lists, k);
+    fused.truncate(limit);
+    fused
+}
+
+/// Vrai si la requête emploie la grammaire du plein texte : un champ (`from:`), une phrase entre
+/// guillemets, un opérateur (`AND`, `OR`, `NOT`, `-mot`, `+mot`).
+///
+/// ## Pourquoi elle ne passe pas par le sémantique
+///
+/// Qui écrit `from:banque "relevé de compte"` demande un filtre précis, pas un voisinage de sens.
+/// Le modèle encoderait la requête mot pour mot — `from:banque` compris — et la fusion diluerait
+/// le filtre exact dans des messages « proches » : c'est le défaut de fusion relevé le 2026-09-21,
+/// appliqué à la requête qui s'y prête le moins.
+#[must_use]
+pub fn uses_operators(query: &str) -> bool {
+    query.contains('"')
+        || query.split_whitespace().any(|word| {
+            matches!(word, "AND" | "OR" | "NOT")
+                || word.starts_with('-')
+                || word.starts_with('+')
+                || word
+                    .split_once(':')
+                    // Un nom de champ commence par une lettre : `14:30` est une heure.
+                    .is_some_and(|(field, _)| {
+                        field.chars().next().is_some_and(char::is_alphabetic)
+                            && field.chars().all(char::is_alphanumeric)
+                    })
+        })
+}
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -382,6 +418,69 @@ mod tests {
         let (_dir, mailbox) = indexed(&sample());
         let hybrid = Hybrid::new(&mailbox, None);
         assert!(hybrid.search("subject:(", 10).is_err());
+    }
+
+    /// Un encodeur de requête qui rend toujours le même vecteur : le sémantique est **là**, et
+    /// c'est tout ce que les tests suivants demandent.
+    struct Constant;
+
+    impl QueryEncoder for Constant {
+        fn dim(&self) -> usize {
+            4
+        }
+
+        fn encode_query(&self, _query: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0, 0.0])
+        }
+    }
+
+    /// Le défaut corrigé le 2026-10-08 : avec un sémantique présent, une requête que la grammaire
+    /// refuse rendait une liste « par le sens » au lieu de l'erreur.
+    #[test]
+    fn a_refused_query_stays_an_error_when_the_semantic_engine_is_there() {
+        let (dir, mailbox) = indexed(&sample());
+        let root = camino::Utf8Path::from_path(dir.path()).unwrap();
+        let store = mailcore::Store::open(root).unwrap();
+        let semantic = Semantic::with(&store, Box::new(Constant)).unwrap();
+        let hybrid = Hybrid::new(&mailbox, Some(semantic));
+        assert!(hybrid.is_semantic());
+        assert!(hybrid.search("subject:(", 10).is_err());
+        // Le contrôle inverse : une requête valable répond.
+        assert!(hybrid.search("devis", 10).is_ok());
+    }
+
+    #[test]
+    fn the_query_grammar_is_recognised_and_plain_words_are_not() {
+        for query in [
+            "from:banque",
+            "subject:facture 2024",
+            "\"relevé de compte\"",
+            "chaudière AND devis",
+            "facture -orange",
+            "+urgent réunion",
+        ] {
+            assert!(uses_operators(query), "{query:?}");
+        }
+        // Le contrôle inverse : la langue courante, ponctuation comprise, passe par le sens.
+        for query in [
+            "la facture du plombier de l'an dernier",
+            "rendez-vous à 14:30",
+            "devis chaudière",
+            "c'est quoi : la réponse",
+            "and or not",
+        ] {
+            assert!(!uses_operators(query), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_semantic_list_the_fusion_is_the_full_text_order() {
+        let ids = [MessageId(3), MessageId(1), MessageId(2)];
+        let fused: Vec<MessageId> = fuse_lists(&ids, None, mailcore::fusion::K, 10)
+            .into_iter()
+            .map(|hit| hit.id)
+            .collect();
+        assert_eq!(fused, ids);
     }
 
     #[test]

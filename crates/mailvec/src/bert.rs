@@ -125,9 +125,15 @@ impl Bert {
         // profonde — vocabulaire, table inverse, arbre de préfixes — de 249 Mio, mesurée le
         // 2026-09-25, vivante pendant toute la passe avant. Payée à chaque lot de la passe et à
         // chaque requête de recherche, pour régler deux paramètres qui ne changent jamais.
+        //
+        // **Jamais au-delà des positions du modèle.** Un jeton de plus que ce que la table de
+        // positions connaît fait échouer le passage avant — pour ce message, à chaque passe, sans
+        // fin. `multilingual-e5-small` en a 512, donc rien ne change pour lui ; un modèle qui en
+        // aurait moins que [`MAX_TOKENS`] échouait sur tout courrier un peu long. Trouvé le
+        // 2026-10-08 en écrivant le test du critère 6 sur le transformeur minuscule des tests.
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: MAX_TOKENS,
+                max_length: MAX_TOKENS.min(config.max_position_embeddings),
                 ..Default::default()
             }))
             .map_err(|e| model_error(&dir, format!("troncature : {e}")))?;
@@ -651,6 +657,9 @@ mod tests {
     fn a_long_text_is_cut_at_the_window() {
         let (_dir, bert) = tiny();
         let long = "bon ".repeat(2 * MAX_TOKENS);
-        assert_eq!(bert.tokens(&long, Role::Passage).unwrap().len(), MAX_TOKENS);
+        // Le transformeur minuscule n'a que soixante-quatre positions : la fenêtre est la plus
+        // petite des deux bornes, et un texte long **s'encode** au lieu de faire échouer la passe.
+        assert_eq!(bert.tokens(&long, Role::Passage).unwrap().len(), 64);
+        assert_eq!(bert.encode_as(&[long], Role::Passage).unwrap().len(), 1);
     }
 }

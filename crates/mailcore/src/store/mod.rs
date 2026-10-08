@@ -81,7 +81,13 @@ impl Store {
     /// donnée.
     #[must_use]
     pub fn vectors_path(&self) -> Utf8PathBuf {
-        self.root.join("vectors.bin")
+        Self::vectors_path_in(&self.root)
+    }
+
+    /// [`Self::vectors_path`] sans ouvrir le store : pour qui veut un `stat` et rien de plus.
+    #[must_use]
+    pub fn vectors_path_in(root: &Utf8Path) -> Utf8PathBuf {
+        root.join("vectors.bin")
     }
 
     /// L'accès aux blobs, derrière le trait — les appelants n'ont pas à savoir que c'est le

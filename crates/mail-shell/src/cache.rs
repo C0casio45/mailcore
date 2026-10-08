@@ -277,6 +277,7 @@ mod tests {
             unread: false,
             flagged: false,
             score: None,
+            found_by: None,
         };
         let rows = vec![row; MAX_ROWS * 3];
         let snapshot = Snapshot::new(String::new(), Vec::new(), Some(1), &rows);
