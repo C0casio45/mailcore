@@ -85,14 +85,14 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand. **Refait le 2026-10-08 sur les vecteurs du modèle taillé : chiffres identiques**, 26,9 % et 1 contre 9 à p = 0,021 |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand. **Refait le 2026-10-08 sur les vecteurs du modèle taillé : chiffres identiques**, 26,9 % et 1 contre 9 à p = 0,021. **Élargi le 2026-10-09 à 46 requêtes** (20 neuves, écrites par l'assistant, réserve dans le journal) : **première moitié toujours non tenue**, hybride dans les 10 premiers pour **17,4 %** (9–31 %), 0 % sur les 18 sans mot commun ; **seconde moitié tenue en rang** : 2 contre 16, p = 0,001 — et 7 contre 1 sur les 8 requêtes dures neuves seules, p = 0,07 |
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **TENU le 2026-10-09, de bout en bout** — `cargo xtask measure-semantic-search`, machine au repos, 22 requêtes × 3 tours dont le premier jeté, trois exécutions : hybride **33,1 à 33,4 ms** de p95 (p50 26,1–26,7), les mots seuls 9,6–10,6 ms. Les trois exécutions s'accordent à 1 %. La recherche qui réveille le sens répond par les mots en 12–15 ms ; le réveil coûte 0,43–0,67 s, hors de la recherche. Pour mémoire, le balayage seul, 2026-09-21 — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente. **Modèle taillé et lots triés, 2026-10-08 : au moins 5,78 msg/s, 3 h 33** — un plancher, la passe tournant en priorité minimale sur une machine qui servait |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | **NON TENU le 2026-10-09, par construction** — `cargo xtask measure-arrival`, machine au repos : **0,52 à 0,90 s** par arrivée, médiane 0,59 s sur l'exécution la plus stable. Le chargement du modèle **seul** prend 0,24 s, déjà au-dessus du seuil : c'est la décision du 2026-10-08 — un enfant par passage, la mémoire rendue aussitôt — qui le fait payer à chaque arrivée. La décision du démon coûte 1,5 ms. Voir le journal pour les remèdes |
 | 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **TENU sur la passe complète du 2026-10-09, avec 24,6 Mio de marge** — transformeur taillé, trois longs textes par lot : **452,2 Mio** de crête pour 476,8 permis (500 Mo). 8,5 au démarrage, 9,9 store ouvert, 343,3 modèle chargé, 382,3 passe finie. La veille, à quatre longs textes par lot, la même passe crevait de 5 Mio (481,9). Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. **Réserve écrite** : la crête monte encore d'une vingtaine de mébioctets d'un bout à l'autre de la passe — une dérive, devancée et non bornée ; les enfants successifs la borneraient. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | **tenu le 2026-10-08, et verrouillé en CI.** Comportement : un canari sur le bouclage, désigné d'une quarantaine de façons par trois messages hostiles, traverse la vraie moisson, les passes dérivées et la passe de fond dans l'exécutable `maild` relancé — **0 connexion**, contrôles positifs compris (`maild/tests/contenu_hors_ligne.rs`). Surface : l'analyse de source étendue à `mailsmtp`, `mailcal`, `mailvec`, et ni `hf-hub` ni `ureq` dans le graphe. **L'installation du modèle ne fait aucune requête** : `mail model install` dit quoi télécharger et vérifie les empreintes |
 | 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | **deux tiers tenus le 2026-10-08, vérifiés par test** : sans modèle, les mots répondent seuls, et la ligne au-dessus des résultats dit « Aucun modèle n'est installé… » avec la commande `mail model install` — `server.hello` le dit aussi avant toute recherche. **Le démarrage reste à mesurer**, au repos ; par construction rien ne se charge au démarrage, l'enfant du sens ne naît qu'à la première recherche |
-| 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | à faire |
+| 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | **mesuré le 2026-10-09, non tenu** — les 46 requêtes sont françaises, sur le corpus réel. Sur les 8 sans mot commun dont la cible est française, aucune n'est dans les 10 premiers, quel que soit le moteur ; le sens seul les classe de 37ᵉ à 35 146ᵉ. Le critère 8 tombe avec le premier : ce n'est pas le passage à l'anglais qui manque, c'est la synonymie en français |
 | 9 | Les deux magasins ne se contredisent pas | drapeaux en SQLite, vecteurs ailleurs : le contrôle du 2026-09-11 sur l'index, refait ici. Un magasin de vecteurs vidé pendant que les drapeaux disent « fait » doit être **détecté au point d'usage**, pas laissé silencieux | **tenu, vérifié par test.** Au point d'usage, à trois endroits : la passe explicite le détecte et refait tout (`pass::update_with`) ; la passe de fond le détecte et **refuse** sans rien effacer (`pass::plan`, raison « divergent ») ; la recherche refuse des vecteurs d'un autre modèle. Dans les trois cas l'écran le dit, avec la commande qui répare — étape 8 |
 
 Le critère 1 est celui qui décide si la phase valait la peine. Les autres disent si elle est
@@ -2891,3 +2891,52 @@ envoie toujours `+FLAGS` le fait tomber, « le message est redevenu lu ».
 Le bouton du survol n'existe que dans un dossier, pas dans des résultats de recherche : un
 résultat n'a pas de dossier, et le message peut vivre dans plusieurs. C'est la règle qu'applique
 déjà l'ouverture d'un message.
+
+### 2026-10-09 (nuit, suite) — le critère 1 sur 46 requêtes, et le critère 8 mesuré
+
+**En clair d'abord.** La recherche par le sens classe mieux que les mots — c'est confirmé sur un
+jeu presque deux fois plus grand. Mais elle ne met toujours **pas** le bon message dans les dix
+premiers quand la requête n'a aucun mot en commun avec lui : 0 sur 18. Le critère 1 reste à
+moitié, et le critère 8, qui est le même en français, n'est pas tenu.
+
+**D'où viennent les vingt requêtes neuves, et la réserve qui va avec.** L'utilisateur a demandé
+que l'assistant les écrive. Une paraphrase de ce qu'on lit n'est pas un souvenir de ce qu'on
+cherche : c'est plus faible qu'un jeu écrit par l'utilisateur, et c'est écrit ici pour ne pas
+l'oublier. Ce qui a été fait pour ne pas choisir les cibles :
+
+- **un tirage à graine fixe** de soixante messages (`cargo xtask queries-find --sample 60`), pas
+  relancé. L'outil est neuf et il **ne lance aucun moteur** — un jeu écrit en regardant ce que le
+  moteur rend ressemble au moteur ;
+- gardés : les messages qu'on peut vouloir retrouver (paiements, démarches, fils de travail,
+  service client) ; écartés : publicité, alertes d'articles. Une requête par cible, sans les mots
+  du sujet ; toutes les réponses acceptables listées par sujet ou expéditeur ;
+- **un seul retrait après coup, avant tout relevé** : une cible qui avait 504 réponses
+  acceptables, qu'un tirage au hasard aurait satisfaite ;
+- **un seul relevé**, et c'est celui-ci.
+
+Le jeu vit dans `measurements/` comme les précédents, hors du dépôt : ses requêtes disent ce que
+quelqu'un cherche dans son courrier.
+
+| sur 46 requêtes, modèle taillé | dans les 10 premiers | rang médian |
+|---|---|---|
+| plein texte seul | 7 (15,2 %, IC 8–28 %) | 5 644 |
+| sens seul | 8 (17,4 %, IC 9–31 %) | 1 216 |
+| hybride | 8 (17,4 %, IC 9–31 %) | 411 |
+
+Sur les **18 requêtes sans mot commun**, aucun moteur ne met la cible dans les dix premiers. La
+comparaison primaire — déclarée le 2026-09-23 — donne **2 victoires du plein texte contre 16 de
+l'hybride, p = 0,001**, avec un rang divisé par 4,5 en moyenne géométrique. Sur les **8 requêtes
+dures neuves seules**, que personne n'avait vues : **7 contre 1, p = 0,07**. Le sens de l'effet se
+retrouve sur des données fraîches ; sa taille ne suffit pas à le prouver sur huit.
+
+**Le critère 8 se lit dans la même sortie** : le banc range les requêtes sans mot commun selon la
+langue de la cible. Les 8 à cible française — de la synonymie pure, sans passage à l'anglais —
+n'ont **aucune** cible dans les dix premiers ; le sens seul les classe 37ᵉ, 94ᵉ, puis au-delà du
+millième. Ce n'est donc pas l'interlangue qui fait défaut : c'est le modèle sur le français.
+
+**Une piste, pas une conclusion.** Sur les 18 requêtes dures, le sens seul bat l'hybride 16 fois
+sur 18 (p = 0,001, comparaison exploratoire) : la fusion dilue le sens quand les mots n'ont rien
+trouvé de porteur. C'était déjà 9 sur 10 le 2026-09-23. Régler la fusion sur ces requêtes-là
+serait la régler sur le jeu qui sert à la juger ; si on le fait, il faudra un jeu frais pour le
+vérifier. Et même le sens seul reste loin des 80 % : aucun réglage de fusion n'y mène, seul un
+meilleur modèle le pourrait.
