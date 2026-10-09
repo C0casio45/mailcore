@@ -89,7 +89,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 | 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente. **Modèle taillé et lots triés, 2026-10-08 : au moins 5,78 msg/s, 3 h 33** — un plancher, la passe tournant en priorité minimale sur une machine qui servait |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
-| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **NON TENU, de 5 Mio, sur la passe complète du 2026-10-08** — transformeur taillé : **481,9 Mio** de crête pour 476,8 permis (500 Mo), soit 1 % de trop. 9,3 au démarrage, 10,7 store ouvert, 357,3 modèle chargé, 404,1 passe finie. Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. Ce qui reste à trancher : la crête est-elle **un pic** — un lot, un message — ou **une dérive** — 47 Mio restent résidents après la passe, et ce reste croîtrait avec le corpus ? Le banc dit maintenant **quand** la crête a lieu ; le remède dépend de la réponse. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio |
+| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **TENU sur la passe complète du 2026-10-09, avec 24,6 Mio de marge** — transformeur taillé, trois longs textes par lot : **452,2 Mio** de crête pour 476,8 permis (500 Mo). 8,5 au démarrage, 9,9 store ouvert, 343,3 modèle chargé, 382,3 passe finie. La veille, à quatre longs textes par lot, la même passe crevait de 5 Mio (481,9). Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. **Réserve écrite** : la crête monte encore d'une vingtaine de mébioctets d'un bout à l'autre de la passe — une dérive, devancée et non bornée ; les enfants successifs la borneraient. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | **tenu le 2026-10-08, et verrouillé en CI.** Comportement : un canari sur le bouclage, désigné d'une quarantaine de façons par trois messages hostiles, traverse la vraie moisson, les passes dérivées et la passe de fond dans l'exécutable `maild` relancé — **0 connexion**, contrôles positifs compris (`maild/tests/contenu_hors_ligne.rs`). Surface : l'analyse de source étendue à `mailsmtp`, `mailcal`, `mailvec`, et ni `hf-hub` ni `ureq` dans le graphe. **L'installation du modèle ne fait aucune requête** : `mail model install` dit quoi télécharger et vérifie les empreintes |
 | 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | **deux tiers tenus le 2026-10-08, vérifiés par test** : sans modèle, les mots répondent seuls, et la ligne au-dessus des résultats dit « Aucun modèle n'est installé… » avec la commande `mail model install` — `server.hello` le dit aussi avant toute recherche. **Le démarrage reste à mesurer**, au repos ; par construction rien ne se charge au démarrage, l'enfant du sens ne naît qu'à la première recherche |
 | 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | à faire |
@@ -2619,3 +2619,61 @@ resté. Leur hôte reste : un compte IMAP sans hôte est refusé comme incohére
 - la passe explicite en enfants successifs, si la dérive doit être bornée et non seulement
   devancée ;
 - les critères 2, 4 et 7, machine au repos.
+
+### 2026-10-09 — trois longs textes par lot : le critère 5 tenu, avec 24,6 Mio de marge
+
+**En clair d'abord.** La passe complète de vérification a fini à 1 h 22. Avec un long texte de
+moins par lot, la mémoire culmine à **452,2 Mio pour 476,8 permis** : le critère 5 est tenu, sur le
+corpus entier. La dérive repérée la veille n'a pas disparu pour autant — elle est devancée, pas
+bornée.
+
+`cargo xtask measure-vectors --bert`, même modèle, même corpus de 73 658 messages, en priorité
+minimale :
+
+| | trois longs textes, 2026-10-09 | quatre, 2026-10-08 |
+|---|---:|---:|
+| au démarrage | 8,5 Mio | 9,3 |
+| store ouvert | 9,9 | 10,7 |
+| modèle chargé | 343,3 | 357,3 |
+| crête de la passe | **452,2** | 481,9 |
+| passe finie | 382,3 | 404,1 |
+| passe finie − modèle | 39 | 47 |
+
+La crête par vingtième de la passe, en Mio — la chronologie que le banc tient depuis la veille :
+
+```
+432  438  439  439  442  445  442  446  447  449
+449  451  450  451  452  452  439  431  422  452
+```
+
+Trois choses à en lire :
+
+- **la crête est atteinte au tout dernier vingtième**, après 72 704 messages, mais la courbe y
+  était déjà sur les seize premiers : 452 est le plateau d'une montée, pas un lot hors norme ;
+- **la montée est d'une vingtaine de mébioctets** du premier vingtième au seizième. C'est la dérive
+  de la veille, sur la même pente. Sur un corpus deux fois plus grand, elle reprendrait une bonne
+  partie des 24,6 Mio de marge ;
+- **le modèle chargé revient à 343 Mio.** Les 14 Mio de plus de la veille ne se reproduisent pas,
+  pas plus que sur le relevé de 5 000 messages : ils tenaient au processus, pas au modèle.
+
+Le débit, **6,56 messages/s** (3 h 07), reste un plancher pour la même raison que la veille : la
+passe tournait en priorité minimale sur une machine qui servait.
+
+**Les enfants successifs restent consignés, pas écrits.** Ils borneraient la dérive par
+construction — un processus ne traite jamais plus de mille messages, comme la passe de fond. Le
+critère étant tenu sur le corpus réel, le chantier sur `mail vectors` attend qu'une passe complète
+s'approche à nouveau du seuil.
+
+#### Les mesures de temps, encore remises
+
+Les bancs des critères 2, 4 et 7 devaient suivre la passe, une fois la machine au repos — moins de
+15 % de processeur trois minutes d'affilée. **Ce repos n'est jamais venu** : les applications de
+fond tiennent la machine au-dessus en permanence, et l'attente n'avait pas de limite de temps.
+Neuf heures perdues pour une condition qui ne pouvait pas devenir vraie. Le seuil se règle sur la
+charge **réelle** de la machine au repos, mesurée d'abord, et une attente sans limite ne s'écrit
+plus.
+
+#### Reste
+
+- les critères 2, 4 et 7, machine au repos ;
+- la passe explicite en enfants successifs, si une passe complète repasse près du seuil.
