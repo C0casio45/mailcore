@@ -4307,6 +4307,7 @@ dependencies = [
  "directories",
  "eframe",
  "egui 0.36.1",
+ "jiff",
  "mailapi",
  "mailauth",
  "mailcore",

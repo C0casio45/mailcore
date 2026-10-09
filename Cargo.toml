@@ -110,6 +110,10 @@ tower-http         = { version = "0.6", features = ["fs"] }
 axum-server        = { version = "0.8", features = ["tls-rustls-no-provider"] }
 sysinfo            = { version = "0.39", default-features = false, features = ["system"] }
 clap               = { version = "4.6", features = ["derive", "env"] }
+# L'heure locale de la coquille. Le décalage d'un instant dépend des règles d'été de son année,
+# donc d'une base de fuseaux : la lire à la main voudrait dire réécrire `tzdb`. Déjà au graphe
+# par `serde_with`, et sans `unsafe` à écrire chez nous pour lire le fuseau de Windows.
+jiff               = "0.2.35"
 # Saisie d'un mot de passe sans écho. Un mot de passe tapé en clair reste dans le tampon de
 # défilement du terminal, et parfois dans le journal de session : `docs/PRIVACY.md` §7 vise
 # les arguments et l'environnement, mais l'écho est la même classe de fuite.

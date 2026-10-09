@@ -53,6 +53,7 @@
 
 mod app;
 mod cache;
+mod clock;
 mod failure;
 mod settings;
 mod signature;

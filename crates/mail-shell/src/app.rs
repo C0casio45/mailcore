@@ -113,6 +113,27 @@ enum Answer {
     Source,
 }
 
+/// Ce que la colonne centrale montre.
+///
+/// ## Pourquoi la file, les brouillons et l'activité sont des vues, et plus des panneaux
+///
+/// Ils étaient trois panneaux dépliés **sous la barre du haut**, dans le même panneau qu'elle :
+/// en ouvrir un poussait les trois colonnes vers le bas, en ouvrir trois laissait une liste de
+/// quelques lignes. Ils sont maintenant des entrées de la colonne de gauche, sous les dossiers,
+/// et s'ouvrent à la place de la liste — comme un dossier, ce qu'ils sont pour l'utilisateur :
+/// un endroit où regarder ce qui n'est pas encore parti, ou ce qui tourne.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// Un dossier, ou des résultats de recherche.
+    Messages,
+    /// La file d'envoi.
+    Outbox,
+    /// Les brouillons.
+    Drafts,
+    /// Les imports, l'index, le cache et les tâches de fond.
+    Activity,
+}
+
 /// Ce que le formulaire de rédaction relève pendant le dessin.
 ///
 /// ## Pourquoi ces cinq champs voyagent ensemble
@@ -188,10 +209,12 @@ pub struct Shell {
     sources: Vec<dto::Source>,
     jobs: Vec<dto::Job>,
     jobs_polled: Option<Instant>,
-    show_import: bool,
+    /// Ce que la colonne centrale montre. Voir [`View`].
+    view: View,
 
-    /// Le dernier message à montrer à l'utilisateur — erreur d'appel, bilan de tâche.
-    status: Option<String>,
+    /// Le dernier message à montrer à l'utilisateur — erreur d'appel, bilan de tâche —, avec
+    /// ce qu'il veut dire. Voir [`theme::Tone`] : la couleur suit le sens, jamais l'inverse.
+    status: Option<(theme::Tone, String)>,
 
     /// La ligne de file que la bannière propose encore d'annuler.
     ///
@@ -275,8 +298,6 @@ pub struct Shell {
     /// Sert à ne pas redemander à chaque image : `egui` redessine soixante fois par seconde, et
     /// une demande par image serait soixante appels par seconde pour un texte qui n'a pas bougé.
     suggest_for: String,
-    /// Vrai quand le panneau de la file d'envoi est ouvert.
-    show_outbox: bool,
 
     /// Les signatures connues, par compte. `None` dit « ce compte n'en a pas », et l'absence
     /// de clé dit « on ne sait pas encore » — deux états qu'un seul `Option` confondrait, et
@@ -287,8 +308,6 @@ pub struct Shell {
     /// Relus au démarrage et après chaque écriture : un brouillon enregistré par un autre
     /// client — la CLI, un modèle — doit apparaître sans qu'on clique.
     drafts: Vec<dto::Draft>,
-    /// Vrai quand le panneau des brouillons est ouvert.
-    show_drafts: bool,
     /// L'éditeur de signature, quand sa fenêtre est ouverte.
     editor: Option<crate::signature::Editor>,
     /// La fenêtre « source du message », quand elle est ouverte.
@@ -436,6 +455,9 @@ impl Shell {
             seed,
         } = setup;
 
+        // Le fuseau se lit pendant que la fenêtre se crée : les premières lignes en ont besoin.
+        crate::clock::warm();
+
         // **Le premier écran vient du cache, avant tout réseau.** La réponse du démon écrasera
         // tout ça sans arbitrage ni fusion : le cache n'est jamais une source de vérité, il est
         // ce qu'on affiche en attendant celle-ci.
@@ -481,7 +503,7 @@ impl Shell {
             sources: Vec::new(),
             jobs: Vec::new(),
             jobs_polled: None,
-            show_import: false,
+            view: View::Messages,
             status: None,
             cancellable: None,
             offline: None,
@@ -496,14 +518,22 @@ impl Shell {
             suggesting: None,
             suggest_token: 0,
             suggest_for: String::new(),
-            show_outbox: false,
             signatures: std::collections::HashMap::new(),
             drafts: Vec::new(),
-            show_drafts: false,
             editor: None,
             source: None,
             settings: None,
         }
+    }
+
+    /// Met une phrase dans la barre d'état, avec ce qu'elle veut dire.
+    ///
+    /// Une nouvelle phrase retire le bouton « Annuler l'envoi » de la précédente : il portait
+    /// sur **celle-là**, et le laisser sous une autre phrase ferait annuler un envoi dont on ne
+    /// parle plus.
+    fn say(&mut self, tone: theme::Tone, text: impl Into<String>) {
+        self.status = Some((tone, text.into()));
+        self.cancellable = None;
     }
 
     /// Le dossier courant, s'il est connu.
@@ -531,6 +561,7 @@ impl Shell {
 
     /// Ouvre un dossier : vide la liste et demande la première page.
     fn open_folder(&mut self, id: i64) {
+        self.view = View::Messages;
         self.current = Some(id);
         self.results = None;
         self.rows.clear();
@@ -676,6 +707,8 @@ impl Shell {
             self.results = None;
             return;
         }
+        // Une recherche se lit dans la liste : depuis la file ou l'activité, elle y ramène.
+        self.view = View::Messages;
         self.searching = true;
         self.worker.ask(Request::Search {
             query,
@@ -873,8 +906,10 @@ impl Shell {
                         self.results = Some(results.rows);
                     } else {
                         self.results = Some(Vec::new());
-                        self.status = Some(
-                            "l'index plein texte est absent : `mail index` le construit".to_owned(),
+                        self.say(
+                            theme::Tone::Attention,
+                            "L'index plein texte est absent : « Reconstruire l'index », dans \
+                             Activité, le construit.",
                         );
                     }
                 }
@@ -920,7 +955,7 @@ impl Shell {
                         && editor.saving
                     {
                         self.editor = None;
-                        self.status = Some("Signature enregistrée.".to_owned());
+                        self.say(theme::Tone::Done, "Signature enregistrée.");
                     }
                 }
                 Reply::Queued(queued) => {
@@ -941,22 +976,23 @@ impl Shell {
                     // « 10 secondes » dans la phrase ferait mentir l'interface le jour où le
                     // maintien change, et un client distant peut parler à un démon d'une autre
                     // version que la sienne.
-                    self.status = Some(if queued.hold > 0 {
+                    let said = if queued.hold > 0 {
                         format!(
-                            "Message en file d'envoi ({} destinataire(s), {} octets). Il partira \
+                            "Message en file d'envoi ({} destinataire(s), {}). Il partira \
                              dans {} s, même si vous fermez la fenêtre.",
                             queued.recipients.len(),
-                            queued.size,
+                            human::bytes(queued.size),
                             queued.hold
                         )
                     } else {
                         format!(
-                            "Message en file d'envoi ({} destinataire(s), {} octets). Il partira \
+                            "Message en file d'envoi ({} destinataire(s), {}). Il partira \
                              même si vous fermez la fenêtre.",
                             queued.recipients.len(),
-                            queued.size
+                            human::bytes(queued.size)
                         )
-                    });
+                    };
+                    self.say(theme::Tone::Done, said);
                     self.cancellable = (queued.hold > 0).then_some(queued.id);
                     self.worker.ask(Request::Outbox);
                     self.worker.ask(Request::Drafts);
@@ -965,11 +1001,19 @@ impl Shell {
                     // Les deux phrases disent ce qui s'est passé, pas ce qui était demandé. Un
                     // « trop tard » est un cas normal de la fenêtre de rétractation : le
                     // facteur avait déjà la ligne, et le message est parti pour de bon.
-                    self.status = Some(if cancelled {
-                        "Envoi annulé : le message ne partira pas.".to_owned()
+                    if cancelled {
+                        self.say(
+                            theme::Tone::Done,
+                            "Envoi annulé : le message ne partira pas.",
+                        );
                     } else {
-                        "Trop tard : le message était déjà en cours de remise.".to_owned()
-                    });
+                        // Pas un échec de l'interface, mais l'annulation demandée n'a pas eu
+                        // lieu : c'est ce que l'utilisateur doit retenir, d'où l'ambre.
+                        self.say(
+                            theme::Tone::Attention,
+                            "Trop tard : le message était déjà en cours de remise.",
+                        );
+                    }
                     self.cancellable = None;
                     self.worker.ask(Request::Outbox);
                 }
@@ -1067,7 +1111,16 @@ impl Shell {
                         // punir d'une faute de frappe.
                         self.sending = false;
                     }
-                    self.status = Some(format!("{what} : {message}"));
+                    // **Une panne de transport n'entre pas dans la barre d'état** : le bandeau
+                    // « Service injoignable » la dit déjà, et il disparaît au retour du service.
+                    // La barre, elle, gardait « abonnement : … » en rouge après la reprise —
+                    // un échec affiché pour une situation déjà réparée.
+                    if !transport {
+                        self.say(
+                            theme::Tone::Failed,
+                            format!("{} : {message}", capitalized(what)),
+                        );
+                    }
                 }
             }
         }
@@ -1111,7 +1164,9 @@ impl Shell {
         let Some((at, query, _)) = &self.semantic_retry else {
             return;
         };
-        if self.results.is_none() || self.query.trim() != query {
+        // Plus de recherche à l'écran, une autre saisie, ou une autre vue : la reprise n'a plus
+        // d'objet — et elle ramènerait à la liste quelqu'un qui est allé voir sa file.
+        if self.results.is_none() || self.query.trim() != query || self.view != View::Messages {
             self.semantic_retry = None;
             return;
         }
@@ -1133,7 +1188,7 @@ impl Shell {
             .jobs
             .iter()
             .any(|job| job.state == "running" || job.state == "queued");
-        if !active && !self.show_import {
+        if !active && self.view != View::Activity {
             return;
         }
         let due = self
@@ -1231,27 +1286,67 @@ impl eframe::App for Shell {
 }
 
 impl Shell {
-    /// Les trois panneaux.
+    /// Les panneaux : la barre, la ligne d'état, les dossiers, la vue centrale et le lecteur.
+    ///
+    /// **Les colonnes se redimensionnent**, depuis la refonte du 2026-10-09 : elles étaient fixes
+    /// — 260 points et 45 % —, et un écran étroit coupait les sujets pendant qu'un écran large
+    /// laissait un lecteur de 900 points pour des lignes de 70 caractères.
     fn panes(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("barre").show(root, |ui| self.top_bar(ui));
+        // **La ligne d'état est en bas, toujours là, et d'une ligne.** Elle était sous la barre
+        // du haut, n'apparaissait qu'avec un message et poussait les trois colonnes vers le bas
+        // à chaque fois : la liste sautait de vingt points sous la souris au moment précis où
+        // l'utilisateur venait d'agir.
+        egui::Panel::bottom("etat")
+            .resizable(false)
+            .show(root, |ui| self.status_bar(ui));
         egui::Panel::left("dossiers")
-            .exact_size(260.0)
+            .default_size(SIDE_DEFAULT)
+            .size_range(SIDE_MIN..=SIDE_MAX)
             .show(root, |ui| self.folders_pane(ui));
-        egui::Panel::right("lecture")
-            .exact_size((root.available_width() * 0.45).clamp(320.0, 900.0))
-            .show(root, |ui| self.reader_pane(ui));
-        egui::CentralPanel::default().show(root, |ui| self.list_pane(ui));
+        // Le lecteur n'a de sens qu'à côté d'une liste de messages : la file, les brouillons et
+        // l'activité prennent toute la largeur.
+        if self.view == View::Messages {
+            egui::Panel::right("lecture")
+                .default_size((root.available_width() * 0.45).clamp(READER_MIN, READER_DEFAULT))
+                .size_range(READER_MIN..=READER_MAX)
+                .show(root, |ui| self.reader_pane(ui));
+        }
+        egui::CentralPanel::default().show(root, |ui| match self.view {
+            View::Messages => self.list_pane(ui),
+            View::Outbox => self.outbox_view(ui),
+            View::Drafts => self.drafts_view(ui),
+            View::Activity => self.activity_view(ui),
+        });
     }
 
-    /// La barre du haut : recherche, import, état.
+    /// Change la vue centrale, et relit ce qu'elle montre.
+    ///
+    /// Relire **à l'ouverture** : c'est le moment où l'utilisateur regarde, et le compteur de la
+    /// colonne de gauche peut avoir été calculé avant le dernier changement.
+    fn show_view(&mut self, view: View) {
+        self.view = view;
+        match view {
+            View::Messages => {}
+            View::Outbox => self.worker.ask(Request::Outbox),
+            View::Drafts => self.worker.ask(Request::Drafts),
+            View::Activity => {
+                self.worker.ask(Request::Sources);
+                self.jobs_polled = None;
+                self.worker.ask(Request::Jobs);
+            }
+        }
+    }
+
+    /// La barre du haut : chercher, écrire, les paramètres. Rien d'autre.
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.set_height(30.0);
 
             let field = ui.add(
                 egui::TextEdit::singleline(&mut self.query)
-                    .desired_width(360.0)
-                    .hint_text("Rechercher — facture, from:banque, \"phrase exacte\""),
+                    .desired_width(SEARCH_WIDTH)
+                    .hint_text("Rechercher — facture, from:banque, \"phrase exacte\"   ( / )"),
             );
             if std::mem::take(&mut self.focus_search) {
                 field.request_focus();
@@ -1259,80 +1354,43 @@ impl Shell {
             if field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.run_search();
             }
-            if ui.button("Chercher").clicked() {
-                self.run_search();
-            }
-            if self.results.is_some() && ui.button("Effacer").clicked() {
-                self.results = None;
-                self.query.clear();
-            }
-
-            ui.separator();
-            // « Écrire » d'abord : c'est l'action, l'import est une opération de mise en route.
-            // Désactivé quand aucun compte ne peut envoyer, plutôt qu'ouvrant un formulaire
-            // dont le bouton refuserait sans dire pourquoi — critère 8.
-            let can_send = self.default_sender().is_some();
-            if ui
-                .add_enabled(can_send, egui::Button::new("✉ Écrire"))
-                .on_disabled_hover_text(
-                    "Aucun compte n'a de serveur d'envoi configuré. Voir `mail account  submission`.",
-                )
-                .clicked()
+            if self.results.is_some()
+                && ui
+                    .button("Effacer")
+                    .on_hover_text("Revenir au dossier — Échap")
+                    .clicked()
             {
-                self.start_compose();
-            }
-            let waiting = self
-                .outbox
-                .iter()
-                .filter(|it| it.state == "queued" || it.state == "sending")
-                .count();
-            let doubtful = self.outbox.iter().filter(|it| it.doubtful).count();
-            let label = match (waiting, doubtful) {
-                // Le doute passe devant le compte en attente : c'est le seul état qui demande
-                // une décision, et il ne doit pas se noyer dans un nombre.
-                (_, 1..) => format!("File ⚠ {doubtful}"),
-                (0, 0) => "File".to_owned(),
-                (n, 0) => format!("File ({n})"),
-            };
-            if ui.selectable_label(self.show_outbox, label).clicked() {
-                self.show_outbox = !self.show_outbox;
-                if self.show_outbox {
-                    self.worker.ask(Request::Outbox);
-                }
-            }
-            // Les brouillons à côté de la file : les deux répondent à « qu'est-ce qui n'est pas
-            // encore parti ? », et les chercher dans deux endroits éloignés serait absurde.
-            let label = if self.drafts.is_empty() {
-                "Brouillons".to_owned()
-            } else {
-                format!("Brouillons ({})", self.drafts.len())
-            };
-            if ui.selectable_label(self.show_drafts, label).clicked() {
-                self.show_drafts = !self.show_drafts;
-                if self.show_drafts {
-                    self.worker.ask(Request::Drafts);
-                }
-            }
-            if ui.selectable_label(self.show_import, "Importer…").clicked() {
-                self.show_import = !self.show_import;
-                if self.show_import {
-                    self.worker.ask(Request::Sources);
-                    self.worker.ask(Request::Jobs);
-                }
-            }
-            if ui
-                .selectable_label(self.settings.is_some(), "⚙ Paramètres")
-                .on_hover_text("Les comptes : par où ils lisent, par où ils envoient")
-                .clicked()
-            {
-                if self.settings.is_some() {
-                    self.settings = None;
-                } else {
-                    self.open_settings();
-                }
+                self.clear_search();
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.settings.is_some(), "⚙")
+                    .on_hover_text(
+                        "Paramètres — les comptes : par où ils lisent, par où ils envoient",
+                    )
+                    .clicked()
+                {
+                    if self.settings.is_some() {
+                        self.settings = None;
+                    } else {
+                        self.open_settings();
+                    }
+                }
+                // « Écrire » est le seul bouton plein de l'interface : c'est l'action, le reste
+                // se consulte. Désactivé quand aucun compte ne peut envoyer, plutôt qu'ouvrant
+                // un formulaire dont le bouton refuserait sans dire pourquoi — critère 8.
+                let can_send = self.default_sender().is_some();
+                if ui
+                    .add_enabled(can_send, primary(ui, "✉ Écrire"))
+                    .on_hover_text("Nouveau message — C")
+                    .on_disabled_hover_text(
+                        "Aucun compte n'a de serveur d'envoi. Paramètres → « Serveur d'envoi… ».",
+                    )
+                    .clicked()
+                {
+                    self.start_compose();
+                }
                 if let Some(hello) = &self.hello {
                     ui.weak(format!(
                         "{} messages{}",
@@ -1352,10 +1410,11 @@ impl Shell {
 
         // **Le bandeau du critère 9.** Il dit ce qui marche encore et ce qui ne marche plus :
         // « rien ne gèle et rien ne ment ». Il ne propose pas de réessayer, parce que
-        // l'abonnement le fait déjà tout seul, toutes les deux secondes.
+        // l'abonnement le fait déjà tout seul, toutes les deux secondes. Il reste en haut, et
+        // c'est le seul : une panne de service change ce que tout l'écran veut dire.
         if let Some(reason) = self.offline.clone() {
             ui.horizontal_wrapped(|ui| {
-                ui.colored_label(ui.visuals().warn_fg_color, "⚠ Service injoignable.");
+                ui.colored_label(theme::warn(ui.ctx()), "⚠ Service injoignable.");
                 ui.label(
                     "La liste déjà chargée reste consultable ; ouvrir un message et chercher \
                      ne fonctionneront pas.",
@@ -1363,40 +1422,92 @@ impl Shell {
                 ui.weak(reason);
             });
         }
+    }
 
-        if self.show_outbox {
-            self.outbox_pane(ui);
-        }
-        if self.show_drafts {
-            self.drafts_pane(ui);
-        }
-        if self.show_import {
-            self.import_pane(ui);
-        }
-        if let Some(status) = self.status.clone() {
-            ui.horizontal(|ui| {
-                ui.colored_label(ui.visuals().error_fg_color, status);
+    /// Quitte la recherche et revient au dossier.
+    fn clear_search(&mut self) {
+        self.results = None;
+        self.semantic = None;
+        self.semantic_retry = None;
+        self.query.clear();
+    }
+
+    /// La ligne d'état : la dernière phrase, dans la couleur de ce qu'elle dit, et à droite la
+    /// tâche de fond en cours.
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.set_height(ROW_HEIGHT);
+            if let Some((tone, text)) = self.status.clone() {
+                let mark = match tone {
+                    theme::Tone::Done => "✓ ",
+                    theme::Tone::Failed => "✖ ",
+                    theme::Tone::Attention => "⚠ ",
+                    theme::Tone::Info => "",
+                };
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("{mark}{text}")).color(tone.color(ui.ctx())),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&text);
                 if let Some(id) = self.cancellable
                     && ui
-                        .button("Annuler l'envoi")
+                        .small_button("Annuler l'envoi")
                         .on_hover_text(
                             "Retire le message de la file. Ne marche que tant que le facteur \
                              ne l'a pas pris.",
                         )
                         .clicked()
                 {
-                    // La bannière ne décide de rien : elle demande, et c'est le store qui
-                    // tranche. Le bouton disparaît tout de suite pour qu'un second clic ne
-                    // parte pas pendant que le premier voyage.
+                    // La ligne ne décide de rien : elle demande, et c'est le store qui tranche.
+                    // Le bouton disparaît tout de suite pour qu'un second clic ne parte pas
+                    // pendant que le premier voyage.
                     self.cancellable = None;
                     self.worker.ask(Request::Cancel { id });
                 }
-                if ui.small_button("×").clicked() {
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Effacer ce message")
+                    .clicked()
+                {
                     self.status = None;
                     self.cancellable = None;
                 }
+            }
+
+            let mut to_activity = false;
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // La tâche en cours, en une ligne : de quoi savoir qu'une synchronisation
+                // avance sans ouvrir l'activité. Un clic l'ouvre.
+                let running = self.jobs.iter().find(|job| job.state == "running");
+                if let Some(job) = running {
+                    // De droite à gauche : la barre d'abord, donc à droite, puis le nom.
+                    match job.fraction {
+                        Some(fraction) => {
+                            ui.add(
+                                egui::ProgressBar::new(fraction)
+                                    .desired_width(STATUS_PROGRESS)
+                                    .show_percentage(),
+                            );
+                        }
+                        None => {
+                            ui.spinner();
+                        }
+                    }
+                    to_activity = ui
+                        .add(
+                            egui::Label::new(egui::RichText::new(job_label(job)).weak())
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("Voir l'activité")
+                        .clicked();
+                }
             });
-        }
+            if to_activity {
+                self.show_view(View::Activity);
+            }
+        });
     }
 
     /// Le panneau des brouillons : ce qui n'est pas encore parti et qu'on n'a pas fini.
@@ -1411,48 +1522,68 @@ impl Shell {
     /// Rouvrir un brouillon alors qu'on écrit déjà **enregistre** ce qui est en cours avant de
     /// le remplacer. Sans ça, le clic perdrait la frappe — et un panneau qui fait perdre du
     /// texte est pire qu'un panneau absent.
-    fn drafts_pane(&mut self, ui: &mut egui::Ui) {
+    fn drafts_view(&mut self, ui: &mut egui::Ui) {
         let mut to_open: Option<dto::Draft> = None;
         let mut to_delete: Option<i64> = None;
 
+        view_header(
+            ui,
+            "Brouillons",
+            &match self.drafts.len() {
+                0 => String::new(),
+                1 => "1 brouillon".to_owned(),
+                n => format!("{n} brouillons"),
+            },
+        );
+        ui.weak(
+            "Enregistrés à la fermeture de la fenêtre de rédaction, et jamais envoyés d'eux-mêmes.",
+        );
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("Brouillons");
-            ui.weak("— enregistrés à la fermeture de la fenêtre, et jamais envoyés d'eux-mêmes.");
-        });
 
         if self.drafts.is_empty() {
-            ui.weak("Aucun brouillon.");
+            empty_state(
+                ui,
+                "Aucun brouillon.",
+                "Un message qu'on ferme sans l'envoyer arrive ici, et se rouvre d'un clic.",
+            );
             return;
         }
 
         egui::ScrollArea::vertical()
             .id_salt("brouillons")
-            .max_height(DRAFTS_PANE)
+            .auto_shrink([false, false])
             .show(ui, |ui| {
                 for draft in &self.drafts {
-                    ui.horizontal_wrapped(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.set_height(ROW_HEIGHT);
+                        ui.add_sized(
+                            [DATE_COLUMN, ROW_HEIGHT],
+                            egui::Label::new(
+                                egui::RichText::new(list_date(draft.updated_at)).weak(),
+                            ),
+                        );
                         // L'étiquette vient du service : un brouillon sans sujet est le cas
                         // ordinaire, et trois clients qui choisiraient chacun leur repli
                         // afficheraient trois listes différentes.
                         if ui
-                            .button(elide(&draft.label, 70))
+                            .link(elide(&draft.label, 90))
                             .on_hover_text("Rouvrir ce brouillon")
                             .clicked()
                         {
                             to_open = Some(draft.clone());
                         }
-                        ui.weak(short_date(draft.updated_at));
-                        if !draft.attachments.is_empty() {
-                            ui.weak(format!("📎 {}", draft.attachments.len()));
-                        }
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("Jeter ce brouillon")
-                            .clicked()
-                        {
-                            to_delete = draft.id;
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("Jeter")
+                                .on_hover_text("Supprime ce brouillon. Rien n'est envoyé.")
+                                .clicked()
+                            {
+                                to_delete = draft.id;
+                            }
+                            if !draft.attachments.is_empty() {
+                                ui.weak(format!("📎 {}", draft.attachments.len()));
+                            }
+                        });
                     });
                 }
             });
@@ -1475,7 +1606,6 @@ impl Shell {
                 attachments: draft.attachments,
                 draft: draft.id,
             });
-            self.show_drafts = false;
         }
         if let Some(id) = to_delete {
             // Si c'est celui qui est ouvert, la fenêtre perd son identifiant : sa fermeture
@@ -1505,19 +1635,36 @@ impl Shell {
     /// Ouvre la fenêtre de rédaction, vide.
     fn start_compose(&mut self) {
         let Some(account) = self.default_sender() else {
-            self.status = Some(
-                "Aucun compte ne peut envoyer. `mail account submission --account N --host …` \
-                 pour en configurer un."
-                    .to_owned(),
+            self.say(
+                theme::Tone::Attention,
+                "Aucun compte ne peut envoyer. Paramètres → « Serveur d'envoi… » sur le compte \
+                 qui doit écrire.",
             );
             return;
         };
+        self.park_compose();
         self.compose = Some(Compose {
             account,
             ..Compose::default()
         });
     }
 
+    /// Range le message en cours d'écriture parmi les brouillons, avant de le remplacer.
+    ///
+    /// « Écrire », « Répondre » et « Transférer » remplaçaient la fenêtre ouverte **sans rien
+    /// garder** : un clic de trop perdait un message à moitié écrit. Les raccourcis d'une
+    /// touche rendaient la chose bien plus facile — « R » tapé dans la fenêtre principale —, d'où
+    /// la règle, au seul endroit qui remplace. Un brouillon vide n'écrit rien : le service le
+    /// sait.
+    ///
+    /// Le transfert demande ses pièces jointes **avant** d'appeler cette fonction : elles
+    /// arrivent par `Reply::Attached`, qui n'est lu qu'au début d'une image suivante — quand la
+    /// nouvelle fenêtre est déjà en place.
+    fn park_compose(&mut self) {
+        if let Some(current) = self.compose.take() {
+            self.worker.ask(Request::SaveDraft(Box::new(current)));
+        }
+    }
     /// Ouvre une réponse au message ouvert, à l'expéditeur seul ou à tout le monde.
     ///
     /// ## Le fil est repris depuis les en-têtes du message, pas reconstruit
@@ -1548,7 +1695,7 @@ impl Shell {
             return;
         };
         let Some(account) = self.default_sender() else {
-            self.status = Some("Aucun compte ne peut envoyer.".to_owned());
+            self.say(theme::Tone::Attention, "Aucun compte ne peut envoyer.");
             return;
         };
 
@@ -1584,7 +1731,7 @@ impl Shell {
             String::new()
         };
 
-        self.compose = Some(Compose {
+        let next = Compose {
             account,
             to: message.row.from.clone(),
             cc,
@@ -1593,7 +1740,9 @@ impl Shell {
             in_reply_to: threading.in_reply_to,
             references: threading.references,
             ..Compose::default()
-        });
+        };
+        self.park_compose();
+        self.compose = Some(next);
     }
 
     /// Ouvre un transfert du message ouvert.
@@ -1616,7 +1765,7 @@ impl Shell {
             return;
         };
         let Some(account) = self.default_sender() else {
-            self.status = Some("Aucun compte ne peut envoyer.".to_owned());
+            self.say(theme::Tone::Attention, "Aucun compte ne peut envoyer.");
             return;
         };
 
@@ -1635,21 +1784,24 @@ impl Shell {
         // `mailapi::dispatch::StagePartParams`.
         let pieces = message.attachments.len();
         let id = message.row.id;
+        let next = Compose {
+            account,
+            subject,
+            text: forwarded(message),
+            ..Compose::default()
+        };
         if pieces > 0 {
-            self.status = Some(format!(
-                "Transfert : reprise de {pieces} pièce(s) jointe(s) en cours…"
-            ));
+            self.say(
+                theme::Tone::Info,
+                format!("Transfert : reprise de {pieces} pièce(s) jointe(s) en cours…"),
+            );
             for part in 0..pieces {
                 self.worker.ask(Request::StagePart { id, part });
             }
         }
 
-        self.compose = Some(Compose {
-            account,
-            subject,
-            text: forwarded(message),
-            ..Compose::default()
-        });
+        self.park_compose();
+        self.compose = Some(next);
     }
     /// La fenêtre de rédaction.
     ///
@@ -1786,13 +1938,13 @@ impl Shell {
             crate::settings::Outcome::Sync(account) => {
                 self.worker.ask(Request::StartSync { account });
                 self.worker.ask(Request::Jobs);
-                // Le panneau des tâches s'ouvre tout seul : une moisson lancée sans rien à
-                // regarder ressemble à un bouton qui n'a rien fait, et l'utilisateur reclique.
-                self.show_import = true;
+                // L'activité s'ouvre toute seule : une moisson lancée sans rien à regarder
+                // ressemble à un bouton qui n'a rien fait, et l'utilisateur reclique.
+                self.show_view(View::Activity);
                 if let Some(page) = &mut self.settings {
                     page.message = Some(format!(
                         "Synchronisation du compte #{account} lancée. Sa progression s'affiche \
-                         dans « Importer… »."
+                         dans « Activité », à gauche de la fenêtre principale."
                     ));
                     page.failed = false;
                 }
@@ -1857,7 +2009,7 @@ impl Shell {
                 }
                 egui::CentralPanel::default().show(window, |ui| {
                     if let Some(error) = &view.error {
-                        ui.colored_label(theme::accent(ui.ctx()), error);
+                        ui.colored_label(theme::error(ui.ctx()), error);
                         return;
                     }
                     let Some(source) = &view.found else {
@@ -1986,7 +2138,10 @@ impl Shell {
             // Le rangement est un aller-retour par le fil du service : il lit le fichier et
             // le compresse, ce qui pour 25 Mo prend le temps qu'il prend. L'interface ne
             // l'attend pas — règle 3 — et la pièce apparaîtra à la réponse.
-            self.status = Some(format!("{} : rangement en cours…", path.as_str()));
+            self.say(
+                theme::Tone::Info,
+                format!("{} : rangement en cours…", path.as_str()),
+            );
             self.worker.ask(Request::Attach { path });
         }
         if pending.edit_signature && self.editor.is_none() {
@@ -2029,6 +2184,12 @@ impl Shell {
     /// fenêtre du système — et celui-ci **quoi**. La séparation n'est pas cosmétique : elle est
     /// ce qui a permis de changer de contenant sans toucher au formulaire.
     fn compose_form(&self, ui: &mut egui::Ui, draft: &mut Compose, pending: &mut Pending) {
+        // Ctrl+Entrée envoie, comme dans tous les clients. **Consommé avant le corps** : le
+        // champ multiligne dessiné plus bas y verrait sinon une Entrée, et le message partirait
+        // avec un saut de ligne de plus. Même porte que le bouton, donc même garde, appliquée
+        // au pied du formulaire : rien sans destinataire, rien pendant qu'un envoi voyage.
+        let shortcut =
+            ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
         // Le champ de destinataires qui a le focus, pour y ancrer la liste des propositions.
         // Relevé dans la grille et consommé après : la liste doit flotter **au-dessus** du
         // formulaire, donc elle se dessine hors de la cellule qui l'a produite.
@@ -2271,14 +2432,16 @@ impl Shell {
         ui.horizontal(|ui| {
             let ready = draft.is_sendable() && !self.sending;
             if ui
-                .add_enabled(ready, egui::Button::new("Envoyer"))
+                .add_enabled(ready, primary(ui, "Envoyer"))
+                .on_hover_text("Ctrl+Entrée")
                 .clicked()
+                || (ready && shortcut)
             {
                 pending.send = true;
             }
             if self.sending {
                 ui.spinner();
-                ui.weak("mise en file…");
+                ui.weak("Mise en file…");
             } else if !draft.is_sendable() {
                 ui.weak("Au moins un destinataire.");
             } else {
@@ -2345,13 +2508,34 @@ impl Shell {
     /// l'interface doit le dire avec les mots de la situation — pas avec un code, pas avec une
     /// icône d'erreur qui laisserait croire qu'il n'est pas parti. C'est le critère 8 de
     /// `docs/PHASE-3.md` appliqué au cas le plus délicat.
-    fn outbox_pane(&mut self, ui: &mut egui::Ui) {
+    fn outbox_view(&mut self, ui: &mut egui::Ui) {
+        let open_count = self.outbox.iter().filter(|it| it.state != "sent").count();
+        view_header(
+            ui,
+            "File d'envoi",
+            &match open_count {
+                0 => String::new(),
+                1 => "1 envoi en cours".to_owned(),
+                n => format!("{n} envois en cours"),
+            },
+        );
         ui.separator();
         if self.outbox.is_empty() {
-            ui.label("File d'envoi vide.");
+            empty_state(
+                ui,
+                "La file d'envoi est vide.",
+                "Un message envoyé passe ici le temps de partir, et y reste s'il est refusé.",
+            );
             return;
         }
+        egui::ScrollArea::vertical()
+            .id_salt("file")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.outbox_lines(ui));
+    }
 
+    /// Les lignes de la file : ce qui n'est pas fini, puis les derniers envoyés.
+    fn outbox_lines(&mut self, ui: &mut egui::Ui) {
         // **Ce qui n'est pas fini d'abord, l'historique ensuite et borné.** Le panneau montrait
         // toutes les lignes, `sent` comprises, et elles ne se purgent jamais : après un mois
         // d'usage, la seule ligne qui demande une décision était noyée dans un mur de
@@ -2369,23 +2553,29 @@ impl Shell {
         // autres nous écrivent, la file montre ce que nous écrivons. Voir `outbox.source`.
         let mut show_source: Option<(i64, String)> = None;
         for line in &open {
+            ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.set_min_height(ROW_HEIGHT);
-                if line.doubtful {
-                    ui.colored_label(ui.visuals().warn_fg_color, "⚠ état incertain");
-                    ui.label(format!("→ {}", line.recipients.join(", ")));
+                // L'état en premier, dans la couleur de ce qu'il demande : l'ambre pour le doute
+                // — une décision à prendre —, le rouge pour le refus, le gris pour l'attente.
+                let (state, color) = if line.doubtful {
+                    ("ÉTAT INCERTAIN", theme::warn(ui.ctx()))
                 } else {
-                    let state = match line.state.as_str() {
-                        "queued" => "en attente",
-                        "sending" => "en cours",
-                        "failed" => "échoué",
-                        other => other,
-                    };
-                    ui.label(format!("{state} → {}", line.recipients.join(", ")));
-                }
-                if source_button(ui).clicked() {
-                    show_source = Some((line.id, format!("envoi #{}", line.id)));
-                }
+                    match line.state.as_str() {
+                        "queued" => ("EN ATTENTE", ui.visuals().weak_text_color()),
+                        "sending" => ("EN COURS", ui.visuals().weak_text_color()),
+                        "failed" => ("REFUSÉ", theme::error(ui.ctx())),
+                        other => (other, ui.visuals().weak_text_color()),
+                    }
+                };
+                ui.label(egui::RichText::new(state).color(color).strong().size(11.0));
+                ui.label(format!("→ {}", line.recipients.join(", ")));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if source_button(ui).clicked() {
+                        show_source = Some((line.id, format!("envoi #{}", line.id)));
+                    }
+                    ui.weak(list_date(line.queued_at));
+                });
             });
 
             // **La phrase du refus n'est pas en gris.** Elle l'était, avec l'état en texte
@@ -2458,14 +2648,24 @@ impl Shell {
         }
 
         if !done.is_empty() {
-            ui.separator();
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new("Envoyés récemment")
+                    .weak()
+                    .strong()
+                    .size(11.0),
+            );
             // Les derniers envoyés seulement, et le total dit ce qui n'est pas montré. Une
             // liste tronquée sans son compte laisserait croire que c'est tout.
             let shown = done.len().min(OUTBOX_HISTORY);
             for line in done.iter().rev().take(shown) {
                 ui.horizontal_wrapped(|ui| {
                     ui.set_min_height(ROW_HEIGHT);
-                    ui.weak(format!("envoyé → {}", line.recipients.join(", ")));
+                    ui.weak(format!(
+                        "{}  envoyé → {}",
+                        list_date(line.queued_at),
+                        line.recipients.join(", ")
+                    ));
                     // Sur une ligne **envoyée** surtout : c'est après coup qu'on veut savoir ce
                     // qui est parti, et le message ne reviendra du dossier « Envoyés » qu'à la
                     // prochaine moisson.
@@ -2499,14 +2699,76 @@ impl Shell {
             self.open_source(crate::worker::SourceOf::Outgoing(id), title);
         }
     }
-    /// Le panneau d'import : les sources déclarées, les tâches en cours.
+    /// L'activité : les tâches de fond, les sources à importer, l'index et le cache.
+    ///
+    /// C'était le panneau « Importer… », qui portait en réalité quatre choses — imports, index,
+    /// purge du cache, synchronisations — sous le nom d'une seule. Le nom suit maintenant ce
+    /// qu'il y a dedans.
     ///
     /// **Un rang, jamais un chemin** : la coquille choisit dans la liste que le service rend,
     /// exactement comme un client distant (`mailapi`, documentation de `jobs.start`).
-    fn import_pane(&mut self, ui: &mut egui::Ui) {
+    fn activity_view(&mut self, ui: &mut egui::Ui) {
+        let running = self
+            .jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .count();
+        view_header(
+            ui,
+            "Activité",
+            &match running {
+                0 => String::new(),
+                1 => "1 tâche en cours".to_owned(),
+                n => format!("{n} tâches en cours"),
+            },
+        );
         ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("activite")
+            .auto_shrink([false, false])
+            .show(ui, |ui| self.activity_body(ui));
+    }
+
+    /// Le contenu de l'activité, section par section.
+    fn activity_body(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Tâches");
+        if self.jobs.is_empty() {
+            ui.weak("Aucune tâche depuis le démarrage du service.");
+        }
+        for job in &self.jobs {
+            ui.horizontal(|ui| {
+                ui.set_height(ROW_HEIGHT);
+                ui.label(job_label(job));
+                let (state, color) = match job.state.as_str() {
+                    "queued" => ("en attente", ui.visuals().weak_text_color()),
+                    "running" => ("en cours", ui.visuals().weak_text_color()),
+                    "done" => ("terminée", theme::ok(ui.ctx())),
+                    "cancelled" => ("annulée", ui.visuals().weak_text_color()),
+                    "failed" => ("en échec", theme::error(ui.ctx())),
+                    other => (other, ui.visuals().weak_text_color()),
+                };
+                ui.colored_label(color, state);
+                match job.fraction {
+                    // Une barre indéterminée est honnête ; une barre à zéro qui ne bouge pas
+                    // ressemble à une panne.
+                    Some(fraction) if job.state == "running" => {
+                        ui.add(egui::ProgressBar::new(fraction).desired_width(180.0));
+                    }
+                    None if job.state == "running" => {
+                        ui.spinner();
+                    }
+                    _ => {}
+                }
+                if let Some(message) = &job.message {
+                    ui.add(egui::Label::new(egui::RichText::new(message).weak()).truncate())
+                        .on_hover_text(message);
+                }
+            });
+        }
+
+        section(ui, "Importer");
         if self.sources.is_empty() {
-            ui.label(
+            ui.weak(
                 "Aucun profil Thunderbird détecté sur cette machine. Rien à importer : la \
                  coquille ne lit que ce que le service a déclaré.",
             );
@@ -2521,21 +2783,25 @@ impl Shell {
                 ui.weak(source.path);
             });
         }
-        if !self.sources.is_empty() {
-            ui.horizontal(|ui| {
-                ui.set_height(ROW_HEIGHT);
-                if ui.button("Reconstruire l'index").clicked() {
-                    self.worker.ask(Request::StartIndex);
-                    self.worker.ask(Request::Jobs);
-                }
-                ui.weak("recherche plein texte");
-            });
-        }
+
+        // **Toujours là.** Le bouton n'apparaissait qu'avec une source à importer : sur une
+        // machine sans Thunderbird, un index perdu ne se reconstruisait pas depuis la coquille —
+        // et la barre d'état disait justement de le reconstruire.
+        section(ui, "Recherche plein texte");
+        ui.horizontal(|ui| {
+            ui.set_height(ROW_HEIGHT);
+            if ui.button("Reconstruire l'index").clicked() {
+                self.worker.ask(Request::StartIndex);
+                self.worker.ask(Request::Jobs);
+            }
+            ui.weak("relit tout le courrier rangé et refait l'index des mots");
+        });
 
         // **Le bouton qui rend le cache acceptable.** `docs/PRIVACY.md` §8 : les sujets et les
         // expéditeurs d'une boîte sont presque aussi révélateurs que le courrier. Un cache
         // qu'on ne peut pas effacer est une trace qu'on ne peut pas retirer.
         if let Some(host) = self.cache_host.clone() {
+            section(ui, "Cache de lecture");
             ui.horizontal(|ui| {
                 ui.set_height(ROW_HEIGHT);
                 let label = if self.cache_disabled {
@@ -2555,44 +2821,25 @@ impl Shell {
                             // jusqu'à la page suivante, ce qui n'est pas effacer.
                             self.cache_disabled = true;
                             self.cache_saved = None;
-                            self.status = Some(format!(
-                                "cache effacé : {path}. Plus rien ne sera écrit jusqu'au \
-                                 prochain lancement."
-                            ));
+                            self.say(
+                                theme::Tone::Done,
+                                format!(
+                                    "Cache effacé : {path}. Plus rien ne sera écrit jusqu'au \
+                                     prochain lancement."
+                                ),
+                            );
                             // La liste à l'écran, elle, ne bouge pas : elle vient du démon, pas
                             // du cache. La vider donnerait l'impression d'avoir perdu son
                             // courrier pour avoir nettoyé un fichier.
                         }
                         Err(source) => {
-                            self.status = Some(format!("cache non effacé : {source}"));
+                            self.say(theme::Tone::Failed, format!("Cache non effacé : {source}"));
                         }
                     }
                 }
                 ui.weak("sujets et expéditeurs gardés hors ligne, pour ce démon");
             });
         }
-
-        for job in &self.jobs {
-            ui.horizontal(|ui| {
-                ui.set_height(ROW_HEIGHT);
-                ui.label(format!("{} — {}", job.kind, job.state));
-                match job.fraction {
-                    // Une barre indéterminée est honnête ; une barre à zéro qui ne bouge pas
-                    // ressemble à une panne.
-                    Some(fraction) => {
-                        ui.add(egui::ProgressBar::new(fraction).desired_width(180.0));
-                    }
-                    None if job.state == "running" => {
-                        ui.spinner();
-                    }
-                    None => {}
-                }
-                if let Some(message) = &job.message {
-                    ui.weak(message);
-                }
-            });
-        }
-        ui.separator();
     }
 
     /// Le panneau des dossiers, groupés par compte.
@@ -2601,17 +2848,22 @@ impl Shell {
     /// chemins complets donne des entrées indiscernables. Le compte en intitulé, le dernier
     /// segment indenté selon la profondeur.
     fn folders_pane(&mut self, ui: &mut egui::Ui) {
+        fill_panel(ui);
         let mut to_open = None;
+        let mut to_show = None;
+        let in_messages = self.view == View::Messages;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let mut account = None;
+                if self.folders.is_empty() {
+                    ui.add_space(6.0);
+                    ui.weak("Aucun dossier pour l'instant. Paramètres (⚙) pour déclarer un compte, Activité pour importer.");
+                }
                 for folder in &self.folders {
                     if account.as_deref() != Some(folder.account.as_str()) {
-                        if account.is_some() {
-                            ui.add_space(6.0);
-                        }
-                        ui.label(egui::RichText::new(&folder.account).strong().size(11.0));
+                        ui.add_space(if account.is_some() { 8.0 } else { 2.0 });
+                        section_label(ui, &folder.account);
                         account = Some(folder.account.clone());
                     }
 
@@ -2626,17 +2878,17 @@ impl Shell {
                         } else {
                             egui::RichText::new(leaf)
                         };
-                        if ui
-                            .selectable_label(self.current == Some(folder.id), label)
-                            .clicked()
-                        {
+                        // Sélectionné seulement quand c'est lui qu'on regarde : la file ouverte, le
+                        // dossier d'où l'on vient n'est plus la vue.
+                        let current = in_messages && self.results.is_none() && self.current == Some(folder.id);
+                        if ui.selectable_label(current, label).clicked() {
                             to_open = Some(folder.id);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if folder.unread > 0 {
                                 ui.colored_label(
                                     theme::accent(ui.ctx()),
-                                    folder.unread.to_string(),
+                                    egui::RichText::new(folder.unread.to_string()).strong(),
                                 );
                             } else {
                                 ui.weak(folder.total.to_string());
@@ -2644,41 +2896,118 @@ impl Shell {
                         });
                     });
                 }
+
+                // **Ce qui vit sur cette machine et nulle part ailleurs** : la file, les
+                // brouillons, l'activité. Sous les dossiers, rangés comme eux, parce qu'ils se
+                // regardent comme eux — voir [`View`].
+                ui.add_space(8.0);
+                section_label(ui, "Sur cette machine");
+                let waiting = self
+                    .outbox
+                    .iter()
+                    .filter(|it| it.state == "queued" || it.state == "sending" || it.state == "failed")
+                    .count();
+                let doubtful = self.outbox.iter().filter(|it| it.doubtful).count();
+                let running = self.jobs.iter().filter(|job| job.state == "running").count();
+                let entries = [
+                    (
+                        View::Outbox,
+                        "File d'envoi",
+                        // Le doute passe devant le compte en attente : c'est le seul état qui
+                        // demande une décision, et il ne doit pas se noyer dans un nombre.
+                        match (waiting, doubtful) {
+                            (_, 1..) => Some((format!("⚠ {doubtful}"), theme::warn(ui.ctx()))),
+                            (0, 0) => None,
+                            (n, 0) => Some((n.to_string(), ui.visuals().weak_text_color())),
+                        },
+                    ),
+                    (
+                        View::Drafts,
+                        "Brouillons",
+                        (!self.drafts.is_empty())
+                            .then(|| (self.drafts.len().to_string(), ui.visuals().weak_text_color())),
+                    ),
+                    (
+                        View::Activity,
+                        "Activité",
+                        (running > 0).then(|| (format!("{running} en cours"), ui.visuals().weak_text_color())),
+                    ),
+                ];
+                for (view, name, badge) in entries {
+                    ui.horizontal(|ui| {
+                        ui.set_height(ROW_HEIGHT);
+                        if ui.selectable_label(self.view == view, name).clicked() {
+                            to_show = Some(view);
+                        }
+                        if let Some((text, color)) = badge {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.colored_label(color, egui::RichText::new(text).strong());
+                            });
+                        }
+                    });
+                }
             });
         if let Some(id) = to_open {
             self.open_folder(id);
+        }
+        if let Some(view) = to_show {
+            self.show_view(view);
         }
     }
 
     /// La liste, virtualisée par le toolkit.
     fn list_pane(&mut self, ui: &mut egui::Ui) {
-        let title = if self.results.is_some() {
-            "Résultats".to_owned()
-        } else {
-            self.folder()
-                .map_or_else(|| "—".to_owned(), |it| it.path.clone())
-        };
         let total = self.total();
         let loaded = self.visible().len();
-
-        ui.horizontal(|ui| {
-            ui.set_height(24.0);
-            ui.strong(title);
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Le compteur est écrit en clair : « 100 / 9702 » ne dit pas de quoi on parle.
-                if loaded < total {
-                    ui.weak(format!("{loaded} chargés sur {total}"));
-                } else {
-                    ui.weak(format!("{total} messages"));
-                }
-            });
-        });
+        // Le compteur est écrit en clair : « 100 / 9702 » ne dit pas de quoi on parle.
+        let count = if loaded < total {
+            format!("{loaded} chargés sur {total}")
+        } else {
+            plural(total, "message", "messages")
+        };
+        if self.results.is_some() {
+            // Classés par pertinence, et le titre le dit : une liste de résultats ressemble à
+            // un dossier, et sans ça on y cherche un ordre de dates qui n'existe pas.
+            view_header(ui, "Résultats", &format!("{count} · par pertinence"));
+            ui.weak(format!("« {} »", self.query.trim()));
+        } else {
+            let (title, account) = self.folder().map_or_else(
+                || ("—".to_owned(), String::new()),
+                |it| (it.path.replace('/', " › "), it.account.clone()),
+            );
+            let unread = self.folder().map_or(0, |it| it.unread);
+            let meta = if unread > 0 {
+                format!("{unread} non lus · {count}")
+            } else {
+                count
+            };
+            view_header(ui, &title, &meta);
+            if !account.is_empty() {
+                ui.weak(account);
+            }
+        }
         if self.results.is_some()
             && let Some(semantic) = &self.semantic
         {
             semantic_banner(ui, semantic);
         }
         ui.separator();
+
+        // **Un état vide qui dit quelque chose.** Une recherche sans résultat laissait une zone
+        // blanche et « 0 messages » en gris dans un coin : impossible de distinguer « rien
+        // trouvé » de « pas encore répondu ».
+        if total == 0 && !self.searching && !self.loading_page {
+            if self.results.is_some() {
+                empty_state(
+                    ui,
+                    &format!("Aucun message ne correspond à « {} ».", self.query.trim()),
+                    "Moins de mots, ou from: pour un expéditeur. Échap revient au dossier.",
+                );
+            } else if self.current.is_some() {
+                empty_state(ui, "Ce dossier est vide.", "");
+            }
+            return;
+        }
 
         let mut to_open = None;
         let mut need_more = false;
@@ -2713,16 +3042,21 @@ impl Shell {
 
     /// Le volet de lecture.
     fn reader_pane(&mut self, ui: &mut egui::Ui) {
+        fill_panel(ui);
         if let Some(error) = &self.open_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
             return;
         }
         if self.message.is_none() {
-            ui.weak(if self.opening {
-                "Ouverture…"
+            if self.opening {
+                ui.weak("Ouverture…");
             } else {
-                "Aucun message sélectionné."
-            });
+                empty_state(
+                    ui,
+                    "Aucun message ouvert.",
+                    "J et K pour parcourir la liste, / pour chercher.",
+                );
+            }
             return;
         }
 
@@ -2750,6 +3084,7 @@ impl Shell {
                         let refus = "Aucun compte n'a de serveur d'envoi configuré.";
                         if ui
                             .add_enabled(can_send, egui::Button::new("↩ Répondre"))
+                            .on_hover_text("Répond à l'expéditeur — R")
                             .on_disabled_hover_text(refus)
                             .clicked()
                         {
@@ -2766,30 +3101,28 @@ impl Shell {
                             } else {
                                 "Ce message n'a qu'un destinataire."
                             })
-                            .on_hover_text("Répond à l'expéditeur, avec les autres en copie")
+                            .on_hover_text("Répond à l'expéditeur, avec les autres en copie — A")
                             .clicked()
                         {
                             reply = Some(Answer::Everyone);
                         }
+                        // L'infobulle disait « les pièces jointes ne suivent pas » : elles
+                        // suivent depuis `start_forward`, qui les reprend une à une.
                         if ui
                             .add_enabled(can_send, egui::Button::new("→ Transférer"))
                             .on_disabled_hover_text(refus)
                             .on_hover_text(
-                                "Nouveau message, hors du fil. Les pièces jointes ne suivent pas.",
+                                "Nouveau message, hors du fil, avec les pièces jointes — F",
                             )
                             .clicked()
                         {
                             reply = Some(Answer::Forward);
                         }
-                        if ui
-                            .button("⛭ Source")
-                            .on_hover_text(
-                                "Les octets du message, tels qu'ils sont : rien n'est décodé",
-                            )
-                            .clicked()
-                        {
-                            reply = Some(Answer::Source);
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if source_button(ui).clicked() {
+                                reply = Some(Answer::Source);
+                            }
+                        });
                     });
                     ui.separator();
                     self.body_actions(ui, message);
@@ -2884,7 +3217,7 @@ impl Shell {
         for row in &self.thread {
             ui.horizontal(|ui| {
                 ui.set_height(ROW_HEIGHT);
-                let label = format!("{}  {}", short_date(row.date), elide(&row.subject, 44));
+                let label = format!("{}  {}", list_date(row.date), elide(&row.subject, 44));
                 let label = if row.id == current {
                     egui::RichText::new(label).strong()
                 } else {
@@ -2925,14 +3258,13 @@ impl Shell {
                 .iter()
                 .map(|tracker| tracker.host.as_str())
                 .collect();
-            ui.colored_label(
-                theme::accent(ui.ctx()),
-                format!(
-                    "{} traceur(s) neutralisé(s) : {}",
-                    html.trackers.len(),
-                    hosts.join(", ")
-                ),
-            );
+            // En gris, plus en accent : c'est un constat rassurant, pas une sélection ni une
+            // alerte — et l'accent ne veut plus dire que ce qu'on regarde.
+            ui.weak(format!(
+                "{} traceur(s) neutralisé(s) : {}",
+                html.trackers.len(),
+                hosts.join(", ")
+            ));
         }
     }
 
@@ -2958,13 +3290,50 @@ impl Shell {
                     - i32::from(input.key_pressed(egui::Key::PageUp)),
             )
         });
+        // Les gestes d'écriture, sans modificateur : une seule touche, comme `j` et `k`. Un
+        // modificateur enfoncé les désactive — Ctrl+C copie, il n'écrit pas un message.
+        let (write, reply, everyone, forward) = ctx.input(|input| {
+            let plain = !input.modifiers.any();
+            (
+                plain && input.key_pressed(egui::Key::C),
+                plain && input.key_pressed(egui::Key::R),
+                plain && input.key_pressed(egui::Key::A),
+                plain && input.key_pressed(egui::Key::F),
+            )
+        });
 
         if search {
             self.focus_search = true;
         }
-        if escape && self.results.is_some() {
-            self.results = None;
-            self.query.clear();
+        if escape {
+            // Échap remonte d'un cran : d'une vue de la colonne de gauche vers la liste, de la
+            // recherche vers le dossier.
+            if self.view != View::Messages {
+                self.view = View::Messages;
+            } else if self.results.is_some() {
+                self.clear_search();
+            }
+        }
+
+        let can_send = self.default_sender().is_some();
+        if write && can_send {
+            self.start_compose();
+        }
+        // Répondre porte sur le message ouvert, et seulement quand on le voit : depuis la file,
+        // `r` ne doit pas répondre à un message qui n'est plus à l'écran.
+        if self.view == View::Messages && can_send && self.message.is_some() {
+            if reply {
+                self.start_reply(false);
+            } else if everyone && self.message.as_ref().is_some_and(|it| it.to.len() > 1) {
+                self.start_reply(true);
+            } else if forward {
+                self.start_forward();
+            }
+        }
+        if self.view != View::Messages {
+            // Les flèches et `j`/`k` parcourent la liste des messages ; dans une autre vue, elles
+            // ouvriraient un message invisible.
+            return;
         }
 
         let step = if page != 0 { page * 20 } else { 0 };
@@ -3468,13 +3837,6 @@ impl Shell {
     }
 }
 
-/// La date civile du démarrage, pour savoir si une date de liste est de l'année en cours.
-///
-/// Une application ouverte à travers un réveillon affichera l'année sur les messages du
-/// lendemain. C'est le prix d'un calcul fait une fois, et il est dérisoire à côté de deux mille
-/// lectures d'horloge par seconde.
-static CURRENT_YEAR: std::sync::OnceLock<(i64, u32, u32, u32, u32)> = std::sync::OnceLock::new();
-
 /// Le percentile d'une série, par interpolation basse.
 ///
 /// Une série vide rend zéro : un banc qui n'a rien relevé doit sortir un chiffre qu'on
@@ -3491,71 +3853,148 @@ fn percentile(series: &[f64], fraction: f64) -> f64 {
 }
 
 /// Une ligne de liste. Rend vrai si elle vient d'être activée.
+///
+/// ## Des colonnes posées à la main, et le fond peint après
+///
+/// La version précédente était une rangée de widgets : la date en `selectable_label`, le reste en
+/// étiquettes. Deux défauts en sortaient. **Seule la date se surlignait** quand la ligne était
+/// choisie — un rectangle d'accent de quarante points au bout d'une ligne de huit cents. Et le
+/// sujet, coupé à la largeur disponible, prenait toute la place : les marques de droite étaient
+/// dessinées au-delà, par-dessus rien.
+///
+/// Les colonnes sont maintenant des rectangles calculés, de droite à gauche pour les marques et
+/// de gauche à droite pour le reste, et le sujet prend **ce qui reste entre les deux**. Le fond
+/// est réservé d'abord et peint ensuite (`Shape::Noop` puis `set`), parce qu'il dépend du survol,
+/// qui ne se sait qu'une fois la ligne enregistrée — et qu'il doit être dessiné sous le texte.
+///
+/// ## La ligne entière est cliquable
+///
+/// Signalé le 2026-09-08 à la première utilisation réelle : seule la date recevait les clics.
+/// `interact` sur le rectangle entier, **après** les cellules, le met au-dessus d'elles ; les
+/// étiquettes ne sont pas sélectionnables et ne prennent pas le clic.
 fn row_widget(ui: &mut egui::Ui, row: &dto::Row, selected: bool) -> bool {
-    let mut clicked = false;
-    let row_area = ui.horizontal(|ui| {
-        ui.set_height(ROW_HEIGHT);
-        let strong = row.unread;
+    let (id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), ROW_HEIGHT));
+    if !ui.is_rect_visible(rect) {
+        return false;
+    }
+    let background = ui.painter().add(egui::Shape::Noop);
+    let strong = row.unread;
+    let styled = |text: String, weak: bool| {
+        let text = egui::RichText::new(text);
+        match (strong, weak) {
+            (true, _) => text.strong(),
+            (false, true) => text.weak(),
+            (false, false) => text,
+        }
+    };
 
-        let response = ui.selectable_label(selected, {
-            let date = short_date(row.date);
-            if strong {
-                egui::RichText::new(date).strong()
-            } else {
-                egui::RichText::new(date).weak()
-            }
-        });
-        clicked |= response.clicked();
-
-        let who = row
-            .from_name
-            .as_deref()
-            .filter(|it| !it.trim().is_empty())
-            .unwrap_or(&row.from);
-        let sender = egui::RichText::new(elide(who, 28));
-        let response = ui.add_sized(
-            [190.0, ROW_HEIGHT],
-            egui::Label::new(if strong { sender.strong() } else { sender })
-                .truncate()
-                .selectable(false),
+    // Les marques, de droite à gauche : elles décident de la place qui reste au sujet.
+    let mut right = rect.right() - ROW_PAD;
+    if row.flagged {
+        right = cell_from_right(ui, rect, right, egui::RichText::new("★"), None);
+    }
+    if row.has_attachments {
+        right = cell_from_right(ui, rect, right, egui::RichText::new("📎"), None);
+    }
+    // Un résultat que les mots n'ont pas trouvé se signale : sans la marque, il ressemble à une
+    // erreur du moteur — « pourquoi celui-là ? ».
+    if row.found_by == Some(dto::FoundBy::Meaning) {
+        right = cell_from_right(
+            ui,
+            rect,
+            right,
+            egui::RichText::new("≈ sens").small().weak(),
+            Some("Trouvé par le sens, pas par les mots cherchés."),
         );
-        clicked |= response.clicked();
+    }
 
-        let subject = egui::RichText::new(&row.subject);
-        let response = ui.add(
-            egui::Label::new(if strong { subject.strong() } else { subject })
-                .truncate()
-                .selectable(false),
+    let mut left = rect.left() + ROW_PAD;
+    // Le point du non-lu : le gras seul se lit mal sur une liste dense, et c'est ce que le thème
+    // promettait à l'accent depuis la phase 1.
+    if row.unread {
+        let center = egui::pos2(left + UNREAD_DOT / 2.0, rect.center().y);
+        ui.painter()
+            .circle_filled(center, 3.0, theme::accent(ui.ctx()));
+    }
+    left += UNREAD_DOT + COLUMN_GAP;
+    left = cell(
+        ui,
+        rect,
+        left,
+        DATE_COLUMN,
+        styled(list_date(row.date), true),
+    );
+    let who = row
+        .from_name
+        .as_deref()
+        .filter(|it| !it.trim().is_empty())
+        .unwrap_or(&row.from);
+    left = cell(ui, rect, left, SENDER_COLUMN, styled(who.to_owned(), false));
+    cell(
+        ui,
+        rect,
+        left,
+        (right - COLUMN_GAP - left).max(0.0),
+        styled(row.subject.clone(), false),
+    );
+
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let fill = if selected {
+        Some(ui.visuals().selection.bg_fill)
+    } else if response.hovered() {
+        Some(ui.visuals().widgets.hovered.weak_bg_fill)
+    } else {
+        None
+    };
+    if let Some(fill) = fill {
+        ui.painter().set(
+            background,
+            egui::Shape::rect_filled(rect, egui::CornerRadius::ZERO, fill),
         );
-        clicked |= response.clicked();
+    }
+    response.clicked()
+}
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if row.flagged {
-                ui.label("★");
-            }
-            if row.has_attachments {
-                ui.label("📎");
-            }
-            // Un résultat que les mots n'ont pas trouvé se signale : sans la marque, il ressemble
-            // à une erreur du moteur — « pourquoi celui-là ? ».
-            if row.found_by == Some(dto::FoundBy::Meaning) {
-                ui.weak("≈ sens")
-                    .on_hover_text("Trouvé par le sens, pas par les mots cherchés.");
-            }
-        });
-    });
+/// Une cellule de ligne, posée à `left` sur `width` points, texte coupé à sa largeur. Rend
+/// l'abscisse de la cellule suivante.
+fn cell(ui: &mut egui::Ui, row: egui::Rect, left: f32, width: f32, text: egui::RichText) -> f32 {
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(left, row.top()),
+        egui::vec2(width.max(0.0), row.height()),
+    );
+    // Un enfant **qui n'avance pas le curseur** du parent : la ligne a déjà réservé sa place,
+    // et `put` ou `scope_builder` la réserveraient une seconde fois.
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.add(egui::Label::new(text).truncate().selectable(false));
+    left + width + COLUMN_GAP
+}
 
-    // **La ligne entière est cliquable, et c'est ce qui manquait.**
-    //
-    // Un `egui::Label` n'est pas interactif : son `clicked()` rend toujours `false`. Seule la
-    // date, qui est un `selectable_label` — donc un bouton — recevait les clics. Cliquer sur
-    // l'objet ou sur l'expéditeur, c'est-à-dire sur les neuf dixièmes de la ligne, ne faisait
-    // rien du tout. Signalé le 2026-09-08, à la première utilisation réelle de la coquille.
-    //
-    // `interact` réenregistre le rectangle de la ligne avec une intention de clic, ce qui
-    // couvre aussi les blancs entre les colonnes — personne ne vise un mot.
-    clicked |= row_area.response.interact(egui::Sense::click()).clicked();
-    clicked
+/// Une marque posée contre `right`, à sa largeur naturelle. Rend le bord droit de la suivante.
+fn cell_from_right(
+    ui: &mut egui::Ui,
+    row: egui::Rect,
+    right: f32,
+    text: egui::RichText,
+    hover: Option<&str>,
+) -> f32 {
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(row.left(), row.top()),
+        egui::pos2(right, row.bottom()),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    let response = child.add(egui::Label::new(text).selectable(false));
+    if let Some(hover) = hover {
+        response.on_hover_text(hover);
+    }
+    child.min_rect().left() - MARK_GAP
 }
 
 /// La ligne qui dit pourquoi la recherche par le sens n'a pas répondu, et comment l'obtenir.
@@ -3588,50 +4027,91 @@ fn semantic_banner(ui: &mut egui::Ui, semantic: &dto::Semantic) {
 
 /// L'en-tête d'un message ouvert.
 fn header(ui: &mut egui::Ui, message: &dto::Message) {
-    ui.label(
-        egui::RichText::new(&message.row.subject)
-            .strong()
-            .size(15.0),
+    ui.add_space(4.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(&message.row.subject)
+                .strong()
+                .size(16.0),
+        )
+        .wrap(),
     );
-    ui.add_space(2.0);
-    let who = message
-        .row
-        .from_name
-        .as_deref()
-        .filter(|it| !it.trim().is_empty())
-        .map_or_else(
-            || message.row.from.clone(),
-            |name| format!("{name} <{}>", message.row.from),
-        );
-    ui.weak(who);
+    ui.add_space(4.0);
+    // Le nom en clair, l'adresse en gris, la date à droite : on lit d'abord **qui**, et
+    // l'adresse sert à vérifier — c'est elle qu'un hameçonnage imite mal.
+    //
+    // La date est posée **d'abord**, à droite, et l'expéditeur prend ce qui reste en se
+    // tronquant : posée après, elle se dessinait par-dessus une adresse longue dès que le volet
+    // était étroit.
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(long_date(message.row.date));
+            ui.with_layout(
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| match message
+                    .row
+                    .from_name
+                    .as_deref()
+                    .filter(|it| !it.trim().is_empty())
+                {
+                    Some(name) if name != message.row.from => {
+                        ui.add(egui::Label::new(egui::RichText::new(name).strong()).truncate());
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&message.row.from).weak())
+                                .truncate(),
+                        )
+                        .on_hover_text(&message.row.from);
+                    }
+                    _ => {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&message.row.from).strong())
+                                .truncate(),
+                        )
+                        .on_hover_text(&message.row.from);
+                    }
+                },
+            );
+        });
+    });
     if !message.to.is_empty() {
-        ui.weak(format!("à {}", message.to.join(", ")));
+        ui.add(
+            egui::Label::new(egui::RichText::new(format!("à {}", message.to.join(", "))).weak())
+                .wrap(),
+        );
     }
-    ui.weak(long_date(message.row.date));
     if !message.folders.is_empty() {
         let paths: Vec<&str> = message.folders.iter().map(|it| it.path.as_str()).collect();
         ui.weak(format!("dans {}", paths.join(", ")));
     }
     if !message.attachments.is_empty() {
-        // Décrites, jamais ouvertes en phase 1.
-        for attachment in &message.attachments {
-            ui.weak(format!(
-                "📎 {} — {} ({} o)",
-                attachment.name.as_deref().unwrap_or("sans nom"),
-                attachment.mime,
-                attachment.size
-            ));
-        }
+        ui.add_space(4.0);
+        // Décrites, jamais ouvertes en phase 1. La taille en unités lisibles, comme dans la
+        // fenêtre de rédaction : « 1843 o » d'un côté et « 1,8 Kio » de l'autre se lisaient
+        // comme deux choses.
+        ui.horizontal_wrapped(|ui| {
+            for attachment in &message.attachments {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "📎 {}  {}",
+                        attachment.name.as_deref().unwrap_or("sans nom"),
+                        human::bytes(attachment.size)
+                    ))
+                    .weak(),
+                )
+                .on_hover_text(&attachment.mime);
+            }
+        });
     }
 }
 
-/// Dessine les blocs d'un corps.
 /// Le bouton qui ouvre la source, avec la même étiquette partout.
 ///
 /// Une seule fonction plutôt que trois littéraux : trois emplacements finiraient par porter
 /// trois formulations, et l'utilisateur ne reconnaîtrait pas que c'est la même chose.
 fn source_button(ui: &mut egui::Ui) -> egui::Response {
-    ui.small_button("⛭ Source")
+    // `{ }` et plus `⛭` : ce dernier se lisait comme l'engrenage des paramètres, à côté de
+    // l'engrenage des paramètres.
+    ui.small_button("{ } Source")
         .on_hover_text("Les octets du message, tels qu'ils sont : rien n'est décodé")
 }
 
@@ -3644,7 +4124,7 @@ fn source_body(ui: &mut egui::Ui, source: &dto::MessageSource) {
         ui.weak(mailapi::human::bytes(source.total));
         if source.invalid_sequences > 0 {
             ui.colored_label(
-                theme::accent(ui.ctx()),
+                theme::warn(ui.ctx()),
                 format!(
                     "{} séquence(s) non UTF-8, rendues par « \u{fffd} »",
                     source.invalid_sequences
@@ -3653,7 +4133,7 @@ fn source_body(ui: &mut egui::Ui, source: &dto::MessageSource) {
         }
         if source.escaped_controls > 0 {
             ui.colored_label(
-                theme::accent(ui.ctx()),
+                theme::warn(ui.ctx()),
                 format!(
                     "{} caractère(s) de contrôle rendus visibles",
                     source.escaped_controls
@@ -3661,7 +4141,7 @@ fn source_body(ui: &mut egui::Ui, source: &dto::MessageSource) {
             );
         }
         if source.headers_truncated {
-            ui.colored_label(theme::accent(ui.ctx()), "en-têtes tronqués");
+            ui.colored_label(theme::warn(ui.ctx()), "En-têtes tronqués");
         }
     });
     ui.separator();
@@ -3680,9 +4160,9 @@ fn source_body(ui: &mut egui::Ui, source: &dto::MessageSource) {
             if source.body_truncated {
                 ui.add_space(4.0);
                 ui.colored_label(
-                    theme::accent(ui.ctx()),
+                    theme::warn(ui.ctx()),
                     format!(
-                        "corps tronqué — le message fait {}",
+                        "Corps tronqué — le message fait {}",
                         mailapi::human::bytes(source.total)
                     ),
                 );
@@ -4045,6 +4525,107 @@ fn signature_preview(ui: &mut egui::Ui, signature: &mailhtml::rich::Document) {
     }
 }
 
+/// L'en-tête d'une vue centrale : son titre, et à droite ce qu'elle compte.
+///
+/// Une seule fonction pour la liste, la file, les brouillons et l'activité : quatre en-têtes
+/// écrits à la main avaient fini par en faire quatre — un titre en gras ici, aucun là.
+fn view_header(ui: &mut egui::Ui, title: &str, meta: &str) {
+    ui.horizontal(|ui| {
+        ui.set_height(VIEW_HEADER);
+        ui.label(egui::RichText::new(title).strong().size(14.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !meta.is_empty() {
+                ui.weak(meta);
+            }
+        });
+    });
+}
+
+/// Ce qu'une vue dit quand elle n'a rien à montrer : ce qui se passe, puis quoi faire.
+///
+/// Une zone blanche ne distingue pas « rien » de « pas encore » ni de « en panne ». La phrase
+/// le fait, et la seconde dit le geste — critère 8 de la phase 3, appliqué au vide.
+fn empty_state(ui: &mut egui::Ui, what: &str, hint: &str) {
+    ui.add_space(EMPTY_TOP);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(what).strong());
+        if !hint.is_empty() {
+            ui.add_space(4.0);
+            ui.weak(hint);
+        }
+    });
+}
+
+/// Un titre de section dans une vue.
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(10.0);
+    section_label(ui, title);
+    ui.add_space(2.0);
+}
+
+/// L'intitulé d'un groupe : un compte dans la colonne de gauche, une section dans une vue.
+/// Petit, gris et en gras — il range, il ne se lit pas.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).weak().strong().size(11.0));
+}
+
+/// Fait occuper au contenu d'un volet latéral toute la largeur qu'il a reçue.
+///
+/// **Un volet d'egui 0.36 retient la largeur de son contenu, pas celle qu'on lui a donnée** :
+/// il ne garantit que le minimum de sa plage. Le lecteur tombait donc à 320 points dès qu'un
+/// message ouvert était moins large que lui — et y restait, puisque la largeur retenue sert de
+/// point de départ à l'image suivante.
+fn fill_panel(ui: &mut egui::Ui) {
+    ui.set_min_width(ui.available_width());
+}
+
+/// Le bouton de l'action principale d'un écran : plein, dans l'accent. Il n'y en a qu'un par
+/// écran — « Écrire », « Envoyer » —, sinon il ne désigne plus rien.
+fn primary(ui: &egui::Ui, text: &str) -> egui::Button<'static> {
+    let accent = theme::accent(ui.ctx());
+    // Le texte sur l'accent : blanc sur le bleu du thème clair, sombre sur le bleu clair du
+    // thème sombre, pour garder le contraste dans les deux.
+    let on_accent = if ui.visuals().dark_mode {
+        egui::Color32::from_rgb(0x10, 0x15, 0x1C)
+    } else {
+        egui::Color32::WHITE
+    };
+    egui::Button::new(egui::RichText::new(text.to_owned()).color(on_accent)).fill(accent)
+}
+
+/// Le nom d'une tâche de fond, en français. Le service rend des codes — `sync`, `index` —, et
+/// les afficher tels quels donnait « import — running » dans une interface française.
+fn job_label(job: &dto::Job) -> String {
+    match job.kind.as_str() {
+        "import" => "Import",
+        "index" => "Index plein texte",
+        "thread" => "Fils de discussion",
+        "contacts" => "Carnet d'adresses",
+        "sync" => "Synchronisation",
+        other => other,
+    }
+    .to_owned()
+}
+
+/// Un nombre et son nom, accordé.
+fn plural(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// Une phrase qui commence par une majuscule. Les noms d'erreur du fil — « recherche »,
+/// « envoi » — arrivent en minuscules, et une ligne d'état qui en commence par une se lisait
+/// comme une phrase coupée.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
 /// L'écran d'arrêt : un désaccord de contrat n'est pas rattrapable côté client.
 fn fatal(ui: &mut egui::Ui, message: &str) {
     egui::CentralPanel::default().show(ui, |ui| {
@@ -4070,44 +4651,74 @@ fn elide(text: &str, max: usize) -> String {
         .collect()
 }
 
-/// Une date courte pour une ligne de liste.
-fn short_date(unix: i64) -> String {
-    // Pas de dépendance de calendrier : `time` ou `chrono` pour afficher une date de liste
-    // serait un arbre de dépendances de plus sur le chemin du démarrage. Le calcul civil
-    // grégorien tient en vingt lignes et ne dépend de rien.
-    let (year, month, day, _, _) = civil(unix);
-    // L'année courante est calculée **une fois par processus**, pas une fois par ligne. La
-    // première version relisait l'horloge du système pour chacune des quarante lignes visibles,
-    // à chaque image — deux mille quatre cents appels par seconde pour un nombre qui change une
-    // fois l'an.
-    let now = *CURRENT_YEAR.get_or_init(|| {
-        civil(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |it| i64::try_from(it.as_secs()).unwrap_or(0)),
-        )
-    });
+/// Les jours de la semaine, abrégés, dimanche en tête — l'ordre de [`weekday`].
+const JOURS: [&str; 7] = ["dim.", "lun.", "mar.", "mer.", "jeu.", "ven.", "sam."];
+
+/// Les mois, abrégés pour l'en-tête d'un message.
+const MOIS_COURTS: [&str; 12] = [
+    "janv.", "févr.", "mars", "avr.", "mai", "juin", "juil.", "août", "sept.", "oct.", "nov.",
+    "déc.",
+];
+
+/// Le jour de la semaine d'un nombre de jours depuis l'époque : 0 pour dimanche. Le
+/// 1er janvier 1970 était un jeudi.
+fn weekday(days: i64) -> usize {
+    usize::try_from((days + 4).rem_euclid(7)).unwrap_or(0)
+}
+
+/// La date d'une ligne de liste, en heure locale.
+fn list_date(unix: i64) -> String {
+    list_date_at(unix, crate::clock::now(), crate::clock::offset)
+}
+
+/// [`list_date`], avec l'instant présent et le fuseau donnés — pour les tests, qui ne peuvent
+/// dépendre ni de l'heure qu'il est ni du fuseau de la machine qui les lance.
+///
+/// Du plus proche au plus loin : l'heure pour aujourd'hui, « hier », le jour de la semaine pour
+/// les six jours d'avant, puis la date — sans l'année quand c'est celle en cours. Une liste se
+/// lit par proximité : « 09:42 » dit plus vite que « 09/10 » qu'un message vient d'arriver.
+fn list_date_at(unix: i64, now: i64, offset: impl Fn(i64) -> i64) -> String {
     if unix <= 0 {
         // 102 messages du corpus réel n'ont pas de date exploitable dans leur en-tête. Un
         // tiret est plus honnête qu'une date inventée à partir de zéro.
         return "—".to_owned();
     }
-    if year == now.0 {
-        format!("{day:02}/{month:02}")
-    } else {
-        format!("{day:02}/{month:02}/{:02}", year % 100)
+    let local = unix + offset(unix);
+    let here = now + offset(now);
+    let day = local.div_euclid(86_400);
+    let today = here.div_euclid(86_400);
+    let (year, month, date, hour, minute) = civil(local);
+    match today - day {
+        0 => format!("{hour:02}:{minute:02}"),
+        1 => "hier".to_owned(),
+        // Six jours et pas sept : « lun. » le lundi suivant désignerait deux jours à la fois.
+        2..=6 => JOURS[weekday(day)].to_owned(),
+        _ if year == civil(here).0 => format!("{date:02}/{month:02}"),
+        _ => format!("{date:02}/{month:02}/{:02}", year.rem_euclid(100)),
     }
 }
 
-/// Une date complète pour l'en-tête d'un message.
+/// Une date complète pour l'en-tête d'un message, en heure locale : « mer. 8 oct. 2026, 09:42 ».
 fn long_date(unix: i64) -> String {
+    long_date_at(unix, crate::clock::offset(unix))
+}
+
+/// [`long_date`], avec le décalage donné.
+fn long_date_at(unix: i64, offset: i64) -> String {
     if unix <= 0 {
         return "date inconnue".to_owned();
     }
-    let (year, month, day, hour, minute) = civil(unix);
-    format!("{day:02}/{month:02}/{year} {hour:02}:{minute:02}")
+    let local = unix + offset;
+    let (year, month, day, hour, minute) = civil(local);
+    let mois = MOIS_COURTS
+        .get(usize::try_from(month.saturating_sub(1)).unwrap_or(0))
+        .copied()
+        .unwrap_or("");
+    format!(
+        "{} {day} {mois} {year}, {hour:02}:{minute:02}",
+        JOURS[weekday(local.div_euclid(86_400))]
+    )
 }
-
 /// L'expéditeur d'un message, tel qu'une ligne d'attribution le nomme.
 ///
 /// Le nom **et** l'adresse quand les deux existent : le nom seul ne dit pas qui c'était
@@ -4187,6 +4798,13 @@ fn quote_body(body: &str) -> String {
 /// En français et écrite à la main, comme le reste des dates de la coquille : aucune
 /// dépendance de calendrier, et [`civil`] fait déjà le calcul grégorien.
 fn full_date(unix: i64) -> String {
+    full_date_at(unix, crate::clock::offset(unix))
+}
+
+/// [`full_date`], avec le décalage donné. **En heure locale** : la ligne d'attribution part
+/// chez le destinataire, et « à 12:00 » pour un message reçu à 14:00 heure de Paris l'aurait
+/// trompé autant que l'utilisateur.
+fn full_date_at(unix: i64, offset: i64) -> String {
     const MOIS: [&str; 12] = [
         "janvier",
         "février",
@@ -4206,7 +4824,7 @@ fn full_date(unix: i64) -> String {
         // qu'une date inventée à partir de zéro.
         return "—".to_owned();
     }
-    let (year, month, day, hour, minute) = civil(unix);
+    let (year, month, day, hour, minute) = civil(unix + offset);
     let mois = MOIS
         .get(usize::try_from(month.saturating_sub(1)).unwrap_or(0))
         .copied()
@@ -4214,11 +4832,12 @@ fn full_date(unix: i64) -> String {
     format!("{day} {mois} {year} à {hour:02}:{minute:02}")
 }
 
-/// Convertit des secondes Unix en date civile UTC.
+/// Convertit des secondes Unix en date civile, **sans fuseau** : l'appelant ajoute le décalage
+/// local avant — voir [`crate::clock`].
 ///
-/// Algorithme de Howard Hinnant, `days_from_civil` inversé. UTC et non l'heure locale : lire le
-/// fuseau du système demande une bibliothèque, et une date de liste à une heure près suffit à
-/// se repérer. À corriger le jour où l'affichage de l'heure exacte comptera.
+/// Algorithme de Howard Hinnant, `days_from_civil` inversé. Le calcul reste écrit ici plutôt que
+/// demandé à `jiff` : il est vérifié sur des instants connus, et le fuseau était la seule chose
+/// qu'on ne pouvait pas faire à la main.
 fn civil(unix: i64) -> (i64, u32, u32, u32, u32) {
     let days = unix.div_euclid(86_400);
     let seconds = unix.rem_euclid(86_400);
@@ -4439,10 +5058,15 @@ mod tests {
     fn a_date_without_a_value_is_a_dash_and_not_the_epoch() {
         // 102 messages du corpus n'ont pas de date exploitable. « 1 janvier 1970 » serait une
         // date inventée.
-        assert_eq!(full_date(0), "—");
-        assert_eq!(full_date(-1), "—");
+        assert_eq!(full_date_at(0, 0), "—");
+        assert_eq!(full_date_at(-1, 0), "—");
         // 2026-09-10T12:00:00Z, soit 20 706 jours depuis l'époque plus douze heures.
-        assert_eq!(full_date(1_789_041_600), "10 septembre 2026 à 12:00");
+        assert_eq!(full_date_at(1_789_041_600, 0), "10 septembre 2026 à 12:00");
+        // Le décalage d'été de Paris : la même date, deux heures plus tard.
+        assert_eq!(
+            full_date_at(1_789_041_600, 7_200),
+            "10 septembre 2026 à 14:00"
+        );
     }
 
     #[test]
@@ -4461,8 +5085,47 @@ mod tests {
 
     #[test]
     fn a_missing_date_is_a_dash() {
-        assert_eq!(short_date(0), "—");
-        assert_eq!(long_date(0), "date inconnue");
+        assert_eq!(list_date_at(0, 1_789_041_600, |_| 0), "—");
+        assert_eq!(long_date_at(0, 0), "date inconnue");
+    }
+
+    /// Jeudi 10 septembre 2026, 12:00 UTC : l'instant « présent » des tests de date.
+    const NOW: i64 = 1_789_041_600;
+
+    #[test]
+    fn a_list_date_reads_by_proximity() {
+        let utc = |_: i64| 0;
+        // Le jour même : l'heure.
+        assert_eq!(list_date_at(NOW - 8_280, NOW, utc), "09:42");
+        assert_eq!(list_date_at(NOW - 86_400, NOW, utc), "hier");
+        // Trois jours avant un jeudi : lundi.
+        assert_eq!(list_date_at(NOW - 3 * 86_400, NOW, utc), "lun.");
+        // Sept jours : plus le jour de la semaine, qui désignerait aussi aujourd'hui.
+        assert_eq!(list_date_at(NOW - 7 * 86_400, NOW, utc), "03/09");
+        // Une autre année porte la sienne.
+        assert_eq!(list_date_at(NOW - 400 * 86_400, NOW, utc), "06/08/25");
+    }
+
+    #[test]
+    fn the_local_offset_moves_a_message_across_midnight() {
+        // 23:30 UTC la veille. Sans décalage, c'est hier ; à Paris en été, c'est 01:30 le jour
+        // même — le cas exact que l'affichage en UTC faisait mentir.
+        let late = NOW - 45_000;
+        assert_eq!(list_date_at(late, NOW, |_| 0), "hier");
+        assert_eq!(list_date_at(late, NOW, |_| 7_200), "01:30");
+        assert_eq!(long_date_at(NOW, 7_200), "jeu. 10 sept. 2026, 14:00");
+        assert_eq!(long_date_at(NOW, 0), "jeu. 10 sept. 2026, 12:00");
+    }
+
+    #[test]
+    fn the_system_zone_gives_a_plausible_offset() {
+        // Pas de valeur attendue — elle dépend de la machine —, mais une borne : aucun fuseau
+        // terrestre ne s'écarte de plus de quatorze heures, et un décalage aberrant viendrait
+        // d'une confusion d'unités.
+        let offset = crate::clock::offset(NOW);
+        assert!(offset.abs() <= 14 * 3_600, "{offset}");
+        // Et un instant hors de ce que la base représente ne panique pas.
+        assert_eq!(crate::clock::offset(i64::MAX), 0);
     }
 
     #[test]
@@ -4479,6 +5142,40 @@ mod tests {
 /// ce qui **n'est pas fini**. Sans cette borne, la seule ligne qui demande une décision se
 /// retrouvait noyée dans un mur de « envoyé » après un mois d'usage.
 const OUTBOX_HISTORY: usize = 5;
+
+/// La colonne de gauche : sa largeur au premier lancement, et ce qu'on peut en faire. Assez
+/// large au départ pour « Boîte de réception » et un compteur à quatre chiffres ; jamais moins
+/// qu'un nom de dossier court, jamais plus qu'un tiers d'écran ordinaire.
+const SIDE_DEFAULT: f32 = 240.0;
+const SIDE_MIN: f32 = 160.0;
+const SIDE_MAX: f32 = 480.0;
+
+/// Le lecteur : au moins de quoi lire une ligne de texte, au plus de quoi ne pas écraser la
+/// liste. Sa largeur de départ suit la fenêtre — 45 % —, bornée par ces deux valeurs.
+const READER_MIN: f32 = 320.0;
+const READER_DEFAULT: f32 = 900.0;
+const READER_MAX: f32 = 1_400.0;
+
+/// Le champ de recherche. 420 points : la requête d'exemple du texte d'aide y tient entière.
+const SEARCH_WIDTH: f32 = 420.0;
+
+/// La barre de progression de la ligne d'état : un repère, pas une mesure.
+const STATUS_PROGRESS: f32 = 120.0;
+
+/// La hauteur de l'en-tête d'une vue centrale.
+const VIEW_HEADER: f32 = 28.0;
+
+/// L'espace au-dessus d'un état vide : assez pour qu'il ne se lise pas comme un en-tête.
+const EMPTY_TOP: f32 = 48.0;
+
+/// Les colonnes d'une ligne de liste. La date tient « 09/10/25 » ; l'expéditeur, vingt-huit
+/// caractères — la coupe d'avant, gardée pour que la liste ne change pas de densité.
+const ROW_PAD: f32 = 8.0;
+const COLUMN_GAP: f32 = 8.0;
+const UNREAD_DOT: f32 = 6.0;
+const DATE_COLUMN: f32 = 56.0;
+const SENDER_COLUMN: f32 = 180.0;
+const MARK_GAP: f32 = 6.0;
 
 /// Largeur minimale de la fenêtre de rédaction.
 ///
@@ -4508,12 +5205,6 @@ const COMPOSE_MIN_BODY: f32 = 96.0;
 /// participants pour 930 pièces, et certaines invitations d'entreprise en ont des dizaines —
 /// les dérouler toutes pousserait le corps du message hors de l'écran.
 const ATTENDEES_SHOWN: usize = 12;
-
-/// Ce que le panneau des brouillons occupe au plus.
-///
-/// Un plafond : la liste défile au-delà, plutôt que de repousser la liste des messages hors de
-/// l'écran.
-const DRAFTS_PANE: f32 = 160.0;
 
 /// La ligne « Signature : … [Modifier] », toujours présente.
 const SIGNATURE_LINE: f32 = 24.0;

@@ -259,7 +259,7 @@ impl Page {
         if self.remote {
             // Un refus qui dit pourquoi, comme celui de `Link::stage`.
             ui.colored_label(
-                crate::theme::accent(ui.ctx()),
+                crate::theme::warn(ui.ctx()),
                 "Ce service est distant. Les comptes se déclarent sur la machine du démon : \
                  c'est son trousseau qui porte le secret, et un secret ne traverse pas le \
                  réseau pour aller s'y ranger.",
@@ -269,7 +269,7 @@ impl Page {
 
         if let Some(message) = &self.message {
             let color = if self.failed {
-                crate::theme::accent(ui.ctx())
+                crate::theme::error(ui.ctx())
             } else {
                 ui.visuals().text_color()
             };
@@ -394,7 +394,7 @@ impl Page {
             ui.horizontal_wrapped(|ui| {
                 ui.strong(format!("#{} {}", account.id, account.name));
                 if !account.enabled {
-                    ui.colored_label(crate::theme::accent(ui.ctx()), "en pause");
+                    ui.colored_label(crate::theme::warn(ui.ctx()), "en pause");
                 }
             });
             ui.horizontal_wrapped(|ui| {
@@ -412,7 +412,7 @@ impl Page {
                 if account.secret {
                     ui.weak("secret dans le trousseau");
                 } else {
-                    ui.colored_label(crate::theme::accent(ui.ctx()), "aucun secret enregistré");
+                    ui.colored_label(crate::theme::warn(ui.ctx()), "aucun secret enregistré");
                 }
                 // **Le geste que la phrase appelle, à portée de clic.** Un compte OAuth2 sans
                 // jeton — ou dont le jeton a été révoqué — n'a qu'une issue, et la nommer sans
@@ -466,7 +466,7 @@ impl Page {
                     })
                     .on_hover_text(
                         "Découvre les dossiers et moissonne. La progression s'affiche dans \
-                         « Importer… ».",
+                         « Activité ».",
                     )
                     .clicked()
                 {
@@ -484,7 +484,7 @@ impl Page {
                     });
                 }
                 if self.forgetting == Some(account.id) {
-                    ui.colored_label(crate::theme::accent(ui.ctx()), "Oublier le secret ?");
+                    ui.colored_label(crate::theme::warn(ui.ctx()), "Oublier le secret ?");
                     if ui
                         .button("Oui, oublier")
                         .on_hover_text(

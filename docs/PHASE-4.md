@@ -2677,3 +2677,49 @@ plus.
 
 - les critères 2, 4 et 7, machine au repos ;
 - la passe explicite en enfants successifs, si une passe complète repasse près du seuil.
+
+### 2026-10-09 (suite) — la coquille refaite
+
+**En clair d'abord.** Hors critère de la phase : l'interface a été reprise d'après une maquette
+validée la veille. La file d'envoi, les brouillons et l'activité deviennent des entrées de la
+colonne de gauche au lieu de panneaux qui s'empilaient ; une ligne d'état fixe en bas dit ce qui
+vient de se passer, dans une couleur qui dit si c'est fait, raté ou à faire ; les dates sont à
+l'heure **locale**. Elle est vérifiée sur un store jetable de huit messages fictifs — jamais sur un
+store qui porte un compte capable d'envoyer.
+
+Ce qui a changé, et pourquoi :
+
+- **quatre couleurs, un sens chacune** — l'accent pour la sélection, le non-lu et l'action
+  principale ; le rouge pour ce qui a échoué ; l'ambre pour ce qui attend un geste ; le vert pour ce
+  qui est fait. L'accent servait aussi d'avertissement : un message refusé et un dossier
+  sélectionné avaient la même couleur ;
+- **les vues remplacent les panneaux.** Trois panneaux optionnels se partageaient la hauteur de la
+  liste, et en ouvrir un faisait sauter les lignes sous la souris. Le lecteur n'apparaît qu'à côté
+  d'une liste ;
+- **les dates à l'heure locale**, par `jiff`, déjà au graphe par `serde_with`. Elles étaient en UTC
+  depuis la phase 1 : « 09:42 » se lisait 11:42 en France. Le décalage dépend des règles d'été
+  **de l'année du message**, donc d'une base de fuseaux ; un décalage fixe lu au démarrage se
+  serait trompé d'une heure sur la moitié du corpus. La liste dit « 09:42 », « hier », « lun. »,
+  « 14/09 » ou « 03/12/25 » ;
+- **des écrans vides partout** — recherche sans résultat, dossier vide, aucun message ouvert, file
+  vide, aucun brouillon : un volet blanc ne dit pas s'il est vide ou en train de charger ;
+- **R, A, F, C et Ctrl+Entrée.** Ils ont fait trouver un défaut ancien : « Écrire », « Répondre » et
+  « Transférer » **remplaçaient** la fenêtre de rédaction ouverte sans rien garder. Un clic de trop
+  perdait un message à moitié écrit ; une touche l'aurait rendu banal. Le message en cours passe
+  maintenant aux brouillons avant d'être remplacé, à un seul endroit (`park_compose`) ;
+- **un échec de transport ne va plus dans la ligne d'état** : le bandeau hors ligne le dit déjà,
+  et la ligne restait affichée après le retour du service.
+
+Deux défauts trouvés à l'écran et pas en compilant :
+
+- **un volet d'egui 0.36 retient la largeur de son contenu**, pas celle qu'il a reçue — il ne
+  garantit que le minimum de sa plage. Le lecteur tombait à 320 points dès qu'un message ouvert
+  était moins large que lui, et y restait. Chaque volet latéral occupe maintenant sa largeur
+  (`fill_panel`) ;
+- **la date de l'en-tête se dessinait par-dessus l'adresse** d'un expéditeur long : posée après
+  lui dans une ligne qui se replie, elle n'avait pas sa place réservée. Elle est posée d'abord, à
+  droite, et l'expéditeur se tronque dans ce qui reste.
+
+**Pas encore mesuré** : le démarrage sous 225 ms et l'image sous 16,7 ms, les deux seuils de la
+coquille, se refont machine au repos avec les bancs existants. Et l'objet du message manque aux
+lignes de la file d'envoi : `dto::Outgoing` ne le porte pas.

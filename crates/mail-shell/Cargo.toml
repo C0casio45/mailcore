@@ -33,6 +33,7 @@ mailsmtp.workspace = true
 anyhow.workspace             = true
 camino.workspace             = true
 directories.workspace        = true
+jiff.workspace               = true
 serde_json.workspace         = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true

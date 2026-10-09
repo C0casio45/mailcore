@@ -154,9 +154,32 @@ pub fn spawn_fallback(ctx: &egui::Context) {
     }
 }
 
-/// L'accent, en clair puis en sombre. Un seul, pour la sélection et le non-lu.
+/// L'accent, en clair puis en sombre. Un seul, pour la sélection, le non-lu, le focus et le
+/// bouton de l'action principale d'un écran — et **rien d'autre**.
+///
+/// ## Quatre couleurs, un sens chacune
+///
+/// L'inventaire du 2026-10-09, avant la refonte, a trouvé l'accent employé pour cinq choses —
+/// sélection, non-lu, traceurs neutralisés, refus des paramètres, compte en pause — et la
+/// bannière d'état peinte en rouge d'erreur même pour « Signature enregistrée. ». Une couleur
+/// qui veut tout dire ne dit plus rien, et un succès en rouge apprend à ne plus lire le rouge
+/// le jour où il compte. D'où une couleur par sens : l'accent pour ce qu'on regarde, le rouge
+/// pour ce qui a échoué ([`error`]), l'ambre pour ce qui demande un geste ([`warn`]), le vert
+/// pour ce qui est fait ([`ok`]). Le reste est en gris.
 const ACCENT_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x1B, 0x5E, 0xB8);
 const ACCENT_DARK: egui::Color32 = egui::Color32::from_rgb(0x69, 0xA8, 0xFF);
+
+/// Ce qui a échoué.
+const ERROR_LIGHT: egui::Color32 = egui::Color32::from_rgb(0xB3, 0x26, 0x1E);
+const ERROR_DARK: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x8A, 0x80);
+
+/// Ce qui demande un geste : un doute à trancher, un modèle à installer, un service injoignable.
+const WARN_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x8A, 0x5A, 0x00);
+const WARN_DARK: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xB0, 0x4C);
+
+/// Ce qui est fait.
+const OK_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x6B, 0x3A);
+const OK_DARK: egui::Color32 = egui::Color32::from_rgb(0x81, 0xC9, 0x95);
 
 /// La densité et les couleurs, pour les deux thèmes.
 fn dense(ctx: &egui::Context) {
@@ -170,27 +193,92 @@ fn dense(ctx: &egui::Context) {
             style.spacing.scroll.bar_width = 10.0;
             style.spacing.interact_size.y = ROW_HEIGHT;
 
-            // Pas de coin arrondi décoratif, pas d'ombre portée : bordures 1 px entre
-            // panneaux, et rien d'autre.
-            let accent = if theme == egui::Theme::Dark {
-                ACCENT_DARK
-            } else {
-                ACCENT_LIGHT
-            };
+            let dark = theme == egui::Theme::Dark;
+            let accent = if dark { ACCENT_DARK } else { ACCENT_LIGHT };
             style.visuals.selection.bg_fill = accent.gamma_multiply(0.35);
             style.visuals.selection.stroke = egui::Stroke::new(1.0, accent);
             style.visuals.hyperlink_color = accent;
+            // Les couleurs d'egui pour l'erreur et l'avertissement sont **les nôtres** : une
+            // partie du code les lit par `visuals()`, et deux rouges voisins à l'écran — celui
+            // d'egui, celui du thème — seraient lus comme deux sens différents.
+            style.visuals.error_fg_color = if dark { ERROR_DARK } else { ERROR_LIGHT };
+            style.visuals.warn_fg_color = if dark { WARN_DARK } else { WARN_LIGHT };
+
+            // Pas de coin arrondi décoratif, pas d'ombre portée : bordures 1 px entre
+            // panneaux, et rien d'autre. **Les coins n'avaient jamais été mis à zéro** — seules
+            // les ombres l'étaient —, donc chaque bouton et chaque fenêtre gardait l'arrondi
+            // d'egui, contre ce que l'en-tête de ce module affirmait depuis la phase 1.
             style.visuals.window_shadow = egui::epaint::Shadow::NONE;
             style.visuals.popup_shadow = egui::epaint::Shadow::NONE;
+            style.visuals.window_corner_radius = egui::CornerRadius::ZERO;
+            style.visuals.menu_corner_radius = egui::CornerRadius::ZERO;
+            for widget in [
+                &mut style.visuals.widgets.noninteractive,
+                &mut style.visuals.widgets.inactive,
+                &mut style.visuals.widgets.hovered,
+                &mut style.visuals.widgets.active,
+                &mut style.visuals.widgets.open,
+            ] {
+                widget.corner_radius = egui::CornerRadius::ZERO;
+            }
         });
     }
 }
 
-/// La couleur d'accent du thème courant.
-pub fn accent(ctx: &egui::Context) -> egui::Color32 {
+/// Une couleur du thème courant, choisie entre sa variante claire et sa variante sombre.
+fn pick(ctx: &egui::Context, light: egui::Color32, dark: egui::Color32) -> egui::Color32 {
     if ctx.theme() == egui::Theme::Dark {
-        ACCENT_DARK
+        dark
     } else {
-        ACCENT_LIGHT
+        light
+    }
+}
+
+/// La couleur d'accent du thème courant : sélection, non-lu, focus, action principale.
+pub fn accent(ctx: &egui::Context) -> egui::Color32 {
+    pick(ctx, ACCENT_LIGHT, ACCENT_DARK)
+}
+
+/// Ce qui a échoué.
+pub fn error(ctx: &egui::Context) -> egui::Color32 {
+    pick(ctx, ERROR_LIGHT, ERROR_DARK)
+}
+
+/// Ce qui demande un geste.
+pub fn warn(ctx: &egui::Context) -> egui::Color32 {
+    pick(ctx, WARN_LIGHT, WARN_DARK)
+}
+
+/// Ce qui est fait.
+pub fn ok(ctx: &egui::Context) -> egui::Color32 {
+    pick(ctx, OK_LIGHT, OK_DARK)
+}
+
+/// Ce qu'une ligne d'état veut dire, et donc sa couleur.
+///
+/// Un `enum` plutôt qu'une couleur passée par l'appelant : la question à se poser en écrivant
+/// une phrase est « qu'est-ce que c'est ? », pas « de quelle couleur ? ». Celle qui posait la
+/// seconde a peint un succès en rouge pendant un mois.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// C'est fait.
+    Done,
+    /// Ça a échoué.
+    Failed,
+    /// Ça demande un geste.
+    Attention,
+    /// Pour information : ni réussite ni échec.
+    Info,
+}
+
+impl Tone {
+    /// La couleur de ce sens, dans le thème courant.
+    pub fn color(self, ctx: &egui::Context) -> egui::Color32 {
+        match self {
+            Self::Done => ok(ctx),
+            Self::Failed => error(ctx),
+            Self::Attention => warn(ctx),
+            Self::Info => ctx.global_style().visuals.weak_text_color(),
+        }
     }
 }
