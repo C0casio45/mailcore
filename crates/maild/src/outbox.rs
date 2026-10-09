@@ -173,7 +173,9 @@ fn round(store: &Store, stop: &AtomicBool) -> usize {
     if pending.is_empty() {
         return 0;
     }
-    let accounts = match store.full_accounts() {
+    // Un compte incohérent est écarté, pas les autres : ses messages attendent, ceux des autres
+    // partent. Voir `Store::usable_accounts`.
+    let accounts = match store.usable_accounts() {
         Ok(accounts) => accounts,
         Err(source) => {
             tracing::warn!(%source, "comptes illisibles : rien ne peut partir");

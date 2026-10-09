@@ -535,7 +535,7 @@ impl Api {
     /// Ne rend ni hôte, ni port, ni mécanisme, ni secret : voir `mailapi::dto::Account`.
     async fn accounts_list(&self) -> Result<Value, Error> {
         self.read(|mailbox| {
-            let accounts = mailbox.store().full_accounts().map_err(|source| {
+            let accounts = mailbox.store().usable_accounts().map_err(|source| {
                 tracing::warn!(%source, "comptes illisibles");
                 Error::new(jsonrpc::INTERNAL_ERROR, "les comptes ne sont pas lisibles")
             })?;
@@ -871,7 +871,7 @@ impl Api {
 
         let queued = self
             .read(move |mailbox| {
-                let accounts = mailbox.store().full_accounts().map_err(|source| {
+                let accounts = mailbox.store().usable_accounts().map_err(|source| {
                     tracing::warn!(%source, "comptes illisibles");
                     Error::new(jsonrpc::INTERNAL_ERROR, "les comptes ne sont pas lisibles")
                 })?;

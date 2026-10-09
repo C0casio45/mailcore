@@ -816,6 +816,43 @@ impl Store {
     /// [`crate::Error::Sqlite`], [`crate::Error::UnknownAuth`],
     /// [`crate::Error::UnknownSecurity`], [`crate::Error::InconsistentAccount`].
     pub fn full_accounts(&self) -> Result<Vec<crate::model::Account>> {
+        self.each_account()?.into_iter().collect()
+    }
+
+    /// Les comptes qui se lisent, chaque refus dit au journal avec son compte.
+    ///
+    /// [`Self::full_accounts`] refuse tout dès qu'un compte est incohérent, et c'est juste pour
+    /// qui veut **tous** les comptes — `mail account list` doit dire que la base est abîmée. Une
+    /// tâche qui sert chaque compte pour lui-même — la veille `IDLE`, le facteur — ne doit pas
+    /// s'éteindre pour tous à cause d'un seul : elle prend ceux qui se lisent et dit les autres.
+    /// Trouvé le 2026-10-09 sur le corpus de mesure, qui porte un compte `imap` sans hôte.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`] si la table ne se lit pas ; un compte refusé est seulement
+    /// écarté.
+    pub fn usable_accounts(&self) -> Result<Vec<crate::model::Account>> {
+        Ok(self
+            .each_account()?
+            .into_iter()
+            .filter_map(|it| match it {
+                Ok(account) => Some(account),
+                Err(source) => {
+                    tracing::warn!(%source, "compte écarté : incohérent en base");
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Chaque compte, **ou la raison pour laquelle il est refusé** : un résultat par compte.
+    ///
+    /// La forme brute de [`Self::usable_accounts`], pour qui doit montrer les refus.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`] si la table ne se lit pas.
+    pub fn each_account(&self) -> Result<Vec<Result<crate::model::Account>>> {
         use crate::model::{Account, AccountId, AccountKind, AuthKind, Security, Server};
 
         let mut statement = self.connection().prepare_cached(
@@ -868,8 +905,8 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for raw in rows {
+        /// Un compte depuis ses colonnes brutes, ou la raison de le refuser.
+        fn account_from(raw: Raw) -> Result<Account> {
             let id = raw.id;
             let kind = AccountKind::from_str_lossy(&raw.kind);
             let missing = |what: &str| crate::Error::InconsistentAccount {
@@ -957,16 +994,17 @@ impl Store {
                 }
             };
 
-            out.push(Account {
+            Ok(Account {
                 id: AccountId(id),
                 kind,
                 display_name: raw.display_name,
                 server,
                 submission,
                 enabled: raw.enabled,
-            });
+            })
         }
-        Ok(out)
+
+        Ok(rows.into_iter().map(account_from).collect())
     }
 
     /// L'état de synchronisation d'un dossier.

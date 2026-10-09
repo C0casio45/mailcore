@@ -218,7 +218,7 @@ impl Drop for Watchers {
 fn watchable(store: &Utf8Path) -> anyhow::Result<Vec<Account>> {
     let store = Store::open(store)?;
     Ok(store
-        .full_accounts()?
+        .usable_accounts()?
         .into_iter()
         .filter(|it| it.kind == AccountKind::Imap && it.enabled && it.server.is_some())
         .collect())

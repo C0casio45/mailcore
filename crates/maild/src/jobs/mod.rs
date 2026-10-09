@@ -810,7 +810,9 @@ fn prune(registry: &mut Vec<Entry>) {
 /// journal d'un client. Le nom d'hôte et l'identifiant restent donc côté démon
 /// (`docs/PRIVACY.md` §8), et le client reçoit de quoi agir sans recevoir de quoi profiler.
 fn sync(store: &Store, only: Option<i64>, progress: &Progress) -> Result<String, String> {
-    let accounts = store.full_accounts().map_err(|source| {
+    // Même règle que pour un compte qui ne répond pas, un cran plus tôt : un compte incohérent
+    // en base est écarté, les autres se synchronisent. Voir `Store::usable_accounts`.
+    let accounts = store.usable_accounts().map_err(|source| {
         tracing::error!(%source, "lecture des comptes");
         "les comptes sont illisibles : voir le journal du démon".to_owned()
     })?;

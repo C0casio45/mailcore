@@ -753,11 +753,11 @@ fn harvest(parsed: &mail_parser::Message<'_>, batch: &mut Vec<Seen>, date: i64, 
 ///
 /// ## Un compte incohérent ne fait pas échouer le carnet
 ///
-/// `full_accounts` refuse un compte imap sans serveur, et cette lecture-là ne doit pas empêcher
-/// de reconstruire un carnet : elle retombe alors sur la liste des comptes sans leurs serveurs.
-/// Le carnet est moins bon — `seen_to` sera vide pour le compte fautif — et il existe.
+/// `full_accounts` refuse tous les comptes dès qu'un est incohérent ; le carnet prend ceux qui se
+/// lisent (`usable_accounts`). Il est moins bon pour le compte fautif — son adresse n'est pas
+/// reconnue comme « soi » — et juste pour les autres.
 fn own_addresses(store: &Store) -> Result<std::collections::HashSet<String>> {
-    match store.full_accounts() {
+    match store.usable_accounts() {
         Ok(accounts) => Ok(accounts
             .iter()
             .filter_map(|it| it.server.as_ref())

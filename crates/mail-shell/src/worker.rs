@@ -916,7 +916,7 @@ impl Link {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let accounts = guard
             .store()
-            .full_accounts()
+            .usable_accounts()
             .map_err(|source| format!("comptes illisibles : {source}"))?;
         let account = accounts
             .iter()
@@ -964,7 +964,7 @@ impl Link {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let accounts = guard
             .store()
-            .full_accounts()
+            .usable_accounts()
             .map_err(|source| format!("comptes illisibles : {source}"))?;
         let account = accounts
             .iter()

@@ -1087,6 +1087,37 @@ mod tests {
     }
 
     #[test]
+    fn one_inconsistent_account_does_not_silence_the_others() {
+        // Le refus porte sur **le** compte : la veille `IDLE`, le facteur et la synchronisation
+        // passent par `usable_accounts`, et un compte cassé les éteignait tous.
+        let (_dir, store) = store();
+        let writer = store.writer().unwrap();
+        writer.upsert_imap_account("sain", &server()).unwrap();
+        writer.commit().unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO accounts (id, kind, display_name) VALUES (7, 'imap', 'cassé')",
+                [],
+            )
+            .unwrap();
+
+        // Le chemin strict refuse toujours tout : c'est lui qui dit que la base est abîmée.
+        assert!(store.full_accounts().is_err());
+
+        let usable = store.usable_accounts().unwrap();
+        assert_eq!(usable.len(), 1);
+        assert_eq!(usable[0].display_name, "sain");
+
+        let each = store.each_account().unwrap();
+        assert_eq!(each.len(), 2);
+        assert!(each.iter().any(|it| matches!(
+            it,
+            Err(crate::Error::InconsistentAccount { account: 7, .. })
+        )));
+    }
+
+    #[test]
     fn an_unknown_auth_mechanism_is_refused() {
         // Se tromper de mécanisme, c'est envoyer un secret dans un champ qui ne l'attend pas.
         let (_dir, store) = store();
