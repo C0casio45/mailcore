@@ -78,6 +78,12 @@ struct Run {
     rows: Option<u32>,
     /// Fenêtre et contexte graphique prêts, en ms depuis l'entrée du `main` — sonde native.
     context_ms: Option<f64>,
+    /// Le store ouvert, en ms depuis l'entrée du `main` — coquille native en mode embarqué.
+    ///
+    /// Il précède la fenêtre : sans lui, « fenêtre et contexte » mêlait le travail de `mailcore`
+    /// à celui du système et de la carte graphique, et une régression de l'un se lisait comme
+    /// une régression de l'autre.
+    store_ms: Option<f64>,
     /// Le relevé de défilement, si le banc en a produit un.
     frames: Option<String>,
     /// Vrai si la coquille a relu un cache de lecture au démarrage — mode distant.
@@ -1094,6 +1100,7 @@ fn once(
         process_ms: None,
         rows: None,
         context_ms: None,
+        store_ms: None,
         frames: None,
         from_cache: false,
     };
@@ -1142,6 +1149,8 @@ fn once(
             // Le jalon propre à la sonde native : fenêtre et contexte graphique prêts, avant
             // la première image. L'équivalent de « fenêtre montée » côté Tauri.
             run.context_ms = field(&line, "ms").and_then(|it| it.parse().ok());
+        } else if line.contains("etape=store") {
+            run.store_ms = field(&line, "ms").and_then(|it| it.parse().ok());
         } else if line.contains("critere=2") || line.contains("critere=5") {
             // Rapportée telle quelle : la page a déjà fait le calcul, et le refaire ici
             // n'ajouterait qu'une occasion de le déformer.
@@ -1218,6 +1227,20 @@ fn report(runs: &[Run]) {
         // image — et c'est ce rapport-là qui dit si le budget est mangé par le toolkit ou par
         // notre mise en page.
         println!("  Fenêtre et contexte      {context:.1} ms");
+    }
+    // **Les jalons à chaud, en médiane.** Ceux de la ligne du dessus sont ceux de la première
+    // exécution, la froide : ils disent ce que coûte un cache vide, pas où passent les deux
+    // cents millisecondes d'un démarrage ordinaire.
+    let warm_median = |pick: fn(&Run) -> Option<f64>| {
+        let mut values: Vec<f64> = runs.iter().skip(1).filter_map(pick).collect();
+        values.sort_unstable_by(f64::total_cmp);
+        values.get(values.len() / 2).copied()
+    };
+    if let Some(store) = warm_median(|it| it.store_ms) {
+        println!("  Store ouvert, à chaud    {store:.1} ms (médiane)");
+    }
+    if let Some(context) = warm_median(|it| it.context_ms) {
+        println!("  Fenêtre prête, à chaud   {context:.1} ms (médiane, store compris)");
     }
     if let (Some(process), Some(page)) = (first.process_ms, first.page_ms) {
         // La part du processus contient celle de la page : le webview est créé par la

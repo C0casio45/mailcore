@@ -108,15 +108,14 @@ impl Service {
     ) -> Result<Self> {
         let mailbox =
             Mailbox::open(store).with_context(|| format!("ouverture du store {store}"))?;
-        let stats = mailbox.stats().context("lecture du store")?;
         let search = mailbox.search_available();
 
-        tracing::info!(
-            store = %store,
-            messages = stats.messages,
-            recherche = search,
-            "boîte ouverte"
-        );
+        // **Pas de compte de messages ici.** Il y en avait un, pour cette seule ligne de journal :
+        // 20 ms sur 73 658 messages, payées **avant la fenêtre** de la coquille embarquée, donc
+        // sur le seuil de démarrage de 225 ms — mesuré le 2026-10-09, il faisait passer la
+        // coquille de 220 à 240 ms. `server.hello` rend le même compte, sur le fil du service,
+        // une fois la fenêtre ouverte.
+        tracing::info!(store = %store, recherche = search, "boîte ouverte");
         if !search {
             tracing::warn!("index plein texte absent : la recherche rendra une liste vide");
         }
