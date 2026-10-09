@@ -2569,10 +2569,13 @@ impl Shell {
                     }
                 };
                 ui.label(egui::RichText::new(state).color(color).strong().size(11.0));
-                ui.label(format!("→ {}", line.recipients.join(", ")));
+                // L'objet d'abord : c'est par lui qu'on reconnaît un message, pas par ses
+                // destinataires — trois envois au même correspondant se lisaient pareil.
+                outgoing_subject(ui, line);
+                ui.weak(format!("→ {}", line.recipients.join(", ")));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if source_button(ui).clicked() {
-                        show_source = Some((line.id, format!("envoi #{}", line.id)));
+                        show_source = Some((line.id, outgoing_title(line)));
                     }
                     ui.weak(list_date(line.queued_at));
                 });
@@ -2661,16 +2664,14 @@ impl Shell {
             for line in done.iter().rev().take(shown) {
                 ui.horizontal_wrapped(|ui| {
                     ui.set_min_height(ROW_HEIGHT);
-                    ui.weak(format!(
-                        "{}  envoyé → {}",
-                        list_date(line.queued_at),
-                        line.recipients.join(", ")
-                    ));
+                    ui.weak(list_date(line.queued_at));
+                    outgoing_subject(ui, line);
+                    ui.weak(format!("→ {}", line.recipients.join(", ")));
                     // Sur une ligne **envoyée** surtout : c'est après coup qu'on veut savoir ce
                     // qui est parti, et le message ne reviendra du dossier « Envoyés » qu'à la
                     // prochaine moisson.
                     if source_button(ui).clicked() {
-                        show_source = Some((line.id, format!("envoi #{}", line.id)));
+                        show_source = Some((line.id, outgoing_title(line)));
                     }
                 });
             }
@@ -4569,6 +4570,25 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).weak().strong().size(11.0));
 }
 
+/// L'objet d'un envoi dans la file, ou ce qui en tient lieu.
+fn outgoing_subject(ui: &mut egui::Ui, line: &dto::Outgoing) {
+    match line.subject.as_deref() {
+        Some(subject) => {
+            ui.add(egui::Label::new(subject).truncate());
+        }
+        None => {
+            ui.weak("(sans objet)");
+        }
+    }
+}
+
+/// Le titre de la fenêtre de source d'un envoi : son objet, ou son numéro à défaut.
+fn outgoing_title(line: &dto::Outgoing) -> String {
+    line.subject
+        .clone()
+        .unwrap_or_else(|| format!("envoi #{}", line.id))
+}
+
 /// Fait occuper au contenu d'un volet latéral toute la largeur qu'il a reçue.
 ///
 /// **Un volet d'egui 0.36 retient la largeur de son contenu, pas celle qu'on lui a donnée** :
@@ -5142,6 +5162,10 @@ mod tests {
 /// ce qui **n'est pas fini**. Sans cette borne, la seule ligne qui demande une décision se
 /// retrouvait noyée dans un mur de « envoyé » après un mois d'usage.
 const OUTBOX_HISTORY: usize = 5;
+
+// Le service ne lit l'objet que des derniers envois terminés : en montrer davantage afficherait
+// « (sans objet) » sur des messages qui en ont un.
+const _: () = assert!(OUTBOX_HISTORY <= mailapi::dto::OUTGOING_SUBJECTS_SENT);
 
 /// La colonne de gauche : sa largeur au premier lancement, et ce qu'on peut en faire. Assez
 /// large au départ pour « Boîte de réception » et un compteur à quatre chiffres ; jamais moins

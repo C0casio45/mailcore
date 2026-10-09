@@ -2721,5 +2721,17 @@ Deux défauts trouvés à l'écran et pas en compilant :
   droite, et l'expéditeur se tronque dans ce qui reste.
 
 **Pas encore mesuré** : le démarrage sous 225 ms et l'image sous 16,7 ms, les deux seuils de la
-coquille, se refont machine au repos avec les bancs existants. Et l'objet du message manque aux
-lignes de la file d'envoi : `dto::Outgoing` ne le porte pas.
+coquille, se refont machine au repos avec les bancs existants.
+
+**L'objet du message est revenu dans la file d'envoi**, qui ne montrait que les destinataires —
+trois envois au même correspondant se lisaient pareil. Il est **lu dans le blob**, pas rangé dans
+une colonne : la table `outbox` porte la règle du critère 2, et une migration sur elle pour une
+étiquette n'en valait pas la peine. Le blob est en outre ce qui part, donc l'objet affiché est
+celui que le destinataire lira. Seul le bloc d'en-têtes est lu, ligne à ligne et borné.
+
+Et le chiffre a corrigé l'intuition : **0,2 ms par objet**, mesuré sur mille blobs — l'ouverture
+et le démarrage de la décompression, pas la lecture. L'historique des envois ne se purge jamais ;
+tout relire coûterait, à dix envois par jour, 0,7 s de plus par an à **chaque** liste, sur le fil
+sériel du service. L'objet est donc lu pour chaque envoi en cours et pour les vingt derniers
+terminés (`dto::OUTGOING_SUBJECTS_SENT`), et la coquille, qui en montre cinq, le vérifie à la
+compilation. Le test de la borne a son contrôle inverse : sans la borne, il tombe.

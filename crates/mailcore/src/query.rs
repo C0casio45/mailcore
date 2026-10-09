@@ -772,6 +772,63 @@ impl Mailbox {
         self.source_of(row.blob, row.size)
     }
 
+    /// L'objet d'un message de la file d'envoi, lu dans son propre bloc d'en-têtes.
+    ///
+    /// ## Lu dans le blob, pas rangé dans la ligne
+    ///
+    /// La ligne `outbox` ne porte que ce que l'envoi décide — enveloppe, état, tentatives — et la
+    /// règle du critère 2 vit dans ses colonnes. Y ajouter une étiquette demanderait une
+    /// migration sur la table la plus sensible du store, pour un affichage. Le blob, lui, est
+    /// **ce qui part** : l'objet qu'on y lit est celui que le destinataire verra, pas une copie
+    /// qui pourrait en diverger — la règle de [`Self::outgoing_source`].
+    ///
+    /// Seul le bloc d'en-têtes est lu, ligne à ligne et borné à
+    /// [`crate::source::MAX_HEADERS`] : une pièce jointe de 25 Mio derrière ne coûte rien.
+    ///
+    /// Rend `None` si le blob manque ou si le message n'a pas d'objet. Les caractères de contrôle
+    /// sont remplacés par des espaces : la phrase s'affiche dans une liste, et un en-tête hostile
+    /// n'a pas à y dessiner — la leçon de `crate::source`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Io`] si le blob est illisible.
+    pub fn outgoing_subject(&self, blob: crate::BlobHash) -> Result<Option<String>> {
+        use std::io::{BufRead as _, Read as _};
+
+        let reader = match self.store.blobs().open(blob) {
+            Ok(reader) => reader,
+            Err(crate::Error::BlobNotFound(hash)) => {
+                tracing::warn!(%hash, "blob absent");
+                return Ok(None);
+            }
+            Err(other) => return Err(other),
+        };
+        let mut reader = std::io::BufReader::new(reader.take(crate::source::MAX_HEADERS as u64));
+        let mut head = Vec::new();
+        loop {
+            let start = head.len();
+            let read = reader
+                .read_until(b'\n', &mut head)
+                .map_err(|source| crate::Error::Io {
+                    path: "blob".into(),
+                    source,
+                })?;
+            let line = &head[start..];
+            if read == 0 || line == b"\r\n" || line == b"\n" {
+                break;
+            }
+        }
+        // Une dernière ligne coupée par la fin du contenu — ou par la borne — reste un en-tête,
+        // mais `mail-parser` ne la lit qu'une fois terminée.
+        if !head.is_empty() && !head.ends_with(b"\n") {
+            head.extend_from_slice(b"\r\n");
+        }
+        Ok(MessageParser::default()
+            .parse_headers(&head)
+            .and_then(|parsed| parsed.subject().map(visible_subject))
+            .filter(|it| !it.is_empty()))
+    }
+
     /// Lit au plus [`crate::source::MAX_READ`] octets d'un blob et les rend lisibles.
     ///
     /// **En flux, et borné dès la lecture.** Le plus gros message du corpus réel fait 48 Mio ;
@@ -827,6 +884,17 @@ impl Mailbox {
         // requêtes découperait en plusieurs termes.
         self.search(&format!("from:\"{cleaned}\" OR to:\"{cleaned}\""), limit)
     }
+}
+
+/// Un objet prêt à tenir sur une ligne : les caractères de contrôle — retours à la ligne d'un
+/// en-tête replié mal décodé compris — deviennent des espaces, et les bords sont rognés.
+fn visible_subject(subject: &str) -> String {
+    subject
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 /// La chaîne `References` d'un message, dans l'ordre où elle est écrite.
@@ -1516,5 +1584,65 @@ mod tests {
         let _ = mailbox.folders().unwrap();
         let _ = mailbox.stats().unwrap();
         assert_eq!(mailbox.revision().unwrap(), before);
+    }
+
+    /// Range des octets au magasin et rend l'objet que la file en lirait.
+    fn subject_of(raw: &[u8]) -> Option<String> {
+        let (_dir, mailbox) = mailbox();
+        let put = mailbox.store().blobs().put(raw).unwrap();
+        mailbox.outgoing_subject(put.hash).unwrap()
+    }
+
+    #[test]
+    fn an_outgoing_subject_is_read_from_the_header_block() {
+        assert_eq!(
+            subject_of(b"From: a@b.c\r\nSubject: Devis\r\n\r\nSubject: pas moi\r\n").as_deref(),
+            Some("Devis")
+        );
+    }
+
+    #[test]
+    fn an_outgoing_subject_is_decoded() {
+        // Un mot encodé, comme `mailsmtp::compose` en écrit pour tout objet accentué.
+        assert_eq!(
+            subject_of(b"Subject: =?utf-8?Q?R=C3=A9union?=\r\n\r\ncorps\r\n").as_deref(),
+            Some("Réunion")
+        );
+    }
+
+    #[test]
+    fn a_subject_in_the_body_is_not_the_subject() {
+        // La propriété, pas le mécanisme : `mail-parser` s'arrête lui aussi à la ligne blanche,
+        // donc ce test ne verrait pas la boucle de lecture perdre son arrêt — il verrait qu'un
+        // « Subject: » du corps est pris pour l'objet, quelle qu'en soit la cause.
+        assert_eq!(
+            subject_of(b"From: a@b.c\r\n\r\nSubject: dans le corps\r\n"),
+            None
+        );
+        assert_eq!(subject_of(b"From: a@b.c\n\nSubject: dans le corps\n"), None);
+    }
+
+    #[test]
+    fn hostile_outgoing_subjects_are_tamed() {
+        assert_eq!(
+            subject_of(b"Subject: =?utf-8?Q?a=1B[2Jb=0Dc?=\r\n\r\n").as_deref(),
+            Some("a [2Jb c")
+        );
+        // Vide, ou blanc : pas d'objet plutôt qu'une ligne vide.
+        assert_eq!(subject_of(b"Subject:   \r\n\r\n"), None);
+        // Sans corps ni ligne blanche, et sans rien du tout.
+        assert_eq!(subject_of(b"Subject: seul").as_deref(), Some("seul"));
+        assert_eq!(subject_of(b""), None);
+        // Un bloc d'en-têtes sans fin, au-delà de la borne : lu jusqu'à elle, sans paniquer.
+        let mut endless = b"Subject: long\r\n".to_vec();
+        endless.extend(std::iter::repeat_n(b'x', crate::source::MAX_HEADERS * 2));
+        assert_eq!(subject_of(&endless).as_deref(), Some("long"));
+    }
+
+    #[test]
+    fn a_missing_outgoing_blob_has_no_subject() {
+        let (_dir, mailbox) = mailbox();
+        let absent = crate::BlobHash::of(b"jamais range");
+        assert_eq!(mailbox.outgoing_subject(absent).unwrap(), None);
     }
 }

@@ -819,8 +819,30 @@ impl Api {
                 tracing::warn!(%source, "file d'envoi illisible");
                 Error::new(jsonrpc::INTERNAL_ERROR, "la file d'envoi n'est pas lisible")
             })?;
-            let out: Vec<mailapi::dto::Outgoing> =
-                outbox.iter().map(mailapi::dto::Outgoing::new).collect();
+            // L'objet est lu dans chaque envoi en cours et dans les derniers terminés — voir
+            // `OUTGOING_SUBJECTS_SENT` pour la borne. Un contenu illisible ne fait pas tomber la
+            // liste : la file doit rester visible pour qu'on puisse y décider d'un envoi.
+            let finished = outbox
+                .iter()
+                .filter(|it| it.state == mailcore::SendState::Sent)
+                .count();
+            let mut skipped = finished.saturating_sub(mailapi::dto::OUTGOING_SUBJECTS_SENT);
+            let out: Vec<mailapi::dto::Outgoing> = outbox
+                .iter()
+                .map(|it| {
+                    // La file est rendue du plus ancien au plus récent : les premiers terminés
+                    // sont ceux qu'on saute.
+                    if it.state == mailcore::SendState::Sent && skipped > 0 {
+                        skipped -= 1;
+                        return mailapi::dto::Outgoing::new(it);
+                    }
+                    let subject = mailbox.outgoing_subject(it.blob).unwrap_or_else(|source| {
+                        tracing::warn!(%source, id = it.id.0, "objet d'un envoi illisible");
+                        None
+                    });
+                    mailapi::dto::Outgoing::with_subject(it, subject)
+                })
+                .collect();
             encode(&out)
         })
         .await
@@ -2527,5 +2549,55 @@ mod tests {
         // retirée entre-temps.
         let missing = call(&api, "outbox.retry", json!({"id": 9_999})).await;
         assert_eq!(missing["queued"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn the_outbox_names_its_messages_by_subject_within_its_bound() {
+        // L'objet est lu dans ce qui part, pour chaque envoi en cours et pour les derniers
+        // terminés seulement : l'historique ne se purge jamais, et tout relire à chaque liste
+        // coûterait de plus en plus cher. Voir `dto::OUTGOING_SUBJECTS_SENT`.
+        let (_dir, api, root) = api_that_can_send();
+        let store = Store::open(&root).unwrap();
+        let bound = mailapi::dto::OUTGOING_SUBJECTS_SENT;
+        let sent = bound + 3;
+        for i in 0..=sent {
+            let raw = format!(
+                "From: marie@exemple.fr\r\nTo: jean@ailleurs.fr\r\nSubject: Envoi {i}\r\n\r\ncorps\r\n"
+            );
+            let blob = store.blobs().put(raw.as_bytes()).unwrap().hash;
+            let id = store
+                .enqueue(
+                    mailcore::AccountId(1),
+                    blob,
+                    "marie@exemple.fr",
+                    &["jean@ailleurs.fr".to_owned()],
+                    raw.len() as u64,
+                    1_000,
+                    None,
+                )
+                .unwrap();
+            // Le dernier reste en file, les autres sont partis.
+            if i < sent {
+                store
+                    .commit_outgoing(id, mailcore::SendState::Sent)
+                    .unwrap();
+            }
+        }
+        drop(store);
+
+        let listed = call(&api, "outbox.list", Value::Null).await;
+        let subjects: Vec<Option<&str>> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|line| line["subject"].as_str())
+            .collect();
+        assert_eq!(subjects.len(), sent + 1);
+        // Les trois plus anciens envois terminés n'en ont pas…
+        assert!(subjects[..3].iter().all(Option::is_none), "{subjects:?}");
+        // … les vingt suivants si, et l'envoi en cours aussi, quel que soit son rang.
+        for (i, subject) in subjects.iter().enumerate().skip(3) {
+            assert_eq!(*subject, Some(format!("Envoi {i}").as_str()));
+        }
     }
 }

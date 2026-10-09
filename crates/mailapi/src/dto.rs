@@ -589,6 +589,15 @@ pub struct Account {
     pub enabled: bool,
 }
 
+/// Combien d'envois **terminés** — les plus récents — reçoivent leur objet dans `outbox.list`.
+///
+/// Lire un objet coûte de l'ordre de 0,2 ms — ouvrir le blob, démarrer sa décompression, lire
+/// son bloc d'en-têtes —, mesuré sur mille blobs le 2026-10-09. L'historique des envois ne se
+/// purge jamais : à dix envois par jour, tout lire coûterait 0,7 s de plus par an à **chaque**
+/// liste, sur le fil sériel du service. Les envois en cours, eux, ont toujours leur objet : ce
+/// sont ceux sur lesquels on décide.
+pub const OUTGOING_SUBJECTS_SENT: usize = 20;
+
 /// Une ligne de la file d'envoi.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Outgoing {
@@ -628,13 +637,28 @@ pub struct Outgoing {
     /// Dérivé côté service, comme [`Self::doubtful`] : seule la couche qui a parlé au serveur
     /// sait pourquoi il a refusé, et un client n'a pas à deviner en lisant une phrase française.
     pub resendable: bool,
+    /// L'objet du message, lu dans ce qui part — `mailcore::Mailbox::outgoing_subject`.
+    ///
+    /// Absent si le message n'en a pas, si son contenu manque au magasin, si c'est un envoi
+    /// terminé plus ancien que les [`OUTGOING_SUBJECTS_SENT`] derniers, ou si le service est
+    /// antérieur à ce champ : d'où le `default`, pour qu'un client récent parle encore à un
+    /// démon ancien. Une étiquette, jamais une décision : rien ne s'y lit pour choisir un geste.
+    #[serde(default)]
+    pub subject: Option<String>,
 }
 
 impl Outgoing {
-    /// Convertit une ligne du store.
+    /// Convertit une ligne du store, sans objet : voir [`Self::with_subject`].
     #[must_use]
     pub fn new(it: &mailcore::Outgoing) -> Self {
+        Self::with_subject(it, None)
+    }
+
+    /// Convertit une ligne du store, avec l'objet que le service a lu dans son contenu.
+    #[must_use]
+    pub fn with_subject(it: &mailcore::Outgoing, subject: Option<String>) -> Self {
         Self {
+            subject,
             id: it.id.0,
             account: it.account.0,
             sender: it.sender.clone(),
