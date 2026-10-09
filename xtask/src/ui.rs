@@ -1240,7 +1240,9 @@ fn report(runs: &[Run]) {
         println!("  Store ouvert, à chaud    {store:.1} ms (médiane)");
     }
     if let Some(context) = warm_median(|it| it.context_ms) {
-        println!("  Fenêtre prête, à chaud   {context:.1} ms (médiane, store compris)");
+        // Le store s'ouvre **pendant** la création de la fenêtre depuis le 2026-10-09 : les deux
+        // jalons se chevauchent, ils ne s'additionnent pas.
+        println!("  Fenêtre prête, à chaud   {context:.1} ms (médiane)");
     }
     if let (Some(process), Some(page)) = (first.process_ms, first.page_ms) {
         // La part du processus contient celle de la page : le webview est créé par la

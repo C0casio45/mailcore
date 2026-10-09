@@ -215,18 +215,6 @@ fn main() -> Result<()> {
     }
 
     let bench = Bench::from_env();
-    let backend = match open_backend(&cli, started, launch) {
-        Ok(backend) => backend,
-        // **Un échec au démarrage se voit.** Sans console en release, l'erreur rendue par `main`
-        // ne va nulle part : voir `failure`. Un banc, lui, lit la sortie et n'a personne pour
-        // fermer une fenêtre — il garde l'erreur seule, sinon il attendrait pour toujours.
-        Err(error) => {
-            if bench == Bench::None {
-                failure::show(&error);
-            }
-            return Err(error);
-        }
-    };
 
     // **Le cache de lecture, avant la fenêtre.** En mode distant, c'est ce qui permet au
     // premier écran d'exister sans attendre le réseau — la note du critère 1. C'est une lecture
@@ -246,27 +234,42 @@ fn main() -> Result<()> {
         );
     }
 
-    // Le fil d'API démarre avant la fenêtre : les premières demandes sont donc déjà en vol
-    // pendant que le contexte graphique se crée.
+    // **Le store s'ouvre pendant que la fenêtre se crée**, dans un fil, et non plus avant elle.
     //
-    // **L'ordre compte.** Le fil est sériel, et `server.hello` calcule les statistiques du
-    // store — un compte de blobs et de références sur 102 894 lignes. Le demander en premier
-    // retardait `folders.list`, donc la première page, donc les premières lignes à l'écran :
-    // 115 ms mesurés entre la première image et la première ligne. Les dossiers d'abord, la
-    // présentation ensuite.
-    let worker = worker::Worker::start(backend);
-    worker.ask(worker::Request::Bootstrap { limit: app::PAGE });
-    worker.ask(worker::Request::Sources);
-    worker.ask(worker::Request::Hello);
-    // Après le premier écran, et pour la même raison que `hello` : elles ne servent qu'au
-    // moment où l'utilisateur veut écrire, et le bouton reste désactivé jusque-là. Retarder
-    // les lignes à l'écran pour savoir qui peut envoyer serait le mauvais arbitrage.
-    worker.ask(worker::Request::Accounts);
-    worker.ask(worker::Request::Outbox);
-    // Les brouillons avec la file, et pour la même raison : ce sont les deux réponses à
-    // « qu'est-ce qui n'est pas encore parti ? », et le compteur du bouton doit être juste dès
-    // le premier écran.
-    worker.ask(worker::Request::Drafts);
+    // Mesuré le 2026-10-09 au repos sur 73 658 messages : la fenêtre et son contexte graphique
+    // coûtent environ 165 ms au système et à la carte graphique, le store 37 ms. Les deux en
+    // série faisaient un démarrage à 220 ms, à la limite des 225 ms du critère 1 de la phase 2 ;
+    // les deux ensemble, le store se cache sous la fenêtre. La fenêtre le rejoint dans sa
+    // fonction de création, où il est d'ordinaire déjà prêt.
+    //
+    // Le fil d'API démarre dans le même fil, sitôt le store ouvert : les premières demandes sont
+    // donc en vol pendant que le contexte graphique se crée, comme avant.
+    let opening = std::thread::Builder::new()
+        .name("ouverture".to_owned())
+        .spawn(move || -> Result<worker::Worker> {
+            let backend = open_backend(&cli, started, launch)?;
+            let worker = worker::Worker::start(backend);
+            // **L'ordre compte.** Le fil est sériel, et `server.hello` calcule les statistiques
+            // du store — un compte de blobs et de références sur 102 894 lignes. Le demander en
+            // premier retardait `folders.list`, donc la première page, donc les premières lignes
+            // à l'écran : 115 ms mesurés entre la première image et la première ligne. Les
+            // dossiers d'abord, la présentation ensuite.
+            worker.ask(worker::Request::Bootstrap { limit: app::PAGE });
+            worker.ask(worker::Request::Sources);
+            worker.ask(worker::Request::Hello);
+            // Après le premier écran, et pour la même raison que `hello` : elles ne servent
+            // qu'au moment où l'utilisateur veut écrire, et le bouton reste désactivé
+            // jusque-là. Retarder les lignes à l'écran pour savoir qui peut envoyer serait le
+            // mauvais arbitrage.
+            worker.ask(worker::Request::Accounts);
+            worker.ask(worker::Request::Outbox);
+            // Les brouillons avec la file, et pour la même raison : ce sont les deux réponses à
+            // « qu'est-ce qui n'est pas encore parti ? », et le compteur du bouton doit être
+            // juste dès le premier écran.
+            worker.ask(worker::Request::Drafts);
+            Ok(worker)
+        })
+        .context("lancement du fil d'ouverture")?;
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
@@ -300,6 +303,23 @@ fn main() -> Result<()> {
                 "{MARK} coquille etape=contexte ms={:.1}",
                 started.elapsed().as_secs_f64() * 1000.0
             );
+            let worker = match opening.join() {
+                Ok(Ok(worker)) => worker,
+                // **Un échec au démarrage se voit.** Sans console en release, l'erreur rendue par
+                // `main` ne va nulle part : voir `failure`. Un banc, lui, lit la sortie et n'a
+                // personne pour fermer une fenêtre — il garde l'erreur seule, sinon il
+                // attendrait pour toujours. La fenêtre existe déjà à ce moment, vide : c'est le
+                // prix de l'ouverture en parallèle, et il ne se paie que sur un échec.
+                Ok(Err(error)) => {
+                    if bench == Bench::None {
+                        failure::show(&error);
+                    }
+                    // `{:#}` garde la chaîne des causes : eframe n'affiche que le message de
+                    // tête, et « ouverture du store » sans sa raison ne dit pas quoi réparer.
+                    return Err(format!("{error:#}").into());
+                }
+                Err(_) => return Err("le fil d'ouverture du store a paniqué".into()),
+            };
             theme::install(&cx.egui_ctx);
             worker.attach(&cx.egui_ctx);
             Ok(Box::new(app::Shell::new(app::Setup {
