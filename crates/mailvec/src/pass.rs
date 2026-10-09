@@ -278,7 +278,7 @@ fn update_locked(
         store.reset_vectorised()?;
     }
 
-    advance(store, model, budget, progress)
+    advance(store, model, budget, progress, None)
 }
 
 /// Retire le magasin, s'il existe.
@@ -342,7 +342,7 @@ fn rebuild_locked(
     // déclenche jamais.
     remove_store(&store.vectors_path())?;
     store.reset_vectorised()?;
-    advance(store, model, budget, progress)
+    advance(store, model, budget, progress, None)
 }
 
 /// Combien de messages une passe de fond accepte de faire d'elle-même.
@@ -533,7 +533,40 @@ pub fn follow_locked(
     match plan(store, budget, Some((&identity, model.dim())))? {
         Plan::Nothing => Ok(Followed::Done(Stats::default())),
         Plan::Explicit { reason, pending } => Ok(Followed::Explicit { reason, pending }),
-        Plan::Follow { .. } => Ok(Followed::Done(advance(store, model, budget, progress)?)),
+        Plan::Follow { .. } => Ok(Followed::Done(advance(
+            store, model, budget, progress, None,
+        )?)),
+    }
+}
+
+/// [`follow_locked`], borné à `at_most` messages : ce qui reste attendra le passage suivant.
+///
+/// Pour un processus qui a autre chose à faire entre deux lots — l'enfant de la recherche par le
+/// sens, qui sert des requêtes et ne doit pas les faire attendre derrière mille messages. Une
+/// requête qui arrive pendant un lot attend ce lot, et seulement lui.
+///
+/// # Errors
+///
+/// Les mêmes que [`follow`].
+pub fn follow_some(
+    store: &Store,
+    model: &impl Encoder,
+    budget: crate::text::Budget,
+    progress: &Progress,
+    _lock: &VectorLock,
+    at_most: u64,
+) -> Result<Followed> {
+    let identity = model.identity();
+    match plan(store, budget, Some((&identity, model.dim())))? {
+        Plan::Nothing => Ok(Followed::Done(Stats::default())),
+        Plan::Explicit { reason, pending } => Ok(Followed::Explicit { reason, pending }),
+        Plan::Follow { .. } => Ok(Followed::Done(advance(
+            store,
+            model,
+            budget,
+            progress,
+            Some(at_most),
+        )?)),
     }
 }
 
@@ -759,6 +792,7 @@ fn advance(
     model: &impl Encoder,
     budget: crate::text::Budget,
     progress: &Progress,
+    cap: Option<u64>,
 ) -> Result<Stats> {
     let mut stats = Stats::default();
     let parser = mail_parser::MessageParser::default();
@@ -766,7 +800,9 @@ fn advance(
     let provenance = provenance_of(model, budget);
     let mut writer = VectorWriter::open(store.vectors_path(), model.dim(), &provenance)?;
 
-    let pending = store.unvectorised_total()?;
+    // Borné quand on le demande : voir [`follow_some`].
+    let total = store.unvectorised_total()?;
+    let pending = cap.map_or(total, |cap| total.min(cap));
     progress.set_total(pending);
     let mut remaining = pending;
 
@@ -1112,6 +1148,55 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(plan(&store, budget(), None).unwrap(), Plan::Nothing);
+    }
+
+    #[test]
+    fn a_bounded_follow_stops_at_its_bound_and_the_next_one_continues() {
+        // Le lot de l'enfant de recherche : il ne doit pas faire attendre une requête derrière
+        // tout l'arriéré. Le contrôle inverse est le test précédent — sans borne, tout passe.
+        let (_dir, store) = corpus(5);
+        let fake = Fake::new(8);
+        update_with(&store, &fake, budget(), &Progress::new()).unwrap();
+        store.reset_vectorised().unwrap();
+
+        let lock = VectorLock::try_acquire(&store.vectors_path()).unwrap();
+        let once =
+            |at_most| match follow_some(&store, &fake, budget(), &Progress::new(), &lock, at_most)
+                .unwrap()
+            {
+                Followed::Done(stats) => stats.vectorised,
+                other => panic!("{other:?}"),
+            };
+        assert_eq!(once(2), 2);
+        assert_eq!(
+            plan(&store, budget(), None).unwrap(),
+            Plan::Follow { pending: 3 }
+        );
+        assert_eq!(once(2), 2);
+        assert_eq!(once(2), 1);
+        assert_eq!(plan(&store, budget(), None).unwrap(), Plan::Nothing);
+        // Rien à faire : un lot vide, pas une erreur.
+        assert_eq!(once(2), 0);
+    }
+
+    #[test]
+    fn a_bounded_follow_refuses_what_the_unbounded_one_refuses() {
+        // Une borne ne doit pas ouvrir une porte que `follow` tient fermée : même `plan`, même
+        // refus, rien d'écrit.
+        let (_dir, store) = corpus(3);
+        update_with(&store, &Fake::new(8), budget(), &Progress::new()).unwrap();
+        store.reset_vectorised().unwrap();
+        let before = snapshot(&store);
+        let lock = VectorLock::try_acquire(&store.vectors_path()).unwrap();
+        let other = Fake::named(8, "un-autre-modele");
+        assert!(matches!(
+            follow_some(&store, &other, budget(), &Progress::new(), &lock, 2).unwrap(),
+            Followed::Explicit {
+                reason: Explicit::ModelChanged,
+                ..
+            }
+        ));
+        assert_eq!(snapshot(&store), before);
     }
 
     #[test]

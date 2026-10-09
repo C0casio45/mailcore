@@ -157,6 +157,9 @@ impl Service {
         // `launch` ne parte à la passe de fond.
         let semantic = Arc::new(semantic::Engine::start(store, &launch, activity.clone()));
         let vectoriser = Arc::new(vectors::Vectoriser::start(store, activity, launch));
+        // Quand l'enfant de la recherche est chaud, c'est lui qui fait la passe : il a déjà le
+        // modèle. Voir `Vectoriser::delegate_to`.
+        vectoriser.delegate_to(&semantic);
         let api = api
             .with_vectoriser(Arc::clone(&vectoriser))
             .with_semantic(Arc::clone(&semantic));

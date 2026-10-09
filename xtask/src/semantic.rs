@@ -626,6 +626,10 @@ pub fn measure_arrival(sources: &Sources, arrivals: usize) -> Result<()> {
     let load = loaded.elapsed();
     drop(model);
 
+    // **L'enfant de la recherche chaud**, le chemin du 2026-10-09 : le lot lui est confié, sans
+    // processus ni chargement. Mesuré à part, parce que c'est un autre chemin et un autre coût.
+    let warm = warm_rounds(&program, &replica.root, &store, &all, &targets)?;
+
     println!(
         "\nDécision du démon {}  (dans son processus, sans modèle)",
         ms(decision)
@@ -650,19 +654,100 @@ pub fn measure_arrival(sources: &Sources, arrivals: usize) -> Result<()> {
     let kept: Vec<Duration> = rounds.iter().skip(1).map(|round| round.to_exit).collect();
     let median = percentile(&kept, 0.5);
     println!("\nDont chargement du modèle, mesuré seul : {}", ms(load));
-    println!(
-        "\n{} critère 4 — travail de fond pour un message qui arrive, médiane : {} (seuil < {})",
-        if median < ARRIVAL_BUDGET {
+    let verdict = |value: Duration| {
+        if value < ARRIVAL_BUDGET {
             "OK   "
         } else {
             "ÉCHEC"
-        },
+        }
+    };
+    println!(
+        "\n{} critère 4, enfant froid — un processus et le modèle par arrivée, médiane : {} \
+         (seuil < {})",
+        verdict(median),
         ms(median),
+        ms(ARRIVAL_BUDGET)
+    );
+
+    println!("\nEnfant de la recherche chaud — le lot confié");
+    for (index, took) in warm.iter().enumerate() {
+        println!(
+            "  {}{}  {:>10}",
+            index + 1,
+            if index == 0 { " (jeté)" } else { "       " },
+            ms(*took)
+        );
+    }
+    let warm_kept: Vec<Duration> = warm.iter().skip(1).copied().collect();
+    let warm_median = percentile(&warm_kept, 0.5);
+    println!(
+        "\n{} critère 4, enfant chaud — dans les cinq minutes qui suivent une recherche, médiane : \
+         {} (seuil < {})",
+        verdict(warm_median),
+        ms(warm_median),
         ms(ARRIVAL_BUDGET)
     );
     println!(
         "Ce que ça ne dit pas : plusieurs messages arrivés ensemble partagent un passage, donc un \
-         chargement du modèle."
+         chargement du modèle ; et l'enfant chaud tourne en priorité normale, la passe de fond en \
+         priorité minimale."
     );
     Ok(())
+}
+
+/// Les arrivées servies par l'enfant de la recherche chaud : une par cible, chronométrée de la
+/// demande du lot à sa réponse — rattrapage du magasin compris.
+fn warm_rounds(
+    program: &Utf8PathBuf,
+    root: &Utf8PathBuf,
+    store: &Store,
+    all: &[MessageId],
+    targets: &[MessageId],
+) -> Result<Vec<Duration>> {
+    let engine = maild::semantic::Engine::start(
+        root,
+        &maild::vectors::Launch::program(program.as_std_path()),
+        maild::jobs::Activity::default(),
+    );
+    // L'enfant naît sur un magasin à jour, comme après une recherche ordinaire.
+    store.mark_vectorised(all)?;
+    let _ = engine.ranked("réveil", 10);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while !engine.is_ready() {
+        match engine.standing() {
+            Some(maild::semantic::Unavailable::Starting) | None => {}
+            Some(why) => anyhow::bail!("l'enfant de la recherche a refusé : {}", why.code()),
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "l'enfant de la recherche n'a pas démarré en cinq minutes"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut out = Vec::with_capacity(targets.len());
+    for target in targets {
+        store.reset_vectorised()?;
+        let others: Vec<MessageId> = all.iter().filter(|id| *id != target).copied().collect();
+        store.mark_vectorised(&others)?;
+        anyhow::ensure!(
+            store.unvectorised_total()? == 1,
+            "un seul message doit attendre"
+        );
+        let started = Instant::now();
+        let outcome = engine
+            .follow(8)
+            .context("l'enfant chaud n'a pas fait le lot")?;
+        let took = started.elapsed();
+        anyhow::ensure!(
+            outcome
+                == maild::vectors::Outcome::Done {
+                    vectorised: 1,
+                    unreadable: 0
+                },
+            "l'enfant chaud devait vectoriser un message : {outcome:?}"
+        );
+        out.push(took);
+    }
+    Ok(out)
 }

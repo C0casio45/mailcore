@@ -34,9 +34,13 @@
 //!
 //! ## L'enfant compte comme un travail lourd
 //!
-//! Il tient un [`crate::jobs::Held`] tant qu'il vit : la passe de fond des vecteurs attend qu'il
-//! meure pour se lancer, et se fait tuer s'il naît. Sans ça, une recherche suivie d'une arrivée
-//! de courrier mettait deux copies du modèle en mémoire.
+//! Il tient un [`crate::jobs::Held`] tant qu'il vit : la passe de fond des vecteurs ne lance pas
+//! son propre enfant tant qu'il vit, et tue le sien s'il naît. Sans ça, une recherche suivie
+//! d'une arrivée de courrier mettait deux copies du modèle en mémoire.
+//!
+//! Depuis le 2026-10-09, la passe de fond lui **confie** son travail pendant ce temps, par lots
+//! courts ([`Engine::follow`]) : il a déjà le modèle, et une arrivée ne coûte plus que son
+//! encodage. Il rattrape ensuite le magasin en ne lisant que sa fin.
 //!
 //! ## Le protocole
 //!
@@ -101,19 +105,33 @@ pub enum Unavailable {
     Failed,
 }
 
+/// Ce que le démon demande à l'enfant.
 #[derive(Debug, Serialize, Deserialize)]
-struct Ask {
-    q: String,
-    depth: usize,
+#[serde(rename_all = "snake_case")]
+enum Asked {
+    /// Les messages les plus proches d'une requête.
+    Query { q: String, depth: usize },
+    /// Un lot de la passe de fond, au plus `at_most` messages — voir
+    /// [`crate::vectors::Vectoriser::delegate_to`].
+    Follow { at_most: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Said {
-    Ready { records: u64 },
+    Ready {
+        records: u64,
+    },
     Ids(Vec<i64>),
+    /// Ce que le lot a donné, dans la ligne du protocole de la passe de fond : une seule façon
+    /// de le dire, que l'enfant de la passe et celui-ci partagent.
+    Followed(String),
     Error(String),
 }
+
+/// Combien le démon attend un lot de la passe confié à l'enfant. Un lot est court — voir
+/// `crate::vectors` —, et pendant ce temps une recherche attend : au-delà, l'enfant est malade.
+const FOLLOW_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Unavailable {
     /// Un mot qui le désigne, pour un journal ou le protocole — jamais un chemin.
@@ -346,10 +364,38 @@ fn messages_waiting(count: u64) -> String {
 
 /// L'enfant : charge, annonce, répond, jusqu'à la fin de son entrée.
 pub(crate) mod child {
-    use super::{Ask, Said, Unavailable};
+    use super::{Asked, Said, Unavailable};
+    use crate::vectors::{Failure, Outcome};
     use camino::Utf8Path;
+    use mailcore::vectors::{Refreshed, Vectors};
     use mailvec::search::QueryEncoder;
     use std::io::{BufRead, Write};
+
+    /// Un lot de la passe de fond, avec le modèle déjà chargé : verrou, puis passe bornée. La
+    /// règle de ce qui se suit ou se refuse est celle de la passe de fond — `mailvec::pass::plan`.
+    fn follow(
+        store: &mailcore::Store,
+        model: &mailvec::bert::Bert,
+        path: &Utf8Path,
+        at_most: u64,
+    ) -> Outcome {
+        let lock = match mailcore::vectors::VectorLock::try_acquire(path) {
+            Ok(lock) => lock,
+            Err(mailcore::Error::VectorsBusy { .. }) => return Outcome::Busy,
+            Err(error) => {
+                tracing::warn!(%error, "verrou des vecteurs");
+                return Outcome::Failed(Failure::Store);
+            }
+        };
+        crate::vectors::outcome_of(mailvec::pass::follow_some(
+            store,
+            model,
+            mailvec::text::Budget::default(),
+            &mailcore::Progress::new(),
+            &lock,
+            at_most,
+        ))
+    }
 
     fn say(said: &Said) {
         if let Ok(line) = serde_json::to_string(said) {
@@ -434,7 +480,7 @@ pub(crate) mod child {
                 .map_err(|error| (Unavailable::Failed, error.to_string()))?;
             Ok((vectors, summary))
         };
-        let (mut vectors, mut summary) = match load() {
+        let (mut vectors, summary) = match load() {
             Ok(loaded) => loaded,
             Err((why, detail)) => return refuse(why, &detail),
         };
@@ -442,38 +488,77 @@ pub(crate) mod child {
             records: summary.as_ref().map_or(0, |s| s.records),
         });
 
+        // **Rattraper le magasin s'il a changé** — la passe de fond y ajoute pendant qu'on cherche,
+        // et cet enfant la fait lui-même quand on la lui confie. Seule la fin du fichier est lue ;
+        // un fichier refait est relu en entier, et sa provenance revérifiée.
+        let catch_up = |vectors: &mut Vectors| -> Result<(), (Unavailable, String)> {
+            match vectors.refresh(&path) {
+                Ok(Refreshed::Unchanged | Refreshed::Appended(_)) => Ok(()),
+                Ok(Refreshed::Reloaded) if vectors.is_empty() => {
+                    Err((Unavailable::Empty, "aucun vecteur".to_owned()))
+                }
+                Ok(Refreshed::Reloaded) => {
+                    if vectors
+                        .provenance()
+                        .is_some_and(|theirs| theirs.same_model(&ours))
+                    {
+                        Ok(())
+                    } else {
+                        Err((
+                            Unavailable::Foreign,
+                            "écrits par un autre modèle".to_owned(),
+                        ))
+                    }
+                }
+                // Illisible en l'état : `load` dit pourquoi — autre modèle, autre dimension, ou
+                // panne —, la mémoire ayant déjà été rendue.
+                Err(_) => load().map(|(loaded, _)| *vectors = loaded),
+            }
+        };
+
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
-            let Ok(ask) = serde_json::from_str::<Ask>(&line) else {
+            let Ok(asked) = serde_json::from_str::<Asked>(&line) else {
                 say(&Said::Error("protocol".to_owned()));
                 continue;
             };
-            // **Relire si le magasin a changé** — la passe de fond y ajoute pendant qu'on cherche.
-            // Un `stat` et un en-tête par requête : la question la moins chère d'abord.
-            let now = mailcore::vectors::summary_of(&path).ok().flatten();
-            if now != summary {
-                match load() {
-                    Ok(loaded) => (vectors, summary) = loaded,
-                    Err((why, detail)) => {
+            match asked {
+                Asked::Query { q, depth } => {
+                    if let Err((why, detail)) = catch_up(&mut vectors) {
                         // Le parent tue l'enfant sur tout refus : le modèle chargé ici ne
                         // répondra plus jamais à ces vecteurs.
                         return refuse(why, &detail);
                     }
-                }
-            }
-            let answer = model
-                .encode_query(&ask.q)
-                .map_err(|error| error.to_string())
-                .and_then(|query| {
-                    vectors
-                        .search(&query, ask.depth)
+                    let answer = model
+                        .encode_query(&q)
                         .map_err(|error| error.to_string())
-                });
-            match answer {
-                Ok(hits) => say(&Said::Ids(hits.into_iter().map(|hit| hit.id.0).collect())),
-                Err(error) => {
-                    tracing::warn!(%error, "requête non servie");
-                    say(&Said::Error("failed".to_owned()));
+                        .and_then(|query| {
+                            vectors
+                                .search(&query, depth)
+                                .map_err(|error| error.to_string())
+                        });
+                    match answer {
+                        Ok(hits) => {
+                            say(&Said::Ids(hits.into_iter().map(|hit| hit.id.0).collect()));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "requête non servie");
+                            say(&Said::Error("failed".to_owned()));
+                        }
+                    }
+                }
+                Asked::Follow { at_most } => {
+                    let outcome = follow(&store, &model, &path, at_most);
+                    // Rattrapé **ici**, dans le lot : la recherche suivante n'a rien à relire, et
+                    // les messages arrivés sont cherchables dès la réponse.
+                    let caught = catch_up(&mut vectors);
+                    say(&Said::Followed(outcome.line()));
+                    if let Err((why, detail)) = caught {
+                        // La réponse est donnée ; sortir sans autre ligne, pour ne pas en glisser
+                        // une que le parent lirait comme la réponse à sa question suivante.
+                        tracing::warn!(raison = why.code(), %detail, "magasin illisible après le lot");
+                        return 0;
+                    }
                 }
             }
         }
@@ -719,6 +804,36 @@ impl Engine {
         answer
     }
 
+    /// Fait faire à l'enfant **chaud** un lot de la passe de fond, au plus `at_most` messages.
+    ///
+    /// `None` s'il n'y a pas d'enfant chaud — il ne sera pas réveillé pour ça : la passe de fond
+    /// lance alors le sien, ou attend —, ou s'il n'a pas répondu : il est tué, et sa mort réveille
+    /// la passe de fond. Ne touche pas à l'heure de la dernière recherche : un enfant qu'on ne fait
+    /// que travailler pour la passe doit s'endormir à l'heure, et rendre sa mémoire.
+    ///
+    /// Une recherche qui arrive pendant le lot l'attend, verrou tenu : c'est pourquoi le lot est
+    /// court.
+    #[must_use]
+    pub fn follow(&self, at_most: u64) -> Option<crate::vectors::Outcome> {
+        let mut inner = self.inner.lock().ok()?;
+        let Slot::Ready(running) = &mut inner.slot else {
+            return None;
+        };
+        let outcome = follow_in(running, at_most);
+        if outcome.is_none() {
+            tracing::warn!("l'enfant de la recherche n'a pas fait le lot de la passe de fond");
+            let refused = Slot::Refused {
+                why: Unavailable::Failed,
+                seen: fingerprint(&self.root),
+                at: Instant::now(),
+            };
+            if let Slot::Ready(running) = std::mem::replace(&mut inner.slot, refused) {
+                running.kill();
+            }
+        }
+        outcome
+    }
+
     /// Lance l'enfant sur un fil à lui ; le range quand il est prêt.
     fn warm(&self, program: PathBuf) {
         let inner = Arc::clone(&self.inner);
@@ -750,6 +865,10 @@ impl Engine {
                         }
                     }
                 };
+                drop(inner);
+                // La passe de fond attendait peut-être ce démarrage pour confier son travail : la
+                // prévenir, verrou rendu.
+                activity.notify();
             });
         if spawned.is_err()
             && let Ok(mut inner) = self.inner.lock()
@@ -855,25 +974,40 @@ fn read(running: &Running, timeout: Duration) -> Result<Said, Unavailable> {
     serde_json::from_str(&line).map_err(|_| Unavailable::Failed)
 }
 
-fn ask(running: &mut Running, query: &str, depth: usize) -> Result<Vec<MessageId>, Unavailable> {
-    let line = serde_json::to_string(&Ask {
-        q: query.to_owned(),
-        depth,
-    })
-    .map_err(|_| Unavailable::Failed)?;
+fn send(running: &mut Running, asked: &Asked) -> Result<(), Unavailable> {
+    let line = serde_json::to_string(asked).map_err(|_| Unavailable::Failed)?;
     writeln!(running.stdin, "{line}").map_err(|_| Unavailable::Failed)?;
-    running.stdin.flush().map_err(|_| Unavailable::Failed)?;
+    running.stdin.flush().map_err(|_| Unavailable::Failed)
+}
+
+fn ask(running: &mut Running, query: &str, depth: usize) -> Result<Vec<MessageId>, Unavailable> {
+    send(
+        running,
+        &Asked::Query {
+            q: query.to_owned(),
+            depth,
+        },
+    )?;
     match read(running, ANSWER_TIMEOUT)? {
         Said::Ids(ids) => Ok(ids.into_iter().map(MessageId).collect()),
         Said::Error(code) => Err(Unavailable::from_code(&code)),
-        Said::Ready { .. } => Err(Unavailable::Failed),
+        Said::Ready { .. } | Said::Followed(_) => Err(Unavailable::Failed),
+    }
+}
+
+/// Confie un lot de la passe de fond à l'enfant, et rend ce qu'il en dit.
+fn follow_in(running: &mut Running, at_most: u64) -> Option<crate::vectors::Outcome> {
+    send(running, &Asked::Follow { at_most }).ok()?;
+    match read(running, FOLLOW_TIMEOUT).ok()? {
+        Said::Followed(line) => crate::vectors::Outcome::parse(&line),
+        Said::Ready { .. } | Said::Ids(_) | Said::Error(_) => None,
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{Ask, Said, Unavailable};
+    use super::{Asked, Said, Unavailable};
 
     fn ready() -> super::Facts {
         super::Facts {
@@ -1100,14 +1234,20 @@ mod tests {
         // Une requête est du texte libre : saut de ligne, guillemets, contrôle — elle doit tenir
         // sur une ligne et revenir identique.
         let q = "ligne\nsuivante \"guillemets\" \u{1b}[2J fin".to_owned();
-        let line = serde_json::to_string(&Ask {
+        let line = serde_json::to_string(&Asked::Query {
             q: q.clone(),
             depth: 50,
         })
         .unwrap();
         assert!(!line.contains('\n'));
-        let back: Ask = serde_json::from_str(&line).unwrap();
-        assert_eq!(back.q, q);
+        let back: Asked = serde_json::from_str(&line).unwrap();
+        assert!(matches!(back, Asked::Query { q: found, depth: 50 } if found == q));
+        // La demande de lot aussi, et elle ne se confond pas avec une requête.
+        let follow = serde_json::to_string(&Asked::Follow { at_most: 8 }).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Asked>(&follow).unwrap(),
+            Asked::Follow { at_most: 8 }
+        ));
     }
 
     #[test]
@@ -1115,6 +1255,7 @@ mod tests {
         for said in [
             Said::Ready { records: 3 },
             Said::Ids(vec![3, 1, 2]),
+            Said::Followed("done 2 0".to_owned()),
             Said::Error("model-absent".to_owned()),
         ] {
             let line = serde_json::to_string(&said).unwrap();

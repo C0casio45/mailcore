@@ -376,3 +376,80 @@ async fn a_warm_child_counts_as_heavy_work_until_it_dies() {
     drop(engine);
     assert_eq!(activity.active(), 0, "l'enfant mort ne compte plus");
 }
+
+/// Un service réduit à ce qui compte ici : la recherche, et la passe de fond sur le même compteur.
+fn api_engine_and_pass(
+    root: &Utf8PathBuf,
+    delegate: bool,
+) -> (Api, Arc<Engine>, maild::vectors::Vectoriser) {
+    let activity = maild::jobs::Activity::default();
+    let mailbox = Arc::new(Mutex::new(mailcore::Mailbox::open(root).unwrap()));
+    let jobs = maild::jobs::Jobs::start(
+        Arc::clone(&mailbox),
+        root.clone(),
+        maild::jobs::Sources::new(Vec::new()),
+    );
+    let engine = Arc::new(Engine::start(root, &program(), activity.clone()));
+    let vectoriser =
+        maild::vectors::Vectoriser::start_after(root, activity, program(), Duration::ZERO);
+    if delegate {
+        vectoriser.delegate_to(&engine);
+    }
+    (
+        Api::new(mailbox, jobs).with_semantic(Arc::clone(&engine)),
+        engine,
+        vectoriser,
+    )
+}
+
+#[tokio::test]
+async fn a_warm_child_vectorises_what_arrives_without_a_second_model() {
+    // Le critère 4 tel qu'il est tenu depuis le 2026-10-09 : quand on vient de chercher, l'enfant
+    // de la recherche a le modèle, et c'est lui qui vectorise le courrier qui arrive — sans second
+    // enfant, sans second chargement.
+    let (_dir, root) = store(true, true);
+    let (api, engine, vectoriser) = api_engine_and_pass(&root, true);
+    warmed(&api, &engine, "bonjour").await;
+
+    // Du courrier « arrive » : les drapeaux remis, comme après une moisson.
+    let store = mailcore::Store::open(&root).unwrap();
+    store.reset_vectorised().unwrap();
+    vectoriser.nudge();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while store.unvectorised_total().unwrap() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "rien de vectorisé, état {:?}",
+            vectoriser.status()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        vectoriser.delegated() >= 1,
+        "la passe ne venait pas de l'enfant chaud"
+    );
+    assert!(engine.is_ready(), "l'enfant chaud est mort en route");
+
+    // Et la recherche voit toujours le corpus entier, sans avoir eu à le relire.
+    let results = search(&api, "bonjour").await;
+    assert_eq!(results.semantic.unwrap().state, SemanticState::Ready);
+    assert_eq!(results.count, 5);
+    vectoriser.stop();
+}
+
+#[tokio::test]
+async fn without_delegation_a_warm_child_makes_the_pass_wait() {
+    // Le contrôle inverse, et la règle qu'il garde : jamais deux copies du modèle. Sans
+    // délégation, la passe attend que l'enfant chaud meure plutôt que d'en lancer un second.
+    let (_dir, root) = store(true, true);
+    let (api, engine, vectoriser) = api_engine_and_pass(&root, false);
+    warmed(&api, &engine, "bonjour").await;
+    let store = mailcore::Store::open(&root).unwrap();
+    store.reset_vectorised().unwrap();
+    vectoriser.nudge();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(store.unvectorised_total().unwrap(), 5);
+    assert_eq!(vectoriser.status(), maild::vectors::Status::Paused);
+    assert_eq!(vectoriser.delegated(), 0);
+    vectoriser.stop();
+}

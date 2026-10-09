@@ -267,6 +267,10 @@ pub struct Activity {
 #[derive(Default)]
 struct ActivityInner {
     active: AtomicU64,
+    /// La part de `active` tenue par [`Activity::hold`] — aujourd'hui l'enfant de la recherche par
+    /// le sens. La passe de fond ne la traite pas comme un job : elle peut confier son travail à
+    /// cet enfant, qui a déjà le modèle — voir `crate::vectors`.
+    held: AtomicU64,
     listener: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
@@ -292,10 +296,33 @@ impl Activity {
         }
     }
 
+    /// Combien de **jobs** sont en file ou en cours, sans les travaux tenus par [`Self::hold`].
+    #[must_use]
+    pub fn jobs(&self) -> u64 {
+        self.active().saturating_sub(self.held())
+    }
+
+    /// Combien de travaux sont tenus par [`Self::hold`].
+    #[must_use]
+    pub fn held(&self) -> u64 {
+        self.inner.held.load(Ordering::SeqCst)
+    }
+
+    /// Prévient l'abonné sans rien compter : un travail tenu vient de changer d'état — l'enfant de
+    /// la recherche est prêt, et la passe de fond peut lui confier ce qui attendait.
+    pub fn notify(&self) {
+        if let Ok(slot) = self.inner.listener.lock()
+            && let Some(listener) = slot.as_ref()
+        {
+            listener();
+        }
+    }
+
     /// Compte un travail lourd fait **hors** des jobs, le temps que vit le gardien rendu : la
     /// passe de fond des vecteurs attend qu'il finisse, comme pour un job.
     #[must_use]
     pub fn hold(&self) -> Held {
+        self.inner.held.fetch_add(1, Ordering::SeqCst);
         self.begin();
         Held(self.clone())
     }
@@ -324,6 +351,13 @@ pub struct Held(Activity);
 
 impl Drop for Held {
     fn drop(&mut self) {
+        // Le compte des tenus d'abord : quand l'abonné est prévenu par `end`, il doit voir un
+        // enfant qui n'est plus là.
+        let _ = self
+            .0
+            .inner
+            .held
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         self.0.end();
     }
 }
@@ -1136,11 +1170,13 @@ mod tests {
         assert_eq!(activity.active(), 0);
         assert_eq!(heard.load(Ordering::SeqCst), 3);
 
-        // Le contrôle inverse : tenu, il compte.
+        // Le contrôle inverse : tenu, il compte — comme tenu, pas comme job.
         let held = activity.hold();
         assert_eq!(activity.active(), 1);
+        assert_eq!((activity.jobs(), activity.held()), (0, 1));
         drop(held);
         assert_eq!(activity.active(), 0);
+        assert_eq!((activity.jobs(), activity.held()), (0, 0));
     }
 
     #[test]

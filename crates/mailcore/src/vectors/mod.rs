@@ -61,7 +61,7 @@
 mod scan;
 mod store;
 
-pub use scan::{Hit, Vectors};
+pub use scan::{Hit, Refreshed, Vectors};
 pub use store::VectorWriter;
 
 /// La provenance d'un magasin, lue **sans** charger les vecteurs.

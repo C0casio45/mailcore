@@ -31,6 +31,14 @@
 //! Puis à la fin de chaque job, et toutes les dix minutes pour le courrier rangé par un autre
 //! processus. **Jamais pendant un job** : une moisson et une passe ensemble feraient la somme de
 //! leurs crêtes. Un job qui démarre tue l'enfant en cours ; il reprendra à la fin du job.
+//!
+//! ## Qui la fait, quand on vient de chercher
+//!
+//! L'enfant de la recherche par le sens garde le modèle cinq minutes après la dernière requête.
+//! Pendant ce temps, la passe de fond ne lance pas le sien — deux copies du modèle — : elle **lui
+//! confie** son travail, par lots courts ([`Vectoriser::delegate_to`]). Une arrivée de courrier
+//! ne coûte alors que son encodage, au lieu d'un processus et d'un chargement du modèle — 0,24 s
+//! des 0,59 s mesurées le 2026-10-09. Le reste du temps, rien ne change.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read};
@@ -66,6 +74,13 @@ const BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
 /// À quelle fréquence regarder l'enfant pendant qu'il travaille : s'il a fini, et s'il faut le
 /// tuer parce qu'un job a démarré.
 const WATCH: Duration = Duration::from_millis(200);
+
+/// Combien de messages porte au plus un lot confié à l'enfant de la recherche.
+///
+/// Une recherche qui arrive pendant un lot attend ce lot : il doit rester court. Une arrivée de
+/// courrier en compte un à quelques-uns ; un arriéré plus long se fait en plusieurs lots, entre
+/// lesquels les recherches passent.
+const DELEGATED_BATCH: u64 = 8;
 
 /// Pourquoi une passe de fond a échoué. Des codes, jamais une phrase : rien de ce qui sort d'ici
 /// ne porte de chemin — `docs/PRIVACY.md`, §8.
@@ -187,19 +202,36 @@ impl Launch {
     }
 }
 
-/// La ligne que l'enfant écrit en partant. Un protocole fermé : toute autre ligne est un échec.
+/// Ce qu'un passage de la passe de fond a donné — la ligne que l'enfant écrit en partant, ou que
+/// l'enfant de la recherche rend pour un lot. Un protocole fermé : toute autre ligne est un échec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Outcome {
-    Done { vectorised: u64, unreadable: u64 },
+pub enum Outcome {
+    /// Des messages ont reçu leur vecteur.
+    Done {
+        /// Combien.
+        vectorised: u64,
+        /// Combien étaient illisibles, et ont été marqués sans vecteur.
+        unreadable: u64,
+    },
+    /// Rien à faire.
     Nothing,
-    Explicit { reason: Explicit, pending: u64 },
+    /// La passe de fond refuse ; une passe explicite est nécessaire.
+    Explicit {
+        /// Pourquoi.
+        reason: Explicit,
+        /// Combien de messages attendent.
+        pending: u64,
+    },
+    /// Une autre passe tient le magasin.
     Busy,
+    /// Aucun modèle installé.
     ModelAbsent,
+    /// Le passage a échoué.
     Failed(Failure),
 }
 
 impl Outcome {
-    fn line(self) -> String {
+    pub(crate) fn line(self) -> String {
         match self {
             Self::Done {
                 vectorised,
@@ -213,7 +245,7 @@ impl Outcome {
         }
     }
 
-    fn parse(line: &str) -> Option<Self> {
+    pub(crate) fn parse(line: &str) -> Option<Self> {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
             ["done", vectorised, unreadable] => Some(Self::Done {
@@ -233,12 +265,30 @@ impl Outcome {
     }
 }
 
+/// Ce qu'une passe de fond rend, dans les mots du protocole — pour l'enfant de la passe et pour
+/// l'enfant de la recherche, qui la fait aussi quand il est chaud.
+pub(crate) fn outcome_of(followed: mailvec::Result<mailvec::pass::Followed>) -> Outcome {
+    use mailvec::pass::Followed;
+    match followed {
+        Ok(Followed::Done(stats)) => Outcome::Done {
+            vectorised: stats.vectorised,
+            unreadable: stats.unreadable,
+        },
+        Ok(Followed::Explicit { reason, pending }) => Outcome::Explicit { reason, pending },
+        Ok(Followed::Busy) => Outcome::Busy,
+        Err(error) => {
+            tracing::warn!(%error, "passe de fond en échec");
+            Outcome::Failed(Failure::Pass)
+        }
+    }
+}
+
 /// L'enfant : un passage, une ligne, et il sort.
 mod child {
     use super::{Failure, Outcome};
     use camino::Utf8Path;
     use mailcore::{Progress, Store};
-    use mailvec::pass::{Followed, Plan};
+    use mailvec::pass::Plan;
 
     /// Fait un passage et rend le code de sortie du processus.
     pub(super) fn run(root: &Utf8Path) -> i32 {
@@ -303,18 +353,13 @@ mod child {
                 return Outcome::Failed(Failure::Model);
             }
         };
-        match mailvec::pass::follow_locked(&store, &model, budget, &Progress::new(), &lock) {
-            Ok(Followed::Done(stats)) => Outcome::Done {
-                vectorised: stats.vectorised,
-                unreadable: stats.unreadable,
-            },
-            Ok(Followed::Explicit { reason, pending }) => Outcome::Explicit { reason, pending },
-            Ok(Followed::Busy) => Outcome::Busy,
-            Err(error) => {
-                tracing::warn!(%error, "passe de fond en échec");
-                Outcome::Failed(Failure::Pass)
-            }
-        }
+        super::outcome_of(mailvec::pass::follow_locked(
+            &store,
+            &model,
+            budget,
+            &Progress::new(),
+            &lock,
+        ))
     }
 }
 
@@ -326,6 +371,11 @@ struct Shared {
     status: Mutex<Status>,
     /// L'enfant en cours, pour que l'arrêt le tue sans attendre le fil.
     child: Mutex<Option<Child>>,
+    /// L'enfant de la recherche par le sens, à qui confier le travail quand il est chaud. Faible :
+    /// la passe de fond ne le garde pas en vie.
+    delegate: Mutex<Option<std::sync::Weak<crate::semantic::Engine>>>,
+    /// Combien de lots lui ont été confiés — pour les tests et le diagnostic.
+    delegated: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -415,6 +465,8 @@ impl Vectoriser {
             wake: (Mutex::new(false), Condvar::new()),
             status: Mutex::new(initial),
             child: Mutex::new(None),
+            delegate: Mutex::new(None),
+            delegated: std::sync::atomic::AtomicU64::new(0),
         });
         let Launch::Program(program) = launch else {
             return Self {
@@ -454,6 +506,25 @@ impl Vectoriser {
     /// Réveille le fil tout de suite.
     pub fn nudge(&self) {
         self.shared.nudge();
+    }
+
+    /// Confie la passe à l'enfant de la recherche par le sens **quand il est chaud**.
+    ///
+    /// Sans ça, une arrivée de courrier payait un enfant de plus et un chargement du modèle —
+    /// 0,24 s sur les 0,59 s d'une arrivée mesurée le 2026-10-09 —, et attendait même que l'enfant
+    /// de la recherche meure si l'on venait de chercher. Avec, une arrivée pendant qu'on cherche
+    /// ne coûte que son encodage. Hors de ces moments, rien ne change : l'enfant de la recherche
+    /// n'est jamais réveillé pour la passe.
+    pub fn delegate_to(&self, engine: &Arc<crate::semantic::Engine>) {
+        if let Ok(mut slot) = self.shared.delegate.lock() {
+            *slot = Some(Arc::downgrade(engine));
+        }
+    }
+
+    /// Combien de lots ont été confiés à l'enfant de la recherche depuis le démarrage.
+    #[must_use]
+    pub fn delegated(&self) -> u64 {
+        self.shared.delegated.load(Ordering::SeqCst)
     }
 
     /// Arrête le fil : tue l'enfant en cours, et attend le fil — borné, l'enfant étant mort.
@@ -556,7 +627,10 @@ fn round(
 ) -> bool {
     // Du moins cher au plus cher : un job actif, un recul en cours, un refus que rien n'a levé,
     // l'absence de modèle, puis seulement la question au store.
-    if activity.active() > 0 {
+    //
+    // Un **job**, pas l'enfant de la recherche : lui a déjà le modèle, et c'est à lui que la passe
+    // est confiée plus bas.
+    if activity.jobs() > 0 {
         shared.set(Status::Paused);
         return false;
     }
@@ -607,6 +681,26 @@ fn round(
     };
 
     shared.set(Status::Working { pending });
+    // **L'enfant de la recherche vit : c'est lui qui fait la passe**, un lot à la fois. Jamais un
+    // second enfant à côté — deux copies du modèle. S'il ne peut pas — il démarre encore, ou il n'a
+    // pas répondu —, on attend : sa mise en route ou sa mort réveillent ce fil.
+    if activity.held() > 0 {
+        let engine = shared
+            .delegate
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade));
+        return match engine.and_then(|engine| engine.follow(DELEGATED_BATCH)) {
+            Some(outcome) => {
+                shared.delegated.fetch_add(1, Ordering::SeqCst);
+                settle(outcome, shared, backoff, retry_at, refused, fingerprint)
+            }
+            None => {
+                shared.set(Status::Paused);
+                false
+            }
+        };
+    }
     match spawn_and_wait(root, program, activity, shared) {
         Waited::Killed => {
             // Un job a démarré, ou le démon s'arrête : ce qui est écrit reste écrit.

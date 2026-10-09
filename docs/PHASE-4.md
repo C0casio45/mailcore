@@ -2820,3 +2820,41 @@ ceux qui se lisent et dit chaque refus au journal ; la veille, le facteur, la sy
 `full_accounts` garde le refus global pour qui veut **tous** les comptes : `mail account list`,
 et la page de paramètres, qui doivent dire que la base est abîmée. Un test pose un compte sain et
 un compte cassé ; son contrôle inverse — le chemin tolérant rendu strict — le fait tomber.
+
+### 2026-10-09 (nuit) — le critère 4 : l'enfant de la recherche fait la passe quand il est chaud
+
+**En clair d'abord.** L'utilisateur a retenu la deuxième sortie : quand on vient de chercher,
+l'enfant de la recherche a déjà le modèle en mémoire, et c'est lui qui vectorise le courrier qui
+arrive. Plus de processus à lancer ni de modèle à charger dans ce cas. Le reste du temps, rien ne
+change — l'enfant de la recherche n'est jamais réveillé pour la passe.
+
+Trois morceaux, chacun avec ses tests :
+
+- **une passe bornée** (`mailvec::pass::follow_some`) : un lot de huit messages au plus, puis la
+  main rendue. Une recherche qui arrive pendant un lot attend ce lot, et seulement lui. Même
+  `plan`, donc mêmes refus que la passe de fond — un test le vérifie avec un autre modèle ;
+- **un rattrapage du magasin par sa fin** (`Vectors::refresh`). L'enfant relisait le magasin
+  **entier** dès qu'il changeait — plus de cent mébioctets, et deux copies en mémoire le temps de
+  la relecture. Il ne lit plus que les records ajoutés. Le piège était de reconnaître un fichier
+  **refait** : sous Windows, un fichier supprimé puis recréé sous le même nom dans les quinze
+  secondes hérite de la date de création de l'ancien, et c'est exactement ce que fait une passe
+  complète. Le fichier est donc tenu pour le même si son en-tête est identique à l'octet et si le
+  dernier record lu est toujours là, au même endroit ; sinon tout est relu, mémoire rendue
+  d'abord. Le test du fichier refait a son contrôle inverse : sans la comparaison du dernier
+  record, il tombe ;
+- **la délégation** (`Vectoriser::delegate_to`, `Engine::follow`). Le compteur d'activité
+  distingue maintenant les jobs des travaux tenus : un job met toujours la passe en pause, l'enfant
+  de la recherche reçoit le lot. Un test de bout en bout lance le vrai binaire, réchauffe l'enfant
+  par une recherche, remet les drapeaux, et vérifie que tout est revectorisé **par lui** ; son
+  contrôle inverse, sans délégation, vérifie que la passe attend plutôt que de charger un second
+  modèle.
+
+Un essai sur le corpus de mesure, machine occupée — **pas un relevé** : une arrivée servie par
+l'enfant chaud prend 186 à 492 ms, contre 630 à 910 ms à froid dans la même exécution. Le passage
+à vide y prenait 317 ms contre 95 au repos : la machine était trois fois plus lente qu'à 16 h 50.
+Le verdict se prendra au repos, avec le banc qui mesure maintenant les deux chemins séparément.
+
+Ce que ça ne change pas : à froid — plus de cinq minutes après la dernière recherche —, une
+arrivée coûte toujours un processus et un chargement du modèle, et le critère 4 n'y est pas tenu.
+Et l'enfant de la recherche tourne en priorité normale, là où la passe de fond tourne en priorité
+minimale : les lots qu'on lui confie sont courts pour cette raison aussi.
