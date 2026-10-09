@@ -2858,3 +2858,36 @@ Ce que ça ne change pas : à froid — plus de cinq minutes après la dernière
 arrivée coûte toujours un processus et un chargement du modèle, et le critère 4 n'y est pas tenu.
 Et l'enfant de la recherche tourne en priorité normale, là où la passe de fond tourne en priorité
 minimale : les lots qu'on lui confie sont courts pour cette raison aussi.
+
+### 2026-10-09 (nuit, suite) — la touche sur le bouton, et marquer non lu
+
+**En clair d'abord.** Hors critère, les deux premiers motifs retenus du tableau d'inspiration.
+Chaque bouton qui a un raccourci l'affiche — « Répondre R », « Écrire C », « Envoyer
+Ctrl+Entrée » — au lieu de le cacher dans une infobulle. Et un message peut redevenir **non lu** :
+par un bouton qui apparaît au survol de sa ligne, par un bouton du lecteur, ou par la touche U.
+
+**La touche est une constante, pas un texte.** Le bouton reçoit la même `egui::Key` que lit le
+clavier, et en tire son nom : un bouton ne peut pas annoncer une touche que le clavier ne sert
+pas. Seul « Ctrl+Entrée » est écrit à la main, parce qu'egui le nommerait en anglais.
+
+**Marquer non lu est toujours le drapeau `\Seen`**, retiré au lieu d'être posé : la règle de la
+phase 2 sur les écritures côté serveur tient. Ce qui a demandé du soin est la file de ce qui reste
+à dire au serveur (`flag_pushes`), qui ne connaissait qu'un sens. Elle en porte un maintenant
+(`SCHEMA_V15`, les lignes existantes restent des « lu ») et trois règles en sortent :
+
+- **le dernier geste remplace le précédent.** Une copie n'a qu'une poussée en attente : marquer non
+  lu un message dont le « lu » n'est pas encore parti retourne la ligne. Avec deux lignes, l'ordre
+  d'envoi déciderait de l'état final à la place de l'utilisateur ;
+- **on n'oublie que ce qu'on a poussé, dans le sens où on l'a poussé.** Entre la lecture de la
+  file et la réponse du serveur, un clic peut retourner la marque ; oublier par numéro seul jetait
+  ce nouveau geste, et le serveur gardait l'ancien état pour toujours. Un test le vérifie ;
+- **`-FLAGS`, jamais `FLAGS`.** `FLAGS ()` « marquerait non lu » en effaçant aussi l'étoile.
+
+Le test de bout en bout part d'un message lu et étoilé sur le serveur de test, le marque non lu,
+moissonne deux fois, et vérifie qu'il est toujours non lu et toujours étoilé — sans `CONDSTORE`,
+pour que la seconde moisson relise vraiment les drapeaux. Son contrôle inverse : une poussée qui
+envoie toujours `+FLAGS` le fait tomber, « le message est redevenu lu ».
+
+Le bouton du survol n'existe que dans un dossier, pas dans des résultats de recherche : un
+résultat n'a pas de dossier, et le message peut vivre dans plusieurs. C'est la règle qu'applique
+déjà l'ouverture d'un message.

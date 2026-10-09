@@ -802,7 +802,13 @@ impl<S: Read + Write> Client<S> {
         Ok(Self::selected_from(&replies))
     }
 
-    /// Ajoute `\Seen` à un ensemble d'UID de la boîte courante.
+    /// Ajoute `\Seen` à un ensemble d'UID de la boîte courante, ou le retire.
+    ///
+    /// ## `-FLAGS` pour retirer, et toujours pas `FLAGS`
+    ///
+    /// Marquer non lu est `-FLAGS.SILENT (\Seen)` : il retire ce drapeau et seulement lui. Le
+    /// même raisonnement que ci-dessous vaut dans ce sens, et il est plus fort : `FLAGS ()`
+    /// « marquerait non lu » en effaçant aussi l'étoile.
     ///
     /// ## `+FLAGS.SILENT` et non `+FLAGS`
     ///
@@ -819,15 +825,16 @@ impl<S: Read + Write> Client<S> {
     ///
     /// ## Elle est idempotente côté serveur
     ///
-    /// Ajouter `\Seen` à un message déjà lu ne fait rien. C'est ce qui permet à
-    /// `Store::forget_pending_seen` d'être appelé **après** la réponse : une poussée refaite
-    /// est sans effet, une poussée perdue serait une marque perdue.
+    /// Ajouter `\Seen` à un message déjà lu ne fait rien, le retirer d'un message non lu non
+    /// plus. C'est ce qui permet à `Store::forget_pending_seen` d'être appelé **après** la
+    /// réponse : une poussée refaite est sans effet, une poussée perdue serait une marque perdue.
     ///
     /// # Errors
     ///
     /// Voir [`Client::command`]. [`Error::Refused`] si la boîte est ouverte en lecture seule.
-    pub fn store_seen(&mut self, set: &str) -> Result<()> {
-        self.command(&format!(r"UID STORE {set} +FLAGS.SILENT (\Seen)"))?;
+    pub fn store_seen(&mut self, set: &str, seen: bool) -> Result<()> {
+        let sign = if seen { '+' } else { '-' };
+        self.command(&format!(r"UID STORE {set} {sign}FLAGS.SILENT (\Seen)"))?;
         Ok(())
     }
 

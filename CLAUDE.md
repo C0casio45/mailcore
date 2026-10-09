@@ -66,7 +66,10 @@ recul, abandon — reste dans `mailsmtp::queue::deliver_one`, qui est aussi ce q
 - le raccourci `LIST-STATUS` ne regarde que ce que le serveur annonce, donc il évitait les
   dossiers qui avaient une poussée en attente et la marque ne partait jamais. `up_to_date` a un
   refus en tête pour ça — **c'est la seule raison locale de ne pas sauter un dossier**, et si un
-  autre état local devient poussable, il faut passer par là.
+  autre état local devient poussable, il faut passer par là ;
+- **une poussée a un sens depuis le 2026-10-09** (`SCHEMA_V15`, marquer non lu) : une seule ligne
+  par copie, que le dernier geste **remplace**, et `forget_pending_seen` n'oublie une ligne que si
+  elle porte encore le sens poussé — sinon un clic arrivé pendant la poussée serait perdu.
 
 Et la moisson ouvre en `EXAMINE`, en lecture seule. Un dossier n'est rouvert en `SELECT` que
 s'il a une poussée en attente : le droit d'écrire est demandé au dernier moment et pour un

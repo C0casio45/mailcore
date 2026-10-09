@@ -122,6 +122,8 @@ pub enum Request {
     /// Séparé de `Open` exprès : **lire n'est pas marquer**. Le service sert aussi des
     /// modèles, et un modèle qui parcourt une boîte marquerait tout comme lu au passage.
     MarkRead { id: i64, folder: i64 },
+    /// Marquer un message non lu dans un dossier. Un geste explicite, jamais un effet de bord.
+    MarkUnread { id: i64, folder: i64 },
     /// Trancher le doute sur un message de la file. `resend` ou `accept`.
     Decide { id: i64, decision: &'static str },
     /// Renvoyer un envoi **échoué**, tel quel.
@@ -1605,6 +1607,11 @@ fn describe(request: &Request) -> (&'static str, &'static str, Value) {
             m::MESSAGES_MARK_READ,
             json!({"id": id, "folder": folder}),
         ),
+        Request::MarkUnread { id, folder } => (
+            "marquage non lu",
+            m::MESSAGES_MARK_UNREAD,
+            json!({"id": id, "folder": folder}),
+        ),
         Request::Decide { id, decision } => (
             "décision",
             m::OUTBOX_DECIDE,
@@ -1769,9 +1776,10 @@ fn decode(request: Request, result: Value) -> Result<Reply, String> {
         // **Un accusé, pas une valeur.** Le nombre de copies marquées n'intéresse pas
         // l'interface : ce qui l'intéresse est que la liste a changé, et c'est `Changed` qui le
         // dira. Même choix que `Reply::Started` pour les tâches de fond.
-        Request::MarkRead { .. } | Request::Decide { .. } | Request::Retry { .. } => {
-            Reply::Acknowledged
-        }
+        Request::MarkRead { .. }
+        | Request::MarkUnread { .. }
+        | Request::Decide { .. }
+        | Request::Retry { .. } => Reply::Acknowledged,
         Request::Complete { token, .. } => Reply::Complete {
             token,
             found: from(result)?,

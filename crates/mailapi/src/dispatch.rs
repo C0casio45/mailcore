@@ -39,6 +39,8 @@ pub mod method {
     pub const MESSAGES_THREAD: &str = "messages.thread";
     /// Marque un message lu dans un dossier. Servie par le transport.
     pub const MESSAGES_MARK_READ: &str = "messages.mark_read";
+    /// Marque un message non lu dans un dossier. Servie par le transport.
+    pub const MESSAGES_MARK_UNREAD: &str = "messages.mark_unread";
     /// Range une pièce jointe d'un message reçu dans le magasin, pour la joindre à un autre
     /// message. Servie par le transport.
     pub const MESSAGES_STAGE_PART: &str = "messages.stage_part";
@@ -141,6 +143,7 @@ pub mod method {
         MESSAGES_GET,
         MESSAGES_THREAD,
         MESSAGES_MARK_READ,
+        MESSAGES_MARK_UNREAD,
         MESSAGES_STAGE_PART,
         MESSAGES_SOURCE,
         SEARCH_QUERY,
@@ -189,8 +192,9 @@ pub mod method {
         OUTBOX_RETRY,
         OUTBOX_CANCEL,
         // Marquer lu écrit dans le store **et** met une poussée en attente pour le serveur :
-        // ce n'est pas une lecture, donc pas le répartiteur.
+        // ce n'est pas une lecture, donc pas le répartiteur. Marquer non lu de même.
         MESSAGES_MARK_READ,
+        MESSAGES_MARK_UNREAD,
         MESSAGES_STAGE_PART,
         // La signature se lit et s'écrit sur `accounts`, et l'écriture est un `UPDATE` : le
         // répartiteur ne sert que des lectures. Les deux sont ensemble parce qu'un client qui
@@ -311,7 +315,7 @@ pub struct CompleteParams {
     pub limit: Option<usize>,
 }
 
-/// Paramètres de `messages.mark_read`, servis par le transport.
+/// Paramètres de `messages.mark_read` et de `messages.mark_unread`, servis par le transport.
 ///
 /// ## Le dossier fait partie de la demande
 ///

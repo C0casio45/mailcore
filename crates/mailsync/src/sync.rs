@@ -62,6 +62,8 @@ use mailcore::{
     Account, AccountId, AuthKind, FolderId, MessageFlags, Progress, RemoteCopy, Store, SyncState,
 };
 
+use mailcore::store::flags::PendingSeen;
+
 use crate::client::{Client, Fetched};
 use crate::error::Result;
 
@@ -829,10 +831,6 @@ pub fn push_seen<S: Read + Write>(
     if pending.is_empty() {
         return Ok(0);
     }
-    let uids: Vec<u32> = pending.iter().map(|it| it.uid).collect();
-    let Some(set) = uid_set(&uids) else {
-        return Ok(0);
-    };
 
     // Le dossier est rouvert en écriture. Un refus ici — `\Noselect`, boîte partagée — laisse
     // la poussée en attente et rend la main.
@@ -844,17 +842,33 @@ pub fn push_seen<S: Read + Write>(
         );
         return Ok(0);
     }
-    if let Err(source) = client.store_seen(&set) {
-        tracing::warn!(
-            folder = folder.0,
-            %source,
-            pending = uids.len(),
-            "poussée du drapeau lu refusée : les marques restent en attente"
-        );
-        return Ok(0);
-    }
 
-    let forgotten = store.forget_pending_seen(folder, &uids)?;
+    // **Une commande par sens, et chacune oublie ce qu'elle a poussé.** Un refus de l'une
+    // n'empêche pas l'autre, et n'efface rien de ce qui n'est pas parti : une poussée n'est
+    // oubliée qu'après la réponse qui la concerne.
+    let mut forgotten = 0;
+    for seen in [true, false] {
+        let pushed: Vec<PendingSeen> = pending
+            .iter()
+            .filter(|it| it.seen == seen)
+            .copied()
+            .collect();
+        let uids: Vec<u32> = pushed.iter().map(|it| it.uid).collect();
+        let Some(set) = uid_set(&uids) else {
+            continue;
+        };
+        if let Err(source) = client.store_seen(&set, seen) {
+            tracing::warn!(
+                folder = folder.0,
+                %source,
+                seen,
+                pending = uids.len(),
+                "poussée du drapeau lu refusée : les marques restent en attente"
+            );
+            continue;
+        }
+        forgotten += store.forget_pending_seen(folder, &pushed)?;
+    }
     tracing::info!(folder = folder.0, pushed = forgotten, "drapeau lu poussé");
     Ok(forgotten)
 }

@@ -25,6 +25,7 @@ mod measure;
 mod model;
 mod probe;
 mod profile;
+mod findq;
 mod rebind;
 mod recall;
 mod replies;
@@ -424,6 +425,32 @@ enum Command {
         out: Option<Utf8PathBuf>,
     },
 
+    /// Aide à écrire le jeu de requêtes du critère 1 : un tirage au hasard, ou les messages dont
+    /// le sujet ou l'expéditeur contient un texte, avec leurs empreintes.
+    ///
+    /// Aucun moteur n'est lancé — un jeu écrit en regardant ce que le moteur rend ressemble au
+    /// moteur. La sortie nomme des messages réels : elle ne va jamais dans `docs/`.
+    QueriesFind {
+        /// Racine du store. Lu seulement.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Tirer ce nombre de messages au hasard.
+        #[arg(long)]
+        sample: Option<usize>,
+        /// La graine du tirage : le même nombre rend le même échantillon.
+        #[arg(long, default_value_t = 2026)]
+        seed: u64,
+        /// Un texte que le sujet doit contenir, sans distinction de casse.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Un texte que l'adresse ou le nom de l'expéditeur doit contenir.
+        #[arg(long)]
+        from: Option<String>,
+        /// Montrer le début du corps.
+        #[arg(long)]
+        body: bool,
+    },
+
     /// Mesure les critères 3 et 5 de la phase 4 : le coût d'une passe de vectorisation.
     ///
     /// Débit, durée, mémoire **par palier** — le critère 5 demande de dire où elle va —, et le
@@ -786,6 +813,21 @@ fn main() -> Result<()> {
             queries,
             out,
         } => rebind::run(&store, &queries, out.as_ref()),
+        Command::QueriesFind {
+            store,
+            sample,
+            seed,
+            subject,
+            from,
+            body,
+        } => findq::run(&findq::Options {
+            store,
+            sample,
+            seed,
+            subject,
+            from,
+            body,
+        }),
         Command::MeasureVectors {
             store,
             model,

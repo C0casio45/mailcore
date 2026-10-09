@@ -2511,3 +2511,51 @@ fn a_folder_with_a_pending_seen_push_is_never_skipped() {
         "la poussée est restée en attente après un passage qui a ouvert le dossier"
     );
 }
+
+#[test]
+fn a_message_marked_unread_stays_unread_after_the_harvest() {
+    // **Pousser, puis relire, dans l'autre sens.** Le serveur dit « lu » ; l'utilisateur marque
+    // non lu. Si la poussée partait dans le mauvais sens — `+FLAGS` au lieu de `-FLAGS` — ou
+    // pas du tout, la relecture qui suit réécrirait « lu » et le message se remarquerait tout
+    // seul. Sans `CONDSTORE`, la relecture des drapeaux est complète à chaque passage : c'est
+    // ce qui rend le test sensible, un `CHANGEDSINCE` ne relirait rien.
+    let mut messages = vec![Message::simple(1, "facture"), Message::simple(2, "devis")];
+    messages[0].flags = vec![r"\Seen".to_owned(), r"\Flagged".to_owned()];
+    let config =
+        Config::without_condstore().with_mailboxes(vec![Mailbox::new("INBOX", 1_000, messages)]);
+    let server = Server::start(config).unwrap();
+    let (_dir, store, folder) = store();
+    let mut client = connect(&server);
+    harvest(&mut client, &store, folder, b"INBOX").unwrap();
+
+    let facture = |store: &Store| {
+        store
+            .page(folder, None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|it| it.subject == "facture")
+            .expect("la facture doit être dans la boîte")
+    };
+    let before = facture(&store);
+    // Le contrôle de départ : sans lui, un message jamais lu passerait le test.
+    assert!(before.flags.contains(MessageFlags::SEEN));
+
+    assert_eq!(store.mark_unseen(before.id, folder, 1_000).unwrap(), 1);
+    harvest(&mut client, &store, folder, b"INBOX").unwrap();
+    assert!(
+        store.pending_seen(folder).unwrap().is_empty(),
+        "la poussée est restée en attente"
+    );
+
+    // Un second passage relit ce que le serveur sait désormais.
+    harvest(&mut client, &store, folder, b"INBOX").unwrap();
+    let after = facture(&store);
+    assert!(
+        !after.flags.contains(MessageFlags::SEEN),
+        "le message est redevenu lu : le serveur n'a pas reçu le « non lu »"
+    );
+    assert!(
+        after.flags.contains(MessageFlags::FLAGGED),
+        "l'étoile a disparu avec le drapeau lu"
+    );
+}

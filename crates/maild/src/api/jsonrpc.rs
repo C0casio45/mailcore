@@ -238,6 +238,7 @@ impl Api {
             m::OUTBOX_RETRY => self.outbox_retry(params).await,
             m::OUTBOX_CANCEL => self.outbox_cancel(params).await,
             m::MESSAGES_MARK_READ => self.mark_read(params).await,
+            m::MESSAGES_MARK_UNREAD => self.mark_unread(params).await,
             m::MESSAGES_STAGE_PART => self.stage_part(params).await,
             other => Err(Error::method_not_found(other)),
         }
@@ -966,20 +967,37 @@ impl Api {
     /// Règle 3 du `CLAUDE.md` : ouvrir un message est un clic, et un clic n'attend pas un
     /// réseau.
     async fn mark_read(&self, params: Value) -> Result<Value, Error> {
+        self.mark(params, true).await
+    }
+
+    /// `messages.mark_unread` : la symétrique, qui note un `-FLAGS (\Seen)` à pousser.
+    ///
+    /// C'est le seul geste de la liste qui ne part pas d'une ouverture : l'interface le propose
+    /// au survol d'une ligne. Toujours le drapeau `\Seen` et rien d'autre — la règle de la
+    /// phase 2 sur les écritures côté serveur tient.
+    async fn mark_unread(&self, params: Value) -> Result<Value, Error> {
+        self.mark(params, false).await
+    }
+
+    /// Le corps commun aux deux : un seul endroit lit les paramètres et rend le compte.
+    async fn mark(&self, params: Value, seen: bool) -> Result<Value, Error> {
         let params: mailapi::dispatch::MarkReadParams =
             serde_json::from_value(params).map_err(Error::invalid_params)?;
         self.read(move |mailbox| {
-            let marked = mailbox
-                .store()
-                .mark_seen(
-                    mailcore::MessageId(params.id),
-                    mailcore::FolderId(params.folder),
-                    unix_now(),
-                )
-                .map_err(|source| {
-                    tracing::warn!(%source, "marquage lu impossible");
-                    Error::new(jsonrpc::INTERNAL_ERROR, "le message n'a pas pu être marqué")
-                })?;
+            let (message, folder) = (
+                mailcore::MessageId(params.id),
+                mailcore::FolderId(params.folder),
+            );
+            let store = mailbox.store();
+            let marked = if seen {
+                store.mark_seen(message, folder, unix_now())
+            } else {
+                store.mark_unseen(message, folder, unix_now())
+            };
+            let marked = marked.map_err(|source| {
+                tracing::warn!(%source, seen, "marquage impossible");
+                Error::new(jsonrpc::INTERNAL_ERROR, "le message n'a pas pu être marqué")
+            })?;
             // Le nombre de copies marquées, donc **zéro** quand il n'y avait rien à faire. Un
             // client qui rappelle sur un message déjà lu doit pouvoir le distinguer d'un échec.
             encode(&json!({ "marked": marked }))
@@ -1680,6 +1698,30 @@ mod tests {
         let line = &listed.as_array().unwrap()[0];
         assert_eq!(line["state"], Value::from("committing"));
         assert_eq!(line["doubtful"], Value::Bool(true));
+    }
+
+    #[tokio::test]
+    async fn mark_read_and_mark_unread_go_opposite_ways_and_say_when_nothing_moved() {
+        // Le message du fixture est le premier de son dossier, non lu, sans copie serveur.
+        let (_dir, api) = api();
+        let target = json!({"id": 1, "folder": 1});
+        let marked = |value: Value| value["marked"].as_u64();
+
+        // Déjà non lu : rien ne bouge, et la réponse le dit plutôt que d'échouer.
+        let nothing = call(&api, "messages.mark_unread", target.clone()).await;
+        assert_eq!(marked(nothing), Some(0));
+        assert_eq!(
+            marked(call(&api, "messages.mark_read", target.clone()).await),
+            Some(1)
+        );
+        // Le contrôle qui distingue les deux méthodes : si `mark_unread` marquait lu, elle
+        // rendrait zéro ici.
+        assert_eq!(
+            marked(call(&api, "messages.mark_unread", target.clone()).await),
+            Some(1)
+        );
+        let page = call(&api, "messages.page", json!({"folder": 1})).await;
+        assert_eq!(page["rows"][0]["unread"], Value::Bool(true));
     }
 
     #[tokio::test]

@@ -807,12 +807,12 @@ fn select(
 /// est ce qui rend le refus observable : un client qui pousserait un drapeau après un `EXAMINE`
 /// le découvre ici, et non en production.
 ///
-/// ## Il n'honore que `+FLAGS`, et ignore `FLAGS` et `-FLAGS`
+/// ## Il honore `+FLAGS` et `-FLAGS`, et refuse `FLAGS`
 ///
-/// Le client n'émet que `+FLAGS.SILENT (\Seen)`. Servir `FLAGS` — qui **remplace** la liste —
-/// demanderait de choisir un comportement pour une commande que personne n'envoie, et le jour
-/// où quelqu'un l'enverrait, un serveur de test qui l'accepte silencieusement serait pire qu'un
-/// serveur qui la refuse.
+/// Le client émet `+FLAGS.SILENT (\Seen)` pour marquer lu et `-FLAGS.SILENT (\Seen)` pour
+/// marquer non lu. Servir `FLAGS` — qui **remplace** la liste — demanderait de choisir un
+/// comportement pour une commande que personne n'envoie, et le jour où quelqu'un l'enverrait,
+/// un serveur de test qui l'accepte silencieusement serait pire qu'un serveur qui la refuse.
 fn uid_store(
     command: &Command,
     session: &Session,
@@ -837,14 +837,18 @@ fn uid_store(
     let Some(item) = command.args.get(2).map(|it| it.to_ascii_uppercase()) else {
         return reply(wire, tag, "BAD", "UID STORE attend un élément");
     };
-    if !item.starts_with("+FLAGS") {
+    let add = if item.starts_with("+FLAGS") {
+        true
+    } else if item.starts_with("-FLAGS") {
+        false
+    } else {
         return reply(
             wire,
             tag,
             "BAD",
-            &format!("UID STORE {item} non servi : seul +FLAGS l'est"),
+            &format!("UID STORE {item} non servi : seuls +FLAGS et -FLAGS le sont"),
         );
-    }
+    };
 
     // Les drapeaux demandés : tout ce qui suit l'élément, parenthèses retirées. Le client
     // envoie `(\Seen)`, mais un ensemble de plusieurs doit passer aussi — sinon le test ne
@@ -871,10 +875,15 @@ fn uid_store(
         };
         for flag in &wanted {
             // `+FLAGS` **ajoute** : un drapeau déjà là n'est pas dupliqué, et les autres sont
-            // conservés. `FLAGS` remplacerait, ce qui effacerait `\Flagged` — la différence
-            // est d'un caractère et elle détruit des données.
-            if !message.flags.iter().any(|it| it.eq_ignore_ascii_case(flag)) {
-                message.flags.push(flag.clone());
+            // conservés. `-FLAGS` retire celui-là seulement. `FLAGS` remplacerait, ce qui
+            // effacerait `\Flagged` — la différence est d'un caractère et elle détruit des
+            // données.
+            if add {
+                if !message.flags.iter().any(|it| it.eq_ignore_ascii_case(flag)) {
+                    message.flags.push(flag.clone());
+                }
+            } else {
+                message.flags.retain(|it| !it.eq_ignore_ascii_case(flag));
             }
         }
         touched += 1;

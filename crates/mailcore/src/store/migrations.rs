@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// La version de schéma que ce binaire sait lire et écrire.
-pub const SCHEMA_VERSION: u32 = 14;
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Le schéma initial.
 ///
@@ -718,6 +718,29 @@ CREATE INDEX IF NOT EXISTS idx_messages_unvectorised
     ON messages(vectorised) WHERE vectorised = 0;
 ";
 
+/// v15 — `flag_pushes.seen` : une poussée dit dans quel sens elle va.
+///
+/// Jusqu'ici, la seule chose à dire au serveur était « lu » ; la table n'avait donc pas de
+/// sens, et [`SCHEMA_V6`] expliquait pourquoi ne pas l'ajouter d'avance. « Marquer non lu »
+/// est le besoin, et c'est **toujours le drapeau `\Seen`** — la règle de la phase 2 tient :
+/// rien d'autre ne s'écrit côté serveur.
+///
+/// ## Une colonne, pas une seconde table
+///
+/// Une copie n'a qu'un état final à atteindre. Deux tables — « à marquer lu », « à marquer
+/// non lu » — pourraient porter la même copie dans les deux à la fois, et l'ordre dans lequel
+/// la moisson les viderait déciderait de l'état final à la place de l'utilisateur. Avec une
+/// clé `(folder_id, uid)` et une colonne, le dernier geste **remplace** le précédent : la
+/// contradiction n'est pas représentable.
+///
+/// ## Le défaut à 1
+///
+/// Toutes les lignes écrites avant cette migration sont des marques « lu » : c'était la seule
+/// qui existait. Le défaut n'est pas une supposition, c'est l'histoire de la table.
+const SCHEMA_V15: &str = r"
+ALTER TABLE flag_pushes ADD COLUMN seen INTEGER NOT NULL DEFAULT 1;
+";
+
 /// Applique les migrations manquantes.
 ///
 /// Sans effet si le store est déjà à jour — l'appeler à chaque ouverture est le mode
@@ -783,6 +806,9 @@ pub fn apply(conn: &Connection) -> Result<()> {
     }
     if current < 14 {
         tx.execute_batch(SCHEMA_V14)?;
+    }
+    if current < 15 {
+        tx.execute_batch(SCHEMA_V15)?;
     }
     // `PRAGMA` ne se paramètre pas ; la valeur interpolée est une constante de compilation.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1385,6 +1411,47 @@ mod tests {
         assert!(
             !resendable,
             "une ligne d'avant la migration se dit renvoyable sans que rien ne l'ait classée"
+        );
+    }
+
+    #[test]
+    fn a_push_written_before_v15_stays_a_mark_read() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::apply_pragmas(&conn).unwrap();
+        for step in [
+            SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+            SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14,
+        ] {
+            conn.execute_batch(step).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 14_u32).unwrap();
+        let (inbox, _) = fixture(&conn);
+        conn.execute(
+            "INSERT INTO flag_pushes (folder_id, uid, marked_at) VALUES (?1, 5, 1000)",
+            [inbox],
+        )
+        .unwrap();
+        // Le contrôle qui prouve que la migration est exercée : sans elle, la colonne manque.
+        assert!(
+            conn.query_row("SELECT seen FROM flag_pushes", [], |r| r.get::<_, bool>(0))
+                .is_err(),
+            "la colonne existe déjà : ce test ne mesure pas la migration"
+        );
+
+        apply(&conn).unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+        let (uid, seen): (i64, bool) = conn
+            .query_row("SELECT uid, seen FROM flag_pushes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(uid, 5, "la poussée en attente a été perdue");
+        // Avant v15, la seule poussée qui existait était « lu ». La retourner enverrait un
+        // `-FLAGS` que personne n'a demandé.
+        assert!(
+            seen,
+            "une marque « lu » d'avant la migration est devenue « non lu »"
         );
     }
 }

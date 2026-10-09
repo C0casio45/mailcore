@@ -111,6 +111,8 @@ enum Answer {
     Forward,
     /// Ouvrir la source du message : les octets tels qu'ils sont.
     Source,
+    /// Retourner le drapeau lu du message ouvert.
+    ToggleRead,
 }
 
 /// Ce que la colonne centrale montre.
@@ -1356,8 +1358,8 @@ impl Shell {
             }
             if self.results.is_some()
                 && ui
-                    .button("Effacer")
-                    .on_hover_text("Revenir au dossier — Échap")
+                    .add(egui::Button::new("Effacer").shortcut_text(key_hint("Échap")))
+                    .on_hover_text("Revenir au dossier")
                     .clicked()
             {
                 self.clear_search();
@@ -1382,8 +1384,11 @@ impl Shell {
                 // un formulaire dont le bouton refuserait sans dire pourquoi — critère 8.
                 let can_send = self.default_sender().is_some();
                 if ui
-                    .add_enabled(can_send, primary(ui, "✉ Écrire"))
-                    .on_hover_text("Nouveau message — C")
+                    .add_enabled(
+                        can_send,
+                        primary(ui, "✉ Écrire", WRITE_KEY.symbol_or_name()),
+                    )
+                    .on_hover_text("Nouveau message")
                     .on_disabled_hover_text(
                         "Aucun compte n'a de serveur d'envoi. Paramètres → « Serveur d'envoi… ».",
                     )
@@ -2432,8 +2437,8 @@ impl Shell {
         ui.horizontal(|ui| {
             let ready = draft.is_sendable() && !self.sending;
             if ui
-                .add_enabled(ready, primary(ui, "Envoyer"))
-                .on_hover_text("Ctrl+Entrée")
+                .add_enabled(ready, primary(ui, "Envoyer", SEND_KEY))
+                .on_hover_text("Met le message dans la file d'envoi")
                 .clicked()
                 || (ready && shortcut)
             {
@@ -3011,7 +3016,9 @@ impl Shell {
         }
 
         let mut to_open = None;
+        let mut to_toggle = None;
         let mut need_more = false;
+        let can_mark = self.markable_folder().is_some();
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if self.bench_state.phase == Phase::Scrolling {
             area = area.vertical_scroll_offset(self.bench_state.offset);
@@ -3027,8 +3034,10 @@ impl Shell {
                     ui.allocate_space(egui::vec2(ui.available_width(), ROW_HEIGHT));
                     continue;
                 };
-                if row_widget(ui, row, self.selected == Some(row.id)) {
-                    to_open = Some(row.id);
+                match row_widget(ui, row, self.selected == Some(row.id), can_mark) {
+                    Some(RowAction::Open) => to_open = Some(row.id),
+                    Some(RowAction::ToggleRead) => to_toggle = Some(row.id),
+                    None => {}
                 }
             }
         });
@@ -3039,6 +3048,41 @@ impl Shell {
         if let Some(id) = to_open {
             self.open_message(id, false);
         }
+        if let Some(id) = to_toggle {
+            self.toggle_read(id);
+        }
+    }
+
+    /// Le dossier dans lequel un drapeau lu peut être posé ou retiré, s'il y en a un.
+    ///
+    /// Aucun pendant une recherche : un résultat n'a pas de dossier, et le message peut vivre
+    /// dans plusieurs. C'est la règle d'`open_message`, appliquée au geste inverse.
+    fn markable_folder(&self) -> Option<i64> {
+        self.current.filter(|_| self.results.is_none())
+    }
+
+    /// Retourne le drapeau lu d'un message du dossier ouvert : lu devient non lu, et l'inverse.
+    ///
+    /// L'état de départ se lit sur la ligne de liste, qui est ce que l'utilisateur voit au moment
+    /// du geste. Une ligne qui n'est pas chargée ne se retourne pas : on ne sait pas dans quel
+    /// sens, et deviner pourrait faire l'inverse de ce qui est affiché.
+    fn toggle_read(&mut self, id: i64) {
+        let Some(folder) = self.markable_folder() else {
+            return;
+        };
+        let Some(unread) = self
+            .visible()
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| row.unread)
+        else {
+            return;
+        };
+        self.worker.ask(if unread {
+            Request::MarkRead { id, folder }
+        } else {
+            Request::MarkUnread { id, folder }
+        });
     }
 
     /// Le volet de lecture.
@@ -3084,8 +3128,8 @@ impl Shell {
                         let can_send = self.default_sender().is_some();
                         let refus = "Aucun compte n'a de serveur d'envoi configuré.";
                         if ui
-                            .add_enabled(can_send, egui::Button::new("↩ Répondre"))
-                            .on_hover_text("Répond à l'expéditeur — R")
+                            .add_enabled(can_send, keyed("↩ Répondre", REPLY_KEY))
+                            .on_hover_text("Répond à l'expéditeur")
                             .on_disabled_hover_text(refus)
                             .clicked()
                         {
@@ -3096,13 +3140,16 @@ impl Shell {
                         // que fait le précédent.
                         let others = message.to.len() > 1;
                         if ui
-                            .add_enabled(can_send && others, egui::Button::new("↩ Répondre à tous"))
+                            .add_enabled(
+                                can_send && others,
+                                keyed("↩ Répondre à tous", EVERYONE_KEY),
+                            )
                             .on_disabled_hover_text(if others {
                                 refus
                             } else {
                                 "Ce message n'a qu'un destinataire."
                             })
-                            .on_hover_text("Répond à l'expéditeur, avec les autres en copie — A")
+                            .on_hover_text("Répond à l'expéditeur, avec les autres en copie")
                             .clicked()
                         {
                             reply = Some(Answer::Everyone);
@@ -3110,14 +3157,31 @@ impl Shell {
                         // L'infobulle disait « les pièces jointes ne suivent pas » : elles
                         // suivent depuis `start_forward`, qui les reprend une à une.
                         if ui
-                            .add_enabled(can_send, egui::Button::new("→ Transférer"))
+                            .add_enabled(can_send, keyed("→ Transférer", FORWARD_KEY))
                             .on_disabled_hover_text(refus)
-                            .on_hover_text(
-                                "Nouveau message, hors du fil, avec les pièces jointes — F",
-                            )
+                            .on_hover_text("Nouveau message, hors du fil, avec les pièces jointes")
                             .clicked()
                         {
                             reply = Some(Answer::Forward);
+                        }
+                        // Lu ou non lu, selon ce que la ligne affiche. Le message ouvert vient
+                        // d'être marqué lu : le cas courant est « le garder pour plus tard ».
+                        let unread = self
+                            .visible()
+                            .iter()
+                            .find(|row| row.id == message.row.id)
+                            .map(|row| row.unread);
+                        if self.markable_folder().is_some()
+                            && let Some(unread) = unread
+                        {
+                            let label = if unread {
+                                "Marquer lu"
+                            } else {
+                                "Marquer non lu"
+                            };
+                            if ui.add(keyed(label, UNREAD_KEY)).clicked() {
+                                reply = Some(Answer::ToggleRead);
+                            }
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if source_button(ui).clicked() {
@@ -3189,6 +3253,11 @@ impl Shell {
                     let id = message.row.id;
                     let title = elide(&message.row.subject, 48);
                     self.open_source(crate::worker::SourceOf::Message(id), title);
+                }
+            }
+            Some(Answer::ToggleRead) => {
+                if let Some(id) = self.message.as_ref().map(|it| it.row.id) {
+                    self.toggle_read(id);
                 }
             }
             None => {}
@@ -3293,13 +3362,14 @@ impl Shell {
         });
         // Les gestes d'écriture, sans modificateur : une seule touche, comme `j` et `k`. Un
         // modificateur enfoncé les désactive — Ctrl+C copie, il n'écrit pas un message.
-        let (write, reply, everyone, forward) = ctx.input(|input| {
+        let (write, reply, everyone, forward, toggle_read) = ctx.input(|input| {
             let plain = !input.modifiers.any();
             (
-                plain && input.key_pressed(egui::Key::C),
-                plain && input.key_pressed(egui::Key::R),
-                plain && input.key_pressed(egui::Key::A),
-                plain && input.key_pressed(egui::Key::F),
+                plain && input.key_pressed(WRITE_KEY),
+                plain && input.key_pressed(REPLY_KEY),
+                plain && input.key_pressed(EVERYONE_KEY),
+                plain && input.key_pressed(FORWARD_KEY),
+                plain && input.key_pressed(UNREAD_KEY),
             )
         });
 
@@ -3335,6 +3405,11 @@ impl Shell {
             // Les flèches et `j`/`k` parcourent la liste des messages ; dans une autre vue, elles
             // ouvriraient un message invisible.
             return;
+        }
+        // `u` retourne le drapeau lu du message choisi, comme le bouton du survol. Seulement
+        // dans la liste, pour la même raison que les flèches.
+        if toggle_read && let Some(id) = self.selected {
+            self.toggle_read(id);
         }
 
         let step = if page != 0 { page * 20 } else { 0 };
@@ -3873,12 +3948,31 @@ fn percentile(series: &[f64], fraction: f64) -> f64 {
 /// Signalé le 2026-09-08 à la première utilisation réelle : seule la date recevait les clics.
 /// `interact` sur le rectangle entier, **après** les cellules, le met au-dessus d'elles ; les
 /// étiquettes ne sont pas sélectionnables et ne prennent pas le clic.
-fn row_widget(ui: &mut egui::Ui, row: &dto::Row, selected: bool) -> bool {
+///
+/// ## Un geste au survol, et un seul
+///
+/// Quand la ligne est survolée, un bouton apparaît à droite : marquer lu ou non lu, sans ouvrir.
+/// Seulement des gestes qui ne touchent que le drapeau `\Seen` — rien d'autre ne s'écrit côté
+/// serveur. Et seulement quand la liste est un dossier (`can_mark`) : un résultat de recherche
+/// n'a pas de dossier, et deviner lequel serait choisir à la place de l'utilisateur, la règle
+/// de `open_message`.
+///
+/// Le bouton est enregistré **après** la ligne, donc au-dessus d'elle pour les clics ; sa place
+/// est réservée **avant** les cellules, pour que le sujet ne passe pas dessous. Le survol se lit
+/// sur le rectangle et pas sur la réponse de la ligne : quand le pointeur est sur le bouton, la
+/// ligne n'est plus « survolée » au sens d'egui, et le bouton disparaîtrait sous la souris.
+fn row_widget(
+    ui: &mut egui::Ui,
+    row: &dto::Row,
+    selected: bool,
+    can_mark: bool,
+) -> Option<RowAction> {
     let (id, rect) = ui.allocate_space(egui::vec2(ui.available_width(), ROW_HEIGHT));
     if !ui.is_rect_visible(rect) {
-        return false;
+        return None;
     }
     let background = ui.painter().add(egui::Shape::Noop);
+    let hovered = ui.rect_contains_pointer(rect);
     let strong = row.unread;
     let styled = |text: String, weak: bool| {
         let text = egui::RichText::new(text);
@@ -3891,6 +3985,14 @@ fn row_widget(ui: &mut egui::Ui, row: &dto::Row, selected: bool) -> bool {
 
     // Les marques, de droite à gauche : elles décident de la place qui reste au sujet.
     let mut right = rect.right() - ROW_PAD;
+    let action = (can_mark && hovered).then(|| {
+        let action = egui::Rect::from_min_max(
+            egui::pos2(right - ROW_ACTION, rect.top() + 3.0),
+            egui::pos2(right, rect.bottom() - 3.0),
+        );
+        right = action.left() - MARK_GAP;
+        action
+    });
     if row.flagged {
         right = cell_from_right(ui, rect, right, egui::RichText::new("★"), None);
     }
@@ -3942,7 +4044,7 @@ fn row_widget(ui: &mut egui::Ui, row: &dto::Row, selected: bool) -> bool {
     let response = ui.interact(rect, id, egui::Sense::click());
     let fill = if selected {
         Some(ui.visuals().selection.bg_fill)
-    } else if response.hovered() {
+    } else if hovered {
         Some(ui.visuals().widgets.hovered.weak_bg_fill)
     } else {
         None
@@ -3953,7 +4055,53 @@ fn row_widget(ui: &mut egui::Ui, row: &dto::Row, selected: bool) -> bool {
             egui::Shape::rect_filled(rect, egui::CornerRadius::ZERO, fill),
         );
     }
-    response.clicked()
+    if let Some(action) = action
+        && read_toggle(ui, id.with("lu"), action, row.unread).clicked()
+    {
+        return Some(RowAction::ToggleRead);
+    }
+    response.clicked().then_some(RowAction::Open)
+}
+
+/// Ce qu'une ligne de liste demande quand on clique dessus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    /// La ligne : ouvrir le message.
+    Open,
+    /// Le bouton du survol : retourner le drapeau lu.
+    ToggleRead,
+}
+
+/// Le bouton lu / non lu d'une ligne survolée.
+///
+/// **Dessiné, pas écrit.** Il montre ce que la ligne deviendra : le point plein du non-lu pour
+/// une ligne lue, un cercle vide pour une ligne non lue. C'est le même point que la colonne de
+/// gauche, donc on comprend le geste sans lire l'infobulle. Un glyphe de police aurait dépendu
+/// de ce que la police embarquée contient.
+fn read_toggle(ui: &egui::Ui, id: egui::Id, rect: egui::Rect, unread: bool) -> egui::Response {
+    let response = ui.interact(rect, id, egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect_stroke(
+        rect,
+        egui::CornerRadius::same(2),
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let accent = theme::accent(ui.ctx());
+    if unread {
+        ui.painter().circle_stroke(
+            rect.center(),
+            3.0,
+            egui::Stroke::new(1.0, visuals.fg_stroke.color),
+        );
+    } else {
+        ui.painter().circle_filled(rect.center(), 3.0, accent);
+    }
+    response.on_hover_text(if unread {
+        format!("Marquer lu — {}", UNREAD_KEY.symbol_or_name())
+    } else {
+        format!("Marquer non lu — {}", UNREAD_KEY.symbol_or_name())
+    })
 }
 
 /// Une cellule de ligne, posée à `left` sur `width` points, texte coupé à sa largeur. Rend
@@ -4601,7 +4749,7 @@ fn fill_panel(ui: &mut egui::Ui) {
 
 /// Le bouton de l'action principale d'un écran : plein, dans l'accent. Il n'y en a qu'un par
 /// écran — « Écrire », « Envoyer » —, sinon il ne désigne plus rien.
-fn primary(ui: &egui::Ui, text: &str) -> egui::Button<'static> {
+fn primary(ui: &egui::Ui, text: &str, key: &str) -> egui::Button<'static> {
     let accent = theme::accent(ui.ctx());
     // Le texte sur l'accent : blanc sur le bleu du thème clair, sombre sur le bleu clair du
     // thème sombre, pour garder le contraste dans les deux.
@@ -4610,7 +4758,30 @@ fn primary(ui: &egui::Ui, text: &str) -> egui::Button<'static> {
     } else {
         egui::Color32::WHITE
     };
-    egui::Button::new(egui::RichText::new(text.to_owned()).color(on_accent)).fill(accent)
+    // `right_text` et pas `shortcut_text` : ce dernier passe le texte en faible, c'est-à-dire
+    // en gris — illisible sur l'accent. La touche prend la couleur du libellé, adoucie.
+    egui::Button::new(egui::RichText::new(text.to_owned()).color(on_accent))
+        .right_text(key_hint(key).color(on_accent.gamma_multiply(0.7)))
+        .fill(accent)
+}
+
+/// Un bouton ordinaire qui porte son raccourci clavier.
+///
+/// **Écrit sur le bouton, pas seulement dans l'infobulle.** Une infobulle ne se lit qu'en
+/// s'arrêtant sur le bouton, c'est-à-dire en se servant de la souris : celui qui pourrait
+/// apprendre la touche est justement celui qui ne la voit jamais. Écrite à côté du geste, elle
+/// s'apprend sans chercher.
+///
+/// Le bouton prend une [`egui::Key`] et non un texte : la même constante est lue par le clavier
+/// (`keyboard`), donc un bouton ne peut pas annoncer une touche que le clavier ne sert pas.
+fn keyed(text: &str, key: egui::Key) -> egui::Button<'static> {
+    egui::Button::new(text.to_owned()).shortcut_text(key_hint(key.symbol_or_name()))
+}
+
+/// Le texte d'une touche, à côté d'un libellé : en chasse fixe et plus petit, pour qu'il se lise
+/// comme une touche et pas comme la fin du libellé.
+fn key_hint(key: &str) -> egui::RichText {
+    egui::RichText::new(key.to_owned()).monospace().small()
 }
 
 /// Le nom d'une tâche de fond, en français. Le service rend des codes — `sync`, `index` —, et
@@ -5066,12 +5237,57 @@ mod tests {
             has_attachments: false,
         };
         egui::__run_test_ui(|ui| {
-            row_widget(ui, &row, false);
+            row_widget(ui, &row, false, true);
         });
         row.found_by = Some(dto::FoundBy::Both);
         egui::__run_test_ui(|ui| {
-            row_widget(ui, &row, true);
+            row_widget(ui, &row, true, false);
         });
+    }
+
+    #[test]
+    fn a_row_nobody_touched_asks_for_nothing() {
+        // La règle de la page de paramètres, appliquée à la liste : une ligne que personne n'a
+        // cliquée ne demande rien — sans quoi un message s'ouvrirait, ou changerait de drapeau,
+        // à chaque image. Le bouton du survol est dessiné seul dans les deux sens, puisque le
+        // contexte de test n'a pas de pointeur pour le faire apparaître.
+        let row = dto::Row {
+            id: 1,
+            date: 1_789_041_600,
+            from: "a@exemple.fr".to_owned(),
+            from_name: Some("Quelqu'un".to_owned()),
+            subject: "Le sujet".to_owned(),
+            unread: false,
+            flagged: true,
+            score: None,
+            found_by: None,
+            has_attachments: true,
+        };
+        egui::__run_test_ui(|ui| {
+            assert_eq!(row_widget(ui, &row, false, true), None);
+            assert_eq!(row_widget(ui, &row, true, false), None);
+        });
+        for unread in [true, false] {
+            egui::__run_test_ui(|ui| {
+                let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(26.0, 20.0));
+                assert!(!read_toggle(ui, egui::Id::new("lu"), rect, unread).clicked());
+            });
+        }
+    }
+
+    #[test]
+    fn every_key_written_on_a_button_has_a_readable_name() {
+        // `symbol_or_name` rend un symbole pour certaines touches — une flèche, `⏎`. Une lettre
+        // doit rester une lettre : c'est ce que l'utilisateur tapera.
+        for key in [WRITE_KEY, REPLY_KEY, EVERYONE_KEY, FORWARD_KEY, UNREAD_KEY] {
+            let name = key.symbol_or_name();
+            assert_eq!(
+                name.chars().count(),
+                1,
+                "« {name} » ne se lit pas comme une touche"
+            );
+            assert!(name.chars().all(|it| it.is_ascii_uppercase()));
+        }
     }
 
     #[test]
@@ -5200,6 +5416,18 @@ const UNREAD_DOT: f32 = 6.0;
 const DATE_COLUMN: f32 = 56.0;
 const SENDER_COLUMN: f32 = 180.0;
 const MARK_GAP: f32 = 6.0;
+
+/// Les gestes à une touche. Une seule définition, lue par le clavier et écrite sur les boutons.
+const WRITE_KEY: egui::Key = egui::Key::C;
+const REPLY_KEY: egui::Key = egui::Key::R;
+const EVERYONE_KEY: egui::Key = egui::Key::A;
+const FORWARD_KEY: egui::Key = egui::Key::F;
+/// Retourne le drapeau lu du message choisi.
+const UNREAD_KEY: egui::Key = egui::Key::U;
+/// La largeur du bouton lu / non lu d'une ligne survolée.
+const ROW_ACTION: f32 = 26.0;
+/// Écrit en français : `Context::format_shortcut` rendrait « Ctrl+Enter ».
+const SEND_KEY: &str = "Ctrl+Entrée";
 
 /// Largeur minimale de la fenêtre de rédaction.
 ///
