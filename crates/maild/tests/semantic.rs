@@ -415,19 +415,23 @@ async fn a_warm_child_vectorises_what_arrives_without_a_second_model() {
     let store = mailcore::Store::open(&root).unwrap();
     store.reset_vectorised().unwrap();
     vectoriser.nudge();
+    // **Les deux conditions ensemble, et pas l'une puis l'autre.** L'enfant valide les drapeaux,
+    // **puis** répond, et la passe ne compte le lot qu'à la réponse : entre les deux, le store dit
+    // « tout est fait » et le compteur dit encore zéro. Lire le compteur dès que le store est
+    // vide a fait tomber ce test une fois sur la CI Windows, plus lente. Attendre le compteur ne
+    // l'affaiblit pas : si la passe avait lancé son propre enfant, il ne resterait plus rien à
+    // confier, et le compteur resterait à zéro jusqu'à l'échéance.
     let deadline = Instant::now() + Duration::from_secs(60);
-    while store.unvectorised_total().unwrap() > 0 {
+    while store.unvectorised_total().unwrap() > 0 || vectoriser.delegated() == 0 {
         assert!(
             Instant::now() < deadline,
-            "rien de vectorisé, état {:?}",
+            "la passe ne venait pas de l'enfant chaud : {} restants, {} lots confiés, état {:?}",
+            store.unvectorised_total().unwrap(),
+            vectoriser.delegated(),
             vectoriser.status()
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        vectoriser.delegated() >= 1,
-        "la passe ne venait pas de l'enfant chaud"
-    );
     assert!(engine.is_ready(), "l'enfant chaud est mort en route");
 
     // Et la recherche voit toujours le corpus entier, sans avoir eu à le relire.
