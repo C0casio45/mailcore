@@ -411,37 +411,38 @@ pub fn measure_search(sources: &Sources, queries: &Utf8PathBuf, rounds: usize) -
 pub fn measure_startup(sources: &Sources, runs: usize) -> Result<()> {
     let replica = Replica::build(sources, "target/measure-startup-model", true)?;
     {
-        let store = Store::open(&replica.root).context("ouverture de la réplique")?;
         // **Les comptes à serveur sont désactivés, dans la réplique.** Le corpus de mesure en
         // porte neuf, et la coquille ouvrirait leurs veilles et leurs moissons — des connexions
         // réelles, avec les secrets du trousseau, pendant un chronométrage. Un compte désactivé
-        // n'est ni veillé ni moissonné (`maild::watch`, `maild::jobs`) ; son hôte reste, parce
-        // qu'un compte `imap` sans hôte est refusé comme incohérent et ferait échouer le démarrage
-        // au lieu de le mesurer. La réplique est jetable : l'original n'est pas ouvert.
-        let accounts = store.full_accounts()?;
-        let writer = store.writer().context("écriture dans la réplique")?;
-        for account in accounts
-            .iter()
-            .filter(|it| it.kind != mailcore::AccountKind::Mbox)
+        // n'est ni veillé ni moissonné (`maild::watch`, `maild::jobs`). La réplique est jetable :
+        // l'original n'est pas ouvert.
+        //
+        // **En SQL, et pas par `Store::full_accounts`**, qui refuse le corpus entier dès qu'un
+        // compte y est incohérent — le corpus en a un, `imap` sans hôte, et le banc tombait
+        // avant d'avoir rien désactivé. Le banc n'a pas à valider les comptes : il doit
+        // seulement garantir qu'aucun ne parlera à un serveur, et un `UPDATE` sur la colonne
+        // le garantit pour tous, cohérents ou non.
         {
-            writer
-                .set_account_enabled(account.id, false)
-                .context("désactivation d'un compte de la réplique")?;
+            let db = rusqlite::Connection::open(replica.root.join("index.sqlite").as_std_path())
+                .context("ouverture de la base de la réplique")?;
+            db.execute("UPDATE accounts SET enabled = 0 WHERE kind <> 'mbox'", [])
+                .context("désactivation des comptes de la réplique")?;
+            // Relu, et non supposé : un `UPDATE` qui n'aurait rien touché laisserait la coquille
+            // se connecter.
+            let live: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM accounts WHERE kind <> 'mbox' AND enabled <> 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .context("relecture des comptes de la réplique")?;
+            anyhow::ensure!(
+                live == 0,
+                "{live} compte(s) à serveur encore actifs dans la réplique : la coquille s'y \
+                 connecterait"
+            );
         }
-        writer.commit().context("validation")?;
-        // Relu, et non supposé : un `UPDATE` qui n'aurait rien touché laisserait la coquille se
-        // connecter.
-        let live: Vec<String> = store
-            .full_accounts()?
-            .into_iter()
-            .filter(|it| it.kind != mailcore::AccountKind::Mbox && it.enabled)
-            .map(|it| it.display_name)
-            .collect();
-        anyhow::ensure!(
-            live.is_empty(),
-            "{} compte(s) à serveur encore actifs dans la réplique : la coquille s'y connecterait",
-            live.len()
-        );
+        let store = Store::open(&replica.root).context("ouverture de la réplique")?;
         anyhow::ensure!(
             store.outbox()?.is_empty(),
             "la réplique a des messages en file : la coquille les enverrait"

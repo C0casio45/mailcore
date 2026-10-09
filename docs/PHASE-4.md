@@ -86,9 +86,9 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 | # | Critère | Seuil | État |
 |---|---|---|---|
 | 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand. **Refait le 2026-10-08 sur les vecteurs du modèle taillé : chiffres identiques**, 26,9 % et 1 contre 9 à p = 0,021 |
-| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **balayage mesuré le 2026-09-21** — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
+| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **TENU le 2026-10-09, de bout en bout** — `cargo xtask measure-semantic-search`, machine au repos, 22 requêtes × 3 tours dont le premier jeté, trois exécutions : hybride **33,1 à 33,4 ms** de p95 (p50 26,1–26,7), les mots seuls 9,6–10,6 ms. Les trois exécutions s'accordent à 1 %. La recherche qui réveille le sens répond par les mots en 12–15 ms ; le réveil coûte 0,43–0,67 s, hors de la recherche. Pour mémoire, le balayage seul, 2026-09-21 — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente. **Modèle taillé et lots triés, 2026-10-08 : au moins 5,78 msg/s, 3 h 33** — un plancher, la passe tournant en priorité minimale sur une machine qui servait |
-| 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | à faire |
+| 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | **NON TENU le 2026-10-09, par construction** — `cargo xtask measure-arrival`, machine au repos : **0,52 à 0,90 s** par arrivée, médiane 0,59 s sur l'exécution la plus stable. Le chargement du modèle **seul** prend 0,24 s, déjà au-dessus du seuil : c'est la décision du 2026-10-08 — un enfant par passage, la mémoire rendue aussitôt — qui le fait payer à chaque arrivée. La décision du démon coûte 1,5 ms. Voir le journal pour les remèdes |
 | 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **TENU sur la passe complète du 2026-10-09, avec 24,6 Mio de marge** — transformeur taillé, trois longs textes par lot : **452,2 Mio** de crête pour 476,8 permis (500 Mo). 8,5 au démarrage, 9,9 store ouvert, 343,3 modèle chargé, 382,3 passe finie. La veille, à quatre longs textes par lot, la même passe crevait de 5 Mio (481,9). Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. **Réserve écrite** : la crête monte encore d'une vingtaine de mébioctets d'un bout à l'autre de la passe — une dérive, devancée et non bornée ; les enfants successifs la borneraient. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | **tenu le 2026-10-08, et verrouillé en CI.** Comportement : un canari sur le bouclage, désigné d'une quarantaine de façons par trois messages hostiles, traverse la vraie moisson, les passes dérivées et la passe de fond dans l'exécutable `maild` relancé — **0 connexion**, contrôles positifs compris (`maild/tests/contenu_hors_ligne.rs`). Surface : l'analyse de source étendue à `mailsmtp`, `mailcal`, `mailvec`, et ni `hf-hub` ni `ureq` dans le graphe. **L'installation du modèle ne fait aucune requête** : `mail model install` dit quoi télécharger et vérifie les empreintes |
 | 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | **deux tiers tenus le 2026-10-08, vérifiés par test** : sans modèle, les mots répondent seuls, et la ligne au-dessus des résultats dit « Aucun modèle n'est installé… » avec la commande `mail model install` — `server.hello` le dit aussi avant toute recherche. **Le démarrage reste à mesurer**, au repos ; par construction rien ne se charge au démarrage, l'enfant du sens ne naît qu'à la première recherche |
@@ -2735,3 +2735,88 @@ tout relire coûterait, à dix envois par jour, 0,7 s de plus par an à **chaque
 sériel du service. L'objet est donc lu pour chaque envoi en cours et pour les vingt derniers
 terminés (`dto::OUTGOING_SUBJECTS_SENT`), et la coquille, qui en montre cinq, le vérifie à la
 compilation. Le test de la borne a son contrôle inverse : sans la borne, il tombe.
+
+### 2026-10-09 (soir) — les mesures de temps, machine au repos : la recherche tient, l'arrivée non
+
+**En clair d'abord.** La recherche par le sens répond en 33 ms au pire courant, sous les 50 du
+critère 2. Un message qui arrive coûte environ 0,6 s de travail de fond, trois fois le seuil du
+critère 4 — et ce n'est pas un réglage raté : charger le modèle prend à lui seul 0,24 s, et le
+modèle est rechargé à chaque arrivée parce qu'on a choisi de ne pas le garder en mémoire. Le
+critère 4 est donc une décision à reprendre, pas un défaut à corriger.
+
+Cette fois l'attente du repos était **bornée** : l'utilisateur absent depuis dix minutes et une
+minute de charge moyenne sous 30 % — le fond de cette machine ne descend jamais sous 15 % —, six
+heures au plus. Elle s'est ouverte à 16 h 50, sur 22,7 % de moyenne.
+
+#### Critère 2 : tenu
+
+Trois exécutions de `measure-semantic-search`, chacune à trois tours dont le premier est jeté :
+
+| | exécution 1 | 2 | 3 |
+|---|---:|---:|---:|
+| hybride, p50 | 26,7 ms | 26,2 | 26,1 |
+| hybride, p95 | **33,4** | **33,2** | **33,1** |
+| mots seuls, p95 | 10,6 | 10,6 | 9,6 |
+| réveil de l'enfant | 673 ms | 445 | 433 |
+
+La dispersion est d'un pour cent sur le p95 : rien à soupçonner. Le premier réveil, plus lent, est
+probablement le cache de pages du système — non vérifié. Aucune recherche ne l'attend :
+la recherche qui réveille répond par les mots en 12 à 15 ms.
+
+#### Critère 4 : non tenu, par construction
+
+Trois exécutions de `measure-arrival`, quatre arrivées chacune, la première jetée :
+
+| | exécution 1 | 2 | 3 |
+|---|---:|---:|---:|
+| arrivées gardées | 607 / 809 / 901 ms | 756 / 542 / 614 | 594 / 524 / 587 |
+| médiane | 809 | 614 | **587** |
+| chargement du modèle seul | 239 | 265 | 239 |
+| passage à vide | 96 | 96 | 95 |
+
+Les deux premières exécutions s'écartent entre elles de 30 % — le symptôme que la méthode demande de
+lire avant la médiane — et la troisième s'accorde avec elle-même à 12 %. C'est elle qui est
+retenue : **0,59 s par arrivée**. Le compte se décompose ainsi : 95 ms pour naître et sortir sans
+rien faire, 240 ms de modèle, et environ 250 ms pour lire le texte, l'encoder et écrire le vecteur.
+
+Le seuil de 200 ms est sous le seul chargement du modèle. Aucun réglage de la passe ne le tiendra
+tant que chaque arrivée relance un enfant. C'est exactement ce que le 2026-10-08 annonçait en
+prenant la décision de rendre la mémoire après chaque passage. Trois sorties, de natures
+différentes :
+
+1. **regrouper les arrivées** : attendre quelques dizaines de secondes avant de lancer l'enfant,
+   pour que plusieurs messages partagent un chargement. Le coût **par message** baisse quand le
+   courrier arrive par vagues ; il ne baisse pas pour un message seul ;
+2. **confier l'arrivée à l'enfant de recherche quand il est chaud** : il garde le modèle cinq
+   minutes après une recherche, et `jobs::Activity` interdit déjà deux copies. Une arrivée
+   pendant qu'on cherche ne coûterait que l'encodage. Hors de ces moments, rien ne change ;
+3. **réécrire le critère** : 0,6 s de travail en priorité minimale, invisible à l'écran, pour un
+   message, contre 3 h 07 pour la passe complète. Le critère disait « à comparer à sa propre
+   passe complète » ; ce rapport, lui, est bon. Mais changer un seuil après la mesure est
+   précisément ce que la méthode du projet interdit sans le dire — il faudrait l'écrire comme tel.
+
+La recommandation est la deuxième, éventuellement avec la première : elle ne coûte aucune mémoire
+de plus et garde la règle d'une seule copie du modèle. La décision revient à l'utilisateur.
+
+#### La fluidité de la coquille refaite
+
+`measure-ui --bench signature`, trois exécutions de trois : **6,1 à 6,5 ms** par image en p95,
+8,8 ms au pire, pour un budget de 16,7. Les neuf relevés s'accordent à 6 %.
+
+#### Le banc du critère 7 a trouvé un défaut, dans le banc puis dans le démon
+
+Il est tombé avant de rien mesurer : « compte 7 incohérent : compte imap sans hôte ». Le corpus de
+mesure porte un compte `imap` sans hôte, et `Store::full_accounts` refuse **le corpus entier** dès
+qu'un compte est incohérent. Le banc l'appelait pour désactiver les comptes de sa réplique ; il les
+désactive maintenant par un `UPDATE` sur la colonne, qui vaut pour tous, cohérents ou non, et relit
+qu'aucun n'est resté actif.
+
+Le même refus global vit dans le démon : `maild::watch::watchable` appelle `full_accounts()?`. **Un
+seul compte incohérent éteint la veille `IDLE` de tous les autres**, et la coquille ne peut plus
+lister les comptes pour envoyer. Le refus est voulu — un hôte vide passé à un résolveur donne un
+diagnostic pire — mais il doit porter sur **le** compte, pas sur tous. `Store::usable_accounts` rend
+ceux qui se lisent et dit chaque refus au journal ; la veille, le facteur, la synchronisation,
+`accounts.list`, `outbox.send`, le carnet et les gestes par compte de la coquille passent par lui.
+`full_accounts` garde le refus global pour qui veut **tous** les comptes : `mail account list`,
+et la page de paramètres, qui doivent dire que la base est abîmée. Un test pose un compte sain et
+un compte cassé ; son contrôle inverse — le chemin tolérant rendu strict — le fait tomber.
