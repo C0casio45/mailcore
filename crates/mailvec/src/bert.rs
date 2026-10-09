@@ -26,11 +26,29 @@
 //! **La mise en commun par la moyenne**, pondérée par le masque d'attention, et **pas** le jeton
 //! `CLS`. C'est ce que fait l'entraînement de `e5` ; prendre `CLS` rendrait des vecteurs
 //! parfaitement formés et sans rapport avec ce que le modèle a appris.
+//!
+//! ## D'autres modèles que `e5`, depuis le 2026-10-09
+//!
+//! Les deux règles ci-dessus sont celles de **`e5`**, pas de tous les modèles. Un autre producteur
+//! entraîne avec d'autres préfixes — ou aucun — et une autre mise en commun ; les appliquer à son
+//! modèle rendrait des vecteurs bien formés et faux, sans rien signaler. Elles se lisent donc
+//! dans les fichiers que le producteur publie à côté des poids, au format de
+//! `sentence-transformers` :
+//!
+//! - **l'architecture** dans `config.json` — `bert`, ou `xlm-roberta` dont les positions
+//!   commencent après le remplissage ;
+//! - **la mise en commun** dans `1_Pooling/config.json` — moyenne ou jeton `CLS` ;
+//! - **les préfixes** dans `config_sentence_transformers.json`, clé `prompts`.
+//!
+//! **Un fichier absent garde la règle de `e5`** : c'est le modèle installé jusqu'ici, et ses trois
+//! fichiers ne portent ni l'un ni l'autre. Un réglage présent mais inconnu — une mise en commun par
+//! le maximum — est **refusé** plutôt qu'approché.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config};
+use candle_transformers::models::xlm_roberta::{Config as XlmConfig, XLMRobertaModel};
 
 use crate::{Error, Result};
 
@@ -59,19 +77,181 @@ pub enum Role {
     Passage,
 }
 
-impl Role {
-    /// Le préfixe que l'entraînement de `e5` attend.
-    const fn prefix(self) -> &'static str {
+/// Les préfixes qu'un modèle a vus à l'entraînement, par rôle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Prompts {
+    query: String,
+    passage: String,
+}
+
+impl Prompts {
+    /// Ceux de `e5`, la règle quand le producteur n'en publie pas.
+    fn e5() -> Self {
+        Self {
+            query: "query: ".to_owned(),
+            passage: "passage: ".to_owned(),
+        }
+    }
+
+    fn of(&self, role: Role) -> &str {
+        match role {
+            Role::Query => &self.query,
+            Role::Passage => &self.passage,
+        }
+    }
+
+    /// Lit `config_sentence_transformers.json`, ou rend ceux de `e5` s'il n'existe pas.
+    ///
+    /// Le document s'appelle `passage` chez `e5` et `document` chez d'autres ; une clé absente
+    /// veut dire « pas de préfixe pour ce rôle », c'est ce que fait `sentence-transformers`.
+    fn read(dir: &Utf8Path) -> Result<Self> {
+        let path = dir.join("config_sentence_transformers.json");
+        if !path.is_file() {
+            return Ok(Self::e5());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&read(dir, "config_sentence_transformers.json")?).map_err(
+                |e| {
+                    model_error(
+                        dir,
+                        format!("config_sentence_transformers.json illisible : {e}"),
+                    )
+                },
+            )?;
+        let prompts = value.get("prompts");
+        let pick = |keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| {
+                    prompts
+                        .and_then(|it| it.get(*key))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Ok(Self {
+            query: pick(&["query"]),
+            passage: pick(&["passage", "document"]),
+        })
+    }
+}
+
+/// Comment les états cachés d'un texte deviennent un vecteur.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pooling {
+    /// La moyenne pondérée par le masque — `e5`.
+    Mean,
+    /// L'état du premier jeton — `granite-embedding`, entre autres.
+    Cls,
+}
+
+impl Pooling {
+    /// Lit `1_Pooling/config.json`, ou rend la moyenne s'il n'existe pas.
+    fn read(dir: &Utf8Path) -> Result<Self> {
+        if !dir.join("1_Pooling").join("config.json").is_file() {
+            return Ok(Self::Mean);
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&read(dir, "1_Pooling/config.json")?)
+                .map_err(|e| model_error(dir, format!("1_Pooling/config.json illisible : {e}")))?;
+        let on = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+        // Un seul mode, et l'un des deux que ce crate calcule. Plusieurs à la fois — que
+        // `sentence-transformers` concatène — ou un autre seraient approchés, donc faux.
+        let modes: Vec<&str> = [
+            "pooling_mode_cls_token",
+            "pooling_mode_mean_tokens",
+            "pooling_mode_max_tokens",
+            "pooling_mode_mean_sqrt_len_tokens",
+            "pooling_mode_weightedmean_tokens",
+            "pooling_mode_lasttoken",
+        ]
+        .into_iter()
+        .filter(|key| on(key))
+        .collect();
+        match modes.as_slice() {
+            ["pooling_mode_cls_token"] => Ok(Self::Cls),
+            ["pooling_mode_mean_tokens"] => Ok(Self::Mean),
+            other => Err(model_error(
+                dir,
+                format!("mise en commun non gérée : {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Le réseau, selon l'architecture que nomme `config.json`.
+enum Network {
+    Bert(BertModel),
+    XlmRoberta(XLMRobertaModel),
+}
+
+impl Network {
+    fn forward(&self, ids: &Tensor, types: &Tensor, mask: &Tensor) -> candle_core::Result<Tensor> {
         match self {
-            Self::Query => "query: ",
-            Self::Passage => "passage: ",
+            Self::Bert(model) => model.forward(ids, types, Some(mask)),
+            Self::XlmRoberta(model) => model.forward(ids, mask, types, None, None, None),
+        }
+    }
+}
+
+/// Ce que `config.json` dit de l'architecture, avant de charger quoi que ce soit.
+enum Architecture {
+    Bert(Config),
+    XlmRoberta(XlmConfig),
+}
+
+impl Architecture {
+    fn read(dir: &Utf8Path) -> Result<Self> {
+        let text = read(dir, "config.json")?;
+        let illegible =
+            |e: serde_json::Error| model_error(dir, format!("config.json illisible : {e}"));
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(illegible)?;
+        match value.get("model_type").and_then(serde_json::Value::as_str) {
+            Some("xlm-roberta") => Ok(Self::XlmRoberta(
+                serde_json::from_str(&text).map_err(illegible)?,
+            )),
+            Some("bert") | None => Ok(Self::Bert(serde_json::from_str(&text).map_err(illegible)?)),
+            Some(other) => Err(model_error(
+                dir,
+                format!("architecture non gérée : {other}"),
+            )),
+        }
+    }
+
+    const fn hidden(&self) -> usize {
+        match self {
+            Self::Bert(config) => config.hidden_size,
+            Self::XlmRoberta(config) => config.hidden_size,
+        }
+    }
+
+    fn pad(&self) -> Option<u32> {
+        match self {
+            Self::Bert(config) => u32::try_from(config.pad_token_id).ok(),
+            Self::XlmRoberta(config) => Some(config.pad_token_id),
+        }
+    }
+
+    /// Combien de jetons la table de positions sait placer.
+    ///
+    /// Les positions d'un `xlm-roberta` **commencent après celle du remplissage** — c'est
+    /// `padding_idx + 1`, et `candle` le calcule ainsi — : sur 514 positions, 512 sont utilisables.
+    /// Prendre 514 ferait déborder la table au premier long texte, à chaque passe.
+    fn positions(&self) -> usize {
+        match self {
+            Self::Bert(config) => config.max_position_embeddings,
+            Self::XlmRoberta(config) => config
+                .max_position_embeddings
+                .saturating_sub(config.pad_token_id as usize + 1),
         }
     }
 }
 
 /// Le transformeur chargé.
 pub struct Bert {
-    model: BertModel,
+    model: Network,
+    pooling: Pooling,
+    prompts: Prompts,
     tokenizer: tokenizers::Tokenizer,
     device: Device,
     dim: usize,
@@ -109,8 +289,9 @@ impl Bert {
             });
         }
 
-        let config: Config = serde_json::from_str(&read(&dir, "config.json")?)
-            .map_err(|source| model_error(&dir, format!("config.json illisible : {source}")))?;
+        let architecture = Architecture::read(&dir)?;
+        let pooling = Pooling::read(&dir)?;
+        let prompts = Prompts::read(&dir)?;
 
         let mut tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json").as_str())
             .map_err(|source| {
@@ -133,7 +314,7 @@ impl Bert {
         // 2026-10-08 en écrivant le test du critère 6 sur le transformeur minuscule des tests.
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: MAX_TOKENS.min(config.max_position_embeddings),
+                max_length: MAX_TOKENS.min(architecture.positions()),
                 ..Default::default()
             }))
             .map_err(|e| model_error(&dir, format!("troncature : {e}")))?;
@@ -150,21 +331,39 @@ impl Bert {
         // vecteurs faits de `NaN` en `f16` : son masque d'attention multiplie zéro par l'infini.
         let weights = dir.join("model.safetensors");
         let (builder, digest) = load_weights(&weights, &device)?;
-        let model = BertModel::load(builder, &config)
-            .map_err(|source| model_error(&dir, format!("poids inexploitables : {source}")))?;
+        let unusable = |source: candle_core::Error| {
+            model_error(&dir, format!("poids inexploitables : {source}"))
+        };
+        let model = match &architecture {
+            Architecture::Bert(config) => {
+                Network::Bert(BertModel::load(builder, config).map_err(unusable)?)
+            }
+            Architecture::XlmRoberta(config) => {
+                Network::XlmRoberta(XLMRobertaModel::new(config, builder).map_err(unusable)?)
+            }
+        };
 
-        let dim = config.hidden_size;
-        let pad = u32::try_from(config.pad_token_id)
-            .map_err(|_| model_error(&dir, "pad_token_id hors limites".to_owned()))?;
+        let dim = architecture.hidden();
+        let pad = architecture
+            .pad()
+            .ok_or_else(|| model_error(&dir, "pad_token_id hors limites".to_owned()))?;
         let identity = crate::pass::Identity {
             name: crate::pass::Identity::name_of(&dir),
             family: "transformeur".to_owned(),
             digest,
         };
 
-        tracing::info!(dir = %dir, dim, digest = %identity.digest, "transformeur chargé");
+        tracing::info!(
+            dir = %dir,
+            dim,
+            ?pooling,
+            digest = %identity.digest,
+            "transformeur chargé"
+        );
         Ok(Self {
             model,
+            pooling,
+            prompts,
             tokenizer,
             device,
             dim,
@@ -201,7 +400,7 @@ impl Bert {
     pub fn tokens(&self, text: &str, role: Role) -> Result<Vec<String>> {
         let encoding = self
             .tokenizer
-            .encode(format!("{}{text}", role.prefix()), true)
+            .encode(format!("{}{text}", self.prompts.of(role)), true)
             .map_err(|e| Error::Encode(format!("tokenisation : {e}")))?;
         encoding
             .get_ids()
@@ -226,7 +425,7 @@ impl Bert {
 
         let prefixed: Vec<String> = texts
             .iter()
-            .map(|text| format!("{}{text}", role.prefix()))
+            .map(|text| format!("{}{text}", self.prompts.of(role)))
             .collect();
 
         let encodings = self
@@ -266,10 +465,14 @@ impl Bert {
                 .map_err(|e| Error::Encode(format!("types de jetons : {e}")))?;
             let hidden = self
                 .model
-                .forward(&ids, &types, Some(&mask))
+                .forward(&ids, &types, &mask)
                 .map_err(|e| Error::Encode(format!("passe avant : {e}")))?;
+            let pooled = match self.pooling {
+                Pooling::Mean => mean_pool(&hidden, &mask, self.dim)?,
+                Pooling::Cls => cls_pool(&hidden, self.dim)?,
+            };
 
-            for (index, vector) in group.iter().zip(mean_pool(&hidden, &mask, self.dim)?) {
+            for (index, vector) in group.iter().zip(pooled) {
                 if let Some(slot) = vectors.get_mut(*index) {
                     *slot = Some(vector);
                 }
@@ -381,6 +584,24 @@ fn mean_pool(hidden: &Tensor, mask: &Tensor, dim: usize) -> Result<Vec<Vec<f32>>
         summed.broadcast_div(&counts)?.to_vec2::<f32>()
     };
     let vectors = pool().map_err(|e| Error::Encode(format!("mise en commun : {e}")))?;
+    if let Some(found) = vectors.iter().map(Vec::len).find(|len| *len != dim) {
+        return Err(Error::Encode(format!(
+            "vecteur de dimension {found}, attendu {dim}"
+        )));
+    }
+    Ok(vectors)
+}
+
+/// L'état caché du premier jeton de chaque texte.
+///
+/// Le remplissage est **à droite** — voir [`Bert::encode_as`] —, donc le premier jeton est
+/// toujours un vrai jeton, le `<s>` ou `[CLS]` que le tokeniseur pose en tête : le masque n'a
+/// rien à exclure ici.
+fn cls_pool(hidden: &Tensor, dim: usize) -> Result<Vec<Vec<f32>>> {
+    let vectors = hidden
+        .i((.., 0, ..))
+        .and_then(|first| first.to_vec2::<f32>())
+        .map_err(|e| Error::Encode(format!("mise en commun : {e}")))?;
     if let Some(found) = vectors.iter().map(Vec::len).find(|len| *len != dim) {
         return Err(Error::Encode(format!(
             "vecteur de dimension {found}, attendu {dim}"
@@ -659,6 +880,121 @@ mod tests {
             bert.encode_as(&text, Role::Passage).unwrap()
         );
         assert_eq!(bert.tokens("bonjour", Role::Query).unwrap()[1], "▁query");
+    }
+
+    /// Le transformeur minuscule, déclaré `xlm-roberta` : mêmes poids, même tokeniseur — le
+    /// remplissage y est déjà `<pad>`, identifiant 1, comme chez `granite-embedding`.
+    fn tiny_xlm(extra: &[(&str, serde_json::Value)]) -> (tempfile::TempDir, Bert) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        tiny_bert(&root, TINY_PIECES);
+        let path = root.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path.as_std_path()).unwrap()).unwrap();
+        config["model_type"] = serde_json::json!("xlm-roberta");
+        config["architectures"] = serde_json::json!(["XLMRobertaModel"]);
+        config["pad_token_id"] = serde_json::json!(1);
+        std::fs::write(path.as_std_path(), config.to_string()).unwrap();
+        for (name, value) in extra {
+            let file = root.join(name);
+            std::fs::create_dir_all(file.parent().unwrap().as_std_path()).unwrap();
+            std::fs::write(file.as_std_path(), value.to_string()).unwrap();
+        }
+        let bert = Bert::load(&root).unwrap();
+        (dir, bert)
+    }
+
+    #[test]
+    fn an_xlm_roberta_model_is_cut_before_its_positions_overflow() {
+        // Ses positions commencent après celle du remplissage : sur 64, 62 sont utilisables. Une
+        // fenêtre à 64 ferait déborder la table au premier long texte — à chaque passe, sur
+        // chaque long message. Le contrôle inverse est `a_long_text_is_cut_at_the_window` : le
+        // même modèle déclaré `bert` coupe à 64.
+        let (_dir, bert) = tiny_xlm(&[]);
+        let long = "bon ".repeat(2 * MAX_TOKENS);
+        assert_eq!(bert.tokens(&long, Role::Passage).unwrap().len(), 62);
+        assert_eq!(bert.encode_as(&[long], Role::Passage).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_first_token_pooling_does_not_depend_on_the_batch() {
+        // Lu dans `1_Pooling/config.json`. La propriété du masque, pour cette mise en commun :
+        // le remplissage est à droite, donc le premier jeton d'un texte court rangé à côté d'un
+        // long reste le sien.
+        let cls =
+            serde_json::json!({"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false});
+        let (_dir, bert) = tiny_xlm(&[("1_Pooling/config.json", cls)]);
+        let short = "bon".to_owned();
+        let long = "bonjour été bonjour été bonjour été 😀".to_owned();
+        let alone = bert
+            .encode_as(std::slice::from_ref(&short), Role::Passage)
+            .unwrap();
+        let beside = bert
+            .encode_as(&[long.clone(), short.clone(), long], Role::Passage)
+            .unwrap();
+        let gap = alone[0]
+            .iter()
+            .zip(&beside[1])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(gap < 1e-5, "écart de {gap}");
+
+        // Et ce n'est pas la moyenne : sans le fichier, le même modèle rend autre chose.
+        let (_mean_dir, mean) = tiny_xlm(&[]);
+        assert_ne!(
+            mean.encode_as(std::slice::from_ref(&short), Role::Passage)
+                .unwrap(),
+            alone
+        );
+    }
+
+    #[test]
+    fn the_prompts_come_from_the_producer_file_and_default_to_e5() {
+        // Sans fichier, les préfixes de `e5` — c'est le modèle installé jusqu'ici.
+        let (_dir, e5) = tiny_xlm(&[]);
+        assert_eq!(e5.tokens("bonjour", Role::Query).unwrap()[1], "▁query");
+        // Un fichier sans préfixe : rien n'est ajouté, dans aucun rôle.
+        let none = serde_json::json!({"prompts": {}});
+        let (_dir2, bare) = tiny_xlm(&[("config_sentence_transformers.json", none)]);
+        assert_ne!(bare.tokens("bonjour", Role::Query).unwrap()[1], "▁query");
+        assert_eq!(
+            bare.tokens("bonjour", Role::Query).unwrap(),
+            bare.tokens("bonjour", Role::Passage).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_pooling_or_an_architecture_this_crate_does_not_compute_is_refused() {
+        // Approcher une mise en commun par une autre rendrait des vecteurs bien formés et faux.
+        let refused = |name: &str, value: serde_json::Value| {
+            let dir = tempfile::tempdir().unwrap();
+            let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+            tiny_bert(&root, TINY_PIECES);
+            let file = root.join(name);
+            std::fs::create_dir_all(file.parent().unwrap().as_std_path()).unwrap();
+            if name == "config.json" {
+                let mut config: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(file.as_std_path()).unwrap())
+                        .unwrap();
+                config["model_type"] = value;
+                std::fs::write(file.as_std_path(), config.to_string()).unwrap();
+            } else {
+                std::fs::write(file.as_std_path(), value.to_string()).unwrap();
+            }
+            Bert::load(&root).expect_err("accepté").to_string()
+        };
+        let max = refused(
+            "1_Pooling/config.json",
+            serde_json::json!({"pooling_mode_max_tokens": true}),
+        );
+        assert!(max.contains("mise en commun"), "{max}");
+        let both = refused(
+            "1_Pooling/config.json",
+            serde_json::json!({"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": true}),
+        );
+        assert!(both.contains("mise en commun"), "{both}");
+        let arch = refused("config.json", serde_json::json!("gpt2"));
+        assert!(arch.contains("architecture"), "{arch}");
     }
 
     #[test]

@@ -54,11 +54,19 @@ pub(crate) struct Loaded {
 
 /// Les types d'éléments que ce lecteur sait lire.
 ///
-/// Deux, parce que ce sont les deux que les modèles du projet portent : les poids en `F32` et les
-/// positions en `I64`. Un autre type est refusé avec son nom plutôt que lu de travers.
+/// Les poids en `F32` et les positions en `I64`, que portent les modèles du projet ; et les poids
+/// en `BF16`, que des modèles publiés portent aussi — `granite-embedding` en est un. Un autre type
+/// est refusé avec son nom plutôt que lu de travers.
+///
+/// ## `BF16` est lu en `F32`
+///
+/// Le calcul se fait en `F32` — voir `bert::Bert::load` sur la demi-précision —, donc un poids
+/// `BF16` est élargi à la lecture. L'élargissement est **exact** : un `BF16` est la moitié haute
+/// d'un `F32`, et le remettre à sa place ne perd rien. La mémoire est celle d'un modèle `F32`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kind {
     F32,
+    BF16,
     I64,
 }
 
@@ -66,6 +74,7 @@ impl Kind {
     fn parse(name: &str) -> Option<Self> {
         match name {
             "F32" => Some(Self::F32),
+            "BF16" => Some(Self::BF16),
             "I64" => Some(Self::I64),
             _ => None,
         }
@@ -75,12 +84,14 @@ impl Kind {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::F32 => "F32",
+            Self::BF16 => "BF16",
             Self::I64 => "I64",
         }
     }
 
     pub(crate) const fn width(self) -> u64 {
         match self {
+            Self::BF16 => 2,
             Self::F32 => 4,
             Self::I64 => 8,
         }
@@ -362,6 +373,18 @@ fn read_tensor<R: Read>(
             })?;
             Tensor::from_vec(values, shape, device)
         }
+        Kind::BF16 => {
+            // Élargi à la lecture : les seize bits d'un `BF16` sont la moitié haute d'un `F32`.
+            let mut values: Vec<f32> = Vec::with_capacity(elements);
+            fill(reader, bytes, buffer, |chunk| {
+                values.extend(chunk.chunks_exact(2).map(|b| {
+                    let mut raw = [0u8; 2];
+                    raw.copy_from_slice(b);
+                    f32::from_bits(u32::from(u16::from_le_bytes(raw)) << 16)
+                }));
+            })?;
+            Tensor::from_vec(values, shape, device)
+        }
         Kind::I64 => {
             let mut values: Vec<i64> = Vec::with_capacity(elements);
             fill(reader, bytes, buffer, |chunk| {
@@ -472,6 +495,37 @@ mod tests {
             };
             assert!(equal, "{name} diffère de ce que candle a écrit");
         }
+    }
+
+    #[test]
+    fn a_bf16_tensor_is_widened_exactly_to_f32() {
+        // Écrit en `BF16` par `candle`, et comparé à **son** élargissement : la référence n'est
+        // pas une formule recopiée du lecteur. Plus grand qu'un morceau de lecture, et des valeurs
+        // qui exercent le signe, les petits exposants et les arrondis du `BF16`.
+        let (_guard, root) = dir();
+        let path = root.join("model.safetensors");
+        let device = Device::Cpu;
+        let source = Tensor::arange(-200_000f32, 200_000f32, &device)
+            .unwrap()
+            .affine(1.0e-3, 0.0)
+            .unwrap();
+        let half = source.to_dtype(DType::BF16).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("w".to_owned(), half.clone());
+        candle_core::safetensors::save(&tensors, path.as_std_path()).unwrap();
+
+        let loaded = load(&path, &Device::Cpu).unwrap();
+        let found = &loaded.tensors["w"];
+        assert_eq!(
+            found.dtype(),
+            DType::F32,
+            "lu dans un autre type que celui du calcul"
+        );
+        let expected = half.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(found.to_vec1::<f32>().unwrap(), expected);
+        // Le contrôle inverse : un `BF16` perd de la précision, donc la valeur d'origine en `F32`
+        // n'est **pas** ce qu'on lit. Sans lui, un lecteur qui renverrait la source passerait.
+        assert_ne!(expected, source.to_vec1::<f32>().unwrap());
     }
 
     #[test]
