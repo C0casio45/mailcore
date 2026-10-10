@@ -3127,3 +3127,55 @@ la leçon du 2026-09-10 de nouveau, un banc qui réimplémente ce qu'il vérifie
 empreintes de ses fichiers dans `mail model install`, déclarer ses réglages — son producteur ne
 publie pas de fichier de préfixes —, et revectoriser le store de production, environ une heure et
 quart d'après la passe mesurée.
+
+### 2026-10-10 — `mail model install` installe granite
+
+**En clair d'abord.** La commande d'installation propose maintenant granite, et plus e5. Elle
+fait télécharger **quatre** fichiers au lieu de trois — 223 Mo au lieu de 488 —, les vérifie, et
+écrit elle-même un cinquième fichier : celui qui dit que le modèle n'a pas de préfixe. Le modèle
+qu'elle installe est **le même, octet pour octet**, que celui qui a été mesuré. Le store de
+production n'est pas touché : il garde e5 et ses vecteurs tant qu'on ne les remplace pas.
+
+**Les quatre fichiers**, à la révision `d6cffd33…` d'`ibm-granite/granite-embedding-107m-multilingual`,
+la tête du dépôt depuis le 2025-08-19 : les poids, le tokeniseur, `config.json`, et
+`1_Pooling/config.json`. Le dernier est nouveau et il n'est pas facultatif : il dit que granite met
+en commun **au premier jeton**, et sans lui le modèle ferait la moyenne — des vecteurs bien formés
+et faux. Il est donc reçu, épinglé et vérifié comme les poids. Les quatre fichiers téléchargés le
+2026-10-09 ont été comparés à ce que Hugging Face publie pour cette révision : SHA-256 pour les
+poids, identifiant de contenu git pour les trois autres — identiques tous les quatre. Leurs
+empreintes BLAKE3 sont dans `mailvec::install::FILES`.
+
+**Le cinquième fichier, écrit par mailcore.** Le producteur ne publie pas de
+`config_sentence_transformers.json`, et sans lui `Bert` applique les préfixes de e5 — c'est ce qui
+a fait tourner granite une nuit avec « query: » et « passage: ». La déclaration
+(`install::DECLARED`) est le fichier exact avec lequel granite a été mesuré. Deux règles :
+
+- **elle est écrite par la taille** (`trim::trim_declaring`), avec les fichiers recopiés et avant
+  `config.json`, pas après l'installation. Posée après, elle laissait un instant où le démon
+  pouvait charger le modèle avec les préfixes de e5 — la course trouvée le matin même pour la
+  vérification des réglages ;
+- **une source qui porte déjà ce fichier est refusée**, même s'il est identique : deux versions du
+  même réglage, et rien pour dire laquelle est vraie. C'est le cas le plus probable, pas un cas
+  d'école — le répertoire où granite a été mesuré en porte un, et la vraie commande l'y a refusé.
+
+**L'empreinte attendue n'est plus celle des poids.** Les poids taillés ont l'empreinte
+`a70907b53c80256d` ; le modèle, avec sa mise en commun et sans préfixe, `c7af5a7f438c4a3c`
+(`install::IDENTITY`). C'est celle-ci que les vecteurs portent, et l'installation la calcule sur la
+source, déclaration par-dessus, **avant d'écrire**. Elle concorde sur trois lectures : un test qui
+la recompose à partir du fichier de mise en commun épinglé ; le chargement du modèle installé, qui
+la recalcule depuis les fichiers posés ; et l'en-tête de `vectors-granite-latin.bin`, écrit par la
+passe mesurée, qui porte `digest=c7af5a7f438c4a3c`. Les trois passent par la même composition
+(`bert::settled`) : elles prouvent que le modèle installé est **celui qui a été mesuré**, pas que
+la composition est juste — ça, c'est le travail de son propre test.
+
+**Vérifié de bout en bout** dans un store jetable, avec la vraie commande et les vrais fichiers :
+sans `--from`, les quatre adresses ; depuis le répertoire de mesure, un refus, et rien d'écrit ;
+depuis une copie propre des quatre fichiers, un modèle dont les cinq fichiers sont **identiques
+au bit** à ceux de `granite-latin`, 114 147 898 octets ; relancée, un refus qui dit comment
+remplacer.
+
+**Remplacer e5 par granite** dans un store déjà équipé : arrêter le démon, retirer `model-bert/`,
+installer, puis `mail vectors --bert --rebuild`. Une installation n'écrase jamais un modèle, et des
+vecteurs de e5 ne se comparent pas à ceux de granite — le magasin les refuse et le dit. Pour le
+store de production, c'est environ une heure et quart de passe. **Pas encore fait** : c'est la
+décision de l'utilisateur.

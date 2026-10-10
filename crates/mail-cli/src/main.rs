@@ -42,11 +42,12 @@ struct Cli {
 /// Les sous-commandes du modèle.
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
-    /// Installe le modèle depuis un répertoire où ses trois fichiers ont été téléchargés.
+    /// Installe le modèle depuis un répertoire où ses fichiers ont été téléchargés.
     ///
     /// Sans `--from`, dit quoi télécharger, d'où, et combien ça pèse.
     Install {
-        /// Le répertoire qui contient `config.json`, `tokenizer.json` et `model.safetensors`.
+        /// Le répertoire des fichiers téléchargés, sous-répertoires gardés — la commande sans
+        /// `--from` les nomme.
         #[arg(long)]
         from: Option<Utf8PathBuf>,
     },

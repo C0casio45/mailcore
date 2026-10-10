@@ -259,6 +259,44 @@ fn images(
 /// réécrire — tout ce qui n'est pas un tokeniseur `Unigram` à post-traitement connu est refusé,
 /// plutôt que réécrit de travers —, ou si la cible est occupée ou non inscriptible.
 pub fn trim(source: &Utf8Path, target: &Utf8Path) -> Result<Report> {
+    trim_declaring(source, target, &[])
+}
+
+/// [`trim`], en écrivant à côté des fichiers recopiés des réglages que la source ne porte pas.
+///
+/// C'est le cas d'un producteur qui ne publie pas ses préfixes : `granite-embedding` n'en a pas,
+/// et sans fichier qui le dise, [`crate::bert::Bert`] appliquerait ceux de `e5`. La déclaration
+/// passe par la taille, et pas par une écriture après elle, pour la règle du tout ou rien : posée
+/// après `config.json`, elle laisserait un instant où le modèle se charge avec les mauvais
+/// préfixes.
+///
+/// # Errors
+///
+/// Celles de [`trim`], et [`Error::Model`] si un réglage déclaré n'est pas l'un de [`CARRIED`], ou
+/// si la source le porte déjà : deux versions du même fichier, et rien pour dire laquelle est
+/// vraie.
+pub fn trim_declaring(
+    source: &Utf8Path,
+    target: &Utf8Path,
+    declared: &[(&str, &str)],
+) -> Result<Report> {
+    for (name, _) in declared {
+        if !CARRIED.contains(name) {
+            return Err(model_error(
+                source,
+                format!("{name} n'est pas un fichier de réglages"),
+            ));
+        }
+        if source.join(name).exists() {
+            return Err(model_error(
+                source,
+                format!(
+                    "{name} est dans la source alors que mailcore l'écrit lui-même — le \
+                     producteur ne le publie pas : retirez-le"
+                ),
+            ));
+        }
+    }
     for name in FILES {
         if !source.join(name).is_file() {
             return Err(model_error(source, format!("{name} absent")));
@@ -294,6 +332,9 @@ pub fn trim(source: &Utf8Path, target: &Utf8Path) -> Result<Report> {
                 .map_err(|e| model_error(source, format!("{name} : {e}")))?;
             carried.push((name, bytes));
         }
+    }
+    for (name, text) in declared {
+        carried.push((*name, text.as_bytes().to_vec()));
     }
 
     std::fs::create_dir_all(target.as_std_path())

@@ -105,17 +105,20 @@ impl Prompts {
     /// Le document s'appelle `passage` chez `e5` et `document` chez d'autres ; une clé absente
     /// veut dire « pas de préfixe pour ce rôle », c'est ce que fait `sentence-transformers`.
     fn read(dir: &Utf8Path) -> Result<Self> {
-        let path = dir.join(SETTINGS[1]);
-        if !path.is_file() {
+        Self::parse(dir, read_setting(dir, SETTINGS[1])?.as_deref())
+    }
+
+    /// Le même, sur le texte du fichier — `None` s'il n'existe pas.
+    fn parse(dir: &Utf8Path, text: Option<&str>) -> Result<Self> {
+        let Some(text) = text else {
             return Ok(Self::e5());
-        }
-        let value: serde_json::Value =
-            serde_json::from_str(&read(dir, SETTINGS[1])?).map_err(|e| {
-                model_error(
-                    dir,
-                    format!("config_sentence_transformers.json illisible : {e}"),
-                )
-            })?;
+        };
+        let value: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+            model_error(
+                dir,
+                format!("config_sentence_transformers.json illisible : {e}"),
+            )
+        })?;
         let prompts = value.get("prompts");
         let pick = |keys: &[&str]| {
             keys.iter()
@@ -146,10 +149,15 @@ enum Pooling {
 impl Pooling {
     /// Lit `1_Pooling/config.json`, ou rend la moyenne s'il n'existe pas.
     fn read(dir: &Utf8Path) -> Result<Self> {
-        if !dir.join(SETTINGS[0]).is_file() {
+        Self::parse(dir, read_setting(dir, SETTINGS[0])?.as_deref())
+    }
+
+    /// Le même, sur le texte du fichier — `None` s'il n'existe pas.
+    fn parse(dir: &Utf8Path, text: Option<&str>) -> Result<Self> {
+        let Some(text) = text else {
             return Ok(Self::Mean);
-        }
-        let value: serde_json::Value = serde_json::from_str(&read(dir, SETTINGS[0])?)
+        };
+        let value: serde_json::Value = serde_json::from_str(text)
             .map_err(|e| model_error(dir, format!("1_Pooling/config.json illisible : {e}")))?;
         let on = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
         // Un seul mode, et l'un des deux que ce crate calcule. Plusieurs à la fois — que
@@ -176,21 +184,33 @@ impl Pooling {
     }
 }
 
-/// L'empreinte qu'aurait un modèle de ces poids avec les réglages de `dir`, sans le charger.
+/// L'empreinte qu'aurait un modèle de ces poids avec les réglages de `dir`, sans le charger —
+/// `declared` remplaçant ceux de `dir` qu'il nomme.
 ///
-/// Les mêmes lectures que [`Bert::load`], donc la même réponse : c'est ce qui permet à
+/// Les mêmes analyses que [`Bert::load`], donc la même réponse : c'est ce qui permet à
 /// l'installation de refuser des réglages **avant** d'écrire dans le store, où le démon chargerait
-/// le modèle pendant qu'on le vérifie.
+/// le modèle pendant qu'on le vérifie. `declared` est ce que l'installation écrira elle-même à
+/// côté des fichiers reçus — les préfixes que le producteur ne publie pas.
 ///
 /// # Errors
 ///
 /// [`Error::Model`] si un fichier de réglages de `dir` est illisible ou demande une mise en commun
 /// que ce crate ne calcule pas.
-pub(crate) fn settled_in(dir: &Utf8Path, weights: &str) -> Result<String> {
+pub(crate) fn settled_in(
+    dir: &Utf8Path,
+    weights: &str,
+    declared: &[(&str, &str)],
+) -> Result<String> {
+    let setting = |name: &str| -> Result<Option<String>> {
+        match declared.iter().find(|(declared, _)| *declared == name) {
+            Some((_, text)) => Ok(Some((*text).to_owned())),
+            None => read_setting(dir, name),
+        }
+    };
     Ok(settled(
         weights.to_owned(),
-        Pooling::read(dir)?,
-        &Prompts::read(dir)?,
+        Pooling::parse(dir, setting(SETTINGS[0])?.as_deref())?,
+        &Prompts::parse(dir, setting(SETTINGS[1])?.as_deref())?,
     ))
 }
 
@@ -667,6 +687,15 @@ fn tensor(values: &[u32], rows: usize, cols: usize, device: &Device) -> Result<T
 fn read(dir: &Utf8Path, name: &str) -> Result<String> {
     std::fs::read_to_string(dir.join(name).as_std_path())
         .map_err(|source| model_error(dir, format!("{name} : {source}")))
+}
+
+/// Lit un fichier de réglages, `None` s'il n'existe pas : chacun est facultatif.
+fn read_setting(dir: &Utf8Path, name: &str) -> Result<Option<String>> {
+    if dir.join(name).is_file() {
+        read(dir, name).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Monte les poids `safetensors`, et rend leur empreinte.

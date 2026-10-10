@@ -5,37 +5,58 @@
 //! `docs/PHASE-4.md` n'accorde au projet qu'une requête réseau : l'installation du modèle, sur
 //! une commande tapée par un humain, qui dit d'abord ce qu'elle va chercher, où, et combien ça
 //! pèse. Ce module va plus loin que ce que la phase permet, et c'est voulu : **il ne télécharge
-//! pas du tout.** Il dit quoi télécharger et d'où — trois fichiers d'une révision épinglée —, et
+//! pas du tout.** Il dit quoi télécharger et d'où — quatre fichiers d'une révision épinglée —, et
 //! l'humain les récupère avec l'outil de son choix. Le produit n'embarque ainsi aucun client
-//! réseau pour un fichier de 470 Mo, et « zéro requête » reste vrai par construction, comme dans
+//! réseau pour un fichier de 214 Mo, et « zéro requête » reste vrai par construction, comme dans
 //! `mailcal`.
+//!
+//! ## Quel modèle, depuis le 2026-10-10
+//!
+//! **`granite-embedding-107m-multilingual`**, d'IBM, à la place de `multilingual-e5-small`. Il
+//! l'a remplacé selon une règle écrite avant la mesure — six conditions, six tenues : voir
+//! l'entrée du 2026-10-10 de `docs/PHASE-4.md`. Deux choses le distinguent de `e5` pour
+//! l'installation :
+//!
+//! - **il met en commun au premier jeton**, ce que dit `1_Pooling/config.json`. Ce fichier est
+//!   donc un fichier **reçu**, épinglé et vérifié comme les poids : sans lui, le modèle ferait la
+//!   moyenne et rendrait des vecteurs bien formés et faux ;
+//! - **il n'a pas de préfixe**, et son producteur ne publie aucun fichier qui le dise. Sans
+//!   fichier, [`crate::bert::Bert`] applique ceux de `e5`. La déclaration est donc **écrite par
+//!   mailcore** — [`DECLARED`] —, d'après la fiche du modèle, qui encode requêtes et passages tels
+//!   quels ; c'est le réglage mesuré.
 //!
 //! ## Ce qui est vérifié
 //!
 //! **Chaque fichier reçu, octet par octet, contre une empreinte écrite ici.** Un modèle est du code
 //! exécuté sur tout le corpus : un fichier altéré en route est le plus gros trou que le projet
-//! puisse ouvrir. Les empreintes BLAKE3 ci-dessous ont été calculées le 2026-10-08 sur des fichiers
-//! dont les SHA-256 ont été comparés, le même jour, à ceux que Hugging Face publie pour cette
-//! révision — identiques pour les poids et le tokeniseur ; `config.json`, hors LFS, a le même
-//! identifiant de contenu git.
+//! puisse ouvrir. Les empreintes BLAKE3 ci-dessous ont été calculées le 2026-10-10 sur des fichiers
+//! comparés, le même jour, à ce que Hugging Face publie pour cette révision : le SHA-256 pour les
+//! poids, l'identifiant de contenu git pour les trois autres, hors LFS — identiques tous les quatre.
 //!
 //! Puis **le modèle taillé** — voir [`crate::trim`] —, contre sa propre empreinte : la taille ne
 //! dépend que de sa source, donc son résultat aussi est une constante. Une empreinte qui ne
 //! correspond pas fait retirer ce qui a été écrit.
 //!
-//! Et **les réglages de la source**, avant toute écriture. La taille recopie la mise en commun et
-//! les préfixes tels quels, que la révision épinglée ne publie pas tous et qu'aucune empreinte
-//! ci-dessous ne couvre : un `config_sentence_transformers.json` égaré dans le répertoire source
-//! ôterait à `e5` ses préfixes, en silence, sur chaque vecteur. L'empreinte d'identité nomme les
-//! poids **et** ces réglages, et elle n'est celle des poids seuls qu'avec les réglages de `e5` :
-//! la calculer sur la source et la comparer à l'empreinte attendue couvre tout ce qui fait un
-//! vecteur. Trouvé par une relecture le 2026-10-10.
+//! Et **l'empreinte d'identité**, avant toute écriture : celle que porteront les vecteurs, qui
+//! nomme les poids **et** ce qui en fait un vecteur — mise en commun et préfixes. Elle se calcule
+//! sur la source, la déclaration de mailcore par-dessus, et se compare à [`IDENTITY`]. Elle couvre
+//! un fichier de réglages qui n'est ni reçu ni déclaré, et que la taille recopierait tel quel —
+//! trouvé par une relecture le 2026-10-10, quand le modèle installé était `e5`, qui n'épinglait
+//! aucun des deux.
+//!
+//! **Avec granite, elle ne voit plus de fichier égaré**, et ce n'est pas elle qui le refuse : la
+//! mise en commun est reçue, donc vérifiée par son empreinte, et un fichier de préfixes dans la
+//! source est **masqué** par la déclaration dans ce calcul. C'est
+//! [`crate::trim::trim_declaring`] qui le refuse, avant toute écriture — deux versions du même
+//! réglage. Ce refus n'est donc pas redondant avec le contrôle d'identité : sans lui, le fichier
+//! serait mis en place deux fois, et le second renommage échouerait après les premiers.
 //!
 //! **Sur la source, pas sur le modèle installé.** La première correction chargeait le modèle
 //! taillé pour lire son empreinte — donc après l'avoir mis où le démon regarde, qui pouvait le
 //! charger pendant les secondes de la vérification et vectoriser avec des réglages qu'on allait
 //! refuser. La seconde relecture l'a vu ; la règle est celle de la taille, tout ce qui peut être
-//! refusé l'est avant la première écriture.
+//! refusé l'est avant la première écriture. La déclaration suit la même règle : elle est écrite
+//! **par** la taille, avant `config.json`, et pas après elle.
 
 use std::io::Read;
 
@@ -44,15 +65,15 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::{Error, Result};
 
 /// Le modèle installable, et la révision épinglée d'où viennent ses fichiers.
-pub const REPOSITORY: &str = "intfloat/multilingual-e5-small";
+pub const REPOSITORY: &str = "ibm-granite/granite-embedding-107m-multilingual";
 
 /// La révision de [`REPOSITORY`], un commit : une branche bougerait sous l'empreinte.
-pub const REVISION: &str = "614241f622f53c4eeff9890bdc4f31cfecc418b3";
+pub const REVISION: &str = "d6cffd338414d6a1c1f5decfad5fec62eebc90d5";
 
 /// Un fichier à recevoir.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Expected {
-    /// Son nom, dans le répertoire source et dans le dépôt.
+    /// Son chemin, relatif au répertoire source comme au dépôt.
     pub name: &'static str,
     /// Sa taille exacte, en octets — vérifiée d'abord, parce qu'elle coûte un `stat`.
     pub size: u64,
@@ -60,34 +81,79 @@ pub struct Expected {
     pub blake3: &'static str,
 }
 
-/// Les trois fichiers de la révision épinglée.
-pub const FILES: [Expected; 3] = [
+/// Les quatre fichiers de la révision épinglée.
+pub const FILES: [Expected; 4] = [
     Expected {
         name: "config.json",
-        size: 655,
-        blake3: "008002d237332c95ffe7c26426ce14366bba14b85a7980f9c84992eb2c756242",
+        size: 697,
+        blake3: "36eba5e7532f0c13224ded7f0f16808246f11f0683b49332f8fb9e1739b17dd7",
     },
     Expected {
         name: "tokenizer.json",
-        size: 17_082_730,
-        blake3: "8e30c0bbbb7ebc0f4b46034ecfcb413f69e2b1c3aef9dfbb421c607f2355bad2",
+        size: 9_081_382,
+        blake3: "de0fd147e1d2a523a8f5a0ffe7444463add507c8bc8c716be0d8bd21f966db82",
     },
     Expected {
         name: "model.safetensors",
-        size: 470_641_600,
-        blake3: "a02bcc5c7b413904935968d95ceea52053ade797b1d2081d590d72ba4b2471c3",
+        size: 214_000_232,
+        blake3: "74309808c75696d692701ba2bf1fccc26102ce78f26c1796e99d16e98ccd9171",
+    },
+    Expected {
+        name: "1_Pooling/config.json",
+        size: 191,
+        blake3: "a3f861aba8c4d402f4a127f6d019aa6e47475542024bd994c5f4a80dd354fb8d",
     },
 ];
+
+/// Les réglages que mailcore écrit lui-même, faute de producteur qui les publie : `(chemin,
+/// contenu)`.
+///
+/// Les préfixes vides de `granite-embedding`, octet pour octet le fichier avec lequel il a été
+/// mesuré.
+pub const DECLARED: [(&str, &str); 1] = [(
+    "config_sentence_transformers.json",
+    "{\n  \"_origine\": \"écrit par mailcore le 2026-10-10 d'après la fiche du modèle, qui encode \
+     requêtes et passages sans préfixe ; le producteur ne publie pas ce fichier\",\n  \
+     \"prompts\": {}\n}\n",
+)];
 
 /// L'empreinte des poids taillés, au format de la provenance : seize caractères BLAKE3.
 ///
 /// **À mettre à jour en même temps que la règle de [`crate::trim`]** : `cargo xtask
 /// model-trim-bert` l'imprime. Une règle changée sans elle fait refuser toutes les installations,
 /// ce qui est le bon sens de l'échec.
-pub const TRIMMED_DIGEST: &str = "a043ccf1d02843c5";
+pub const TRIMMED_DIGEST: &str = "a70907b53c80256d";
 
-/// Ce que le modèle taillé occupe sur le disque, ses trois fichiers ensemble — pour le dire avant.
-pub const TRIMMED_BYTES: u64 = 266_777_950;
+/// L'empreinte d'identité du modèle installé, celle que portent ses vecteurs : les poids taillés,
+/// la mise en commun au premier jeton, aucun préfixe.
+///
+/// Elle n'est celle des poids seuls qu'avec les réglages de `e5` — c'était le cas jusqu'au
+/// 2026-10-10, et ce ne l'est plus.
+pub const IDENTITY: &str = "c7af5a7f438c4a3c";
+
+/// Ce que le modèle taillé occupe sur le disque, ses cinq fichiers ensemble — pour le dire avant.
+pub const TRIMMED_BYTES: u64 = 114_147_898;
+
+/// Ce qu'une installation vérifie, et ce qu'elle doit obtenir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pinned<'a> {
+    /// Les fichiers reçus.
+    pub files: &'a [Expected],
+    /// Les réglages que mailcore écrit à côté : `(chemin, contenu)`.
+    pub declared: &'a [(&'a str, &'a str)],
+    /// L'empreinte des poids taillés.
+    pub trimmed: &'a str,
+    /// L'empreinte d'identité du modèle installé.
+    pub identity: &'a str,
+}
+
+/// Le modèle que [`install`] installe.
+pub const PINNED: Pinned<'static> = Pinned {
+    files: &FILES,
+    declared: &DECLARED,
+    trimmed: TRIMMED_DIGEST,
+    identity: IDENTITY,
+};
 
 /// L'adresse d'un fichier de la révision épinglée.
 #[must_use]
@@ -102,6 +168,8 @@ pub struct Installed {
     pub target: Utf8PathBuf,
     /// Le bilan de la taille.
     pub trim: crate::trim::Report,
+    /// L'empreinte d'identité du modèle installé, celle que porteront ses vecteurs.
+    pub identity: String,
 }
 
 /// L'empreinte BLAKE3 complète d'un fichier, lu par morceaux.
@@ -126,7 +194,7 @@ pub fn blake3_of(path: &Utf8Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Vérifie les trois fichiers de `source` contre [`FILES`].
+/// Vérifie les fichiers de `source` contre `expected`.
 ///
 /// # Errors
 ///
@@ -163,13 +231,14 @@ pub fn verify(source: &Utf8Path, expected: &[Expected]) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Model`] si un fichier source ne correspond pas, si un modèle est déjà installé, ou si
-/// le modèle taillé n'a pas l'empreinte attendue — auquel cas ce qui a été écrit est retiré.
+/// [`Error::Model`] si un fichier source ne correspond pas, si les réglages de la source changent
+/// le modèle, si un modèle est déjà installé, ou si le modèle taillé n'a pas l'empreinte attendue
+/// — auquel cas ce qui a été écrit est retiré.
 pub fn install(source: &Utf8Path, root: &Utf8Path) -> Result<Installed> {
-    install_checked(source, root, &FILES, TRIMMED_DIGEST)
+    install_checked(source, root, &PINNED)
 }
 
-/// [`install`] contre des empreintes données — pour les tests, sur un modèle minuscule.
+/// [`install`] contre un modèle épinglé donné — pour les tests, sur un modèle minuscule.
 ///
 /// # Errors
 ///
@@ -177,37 +246,41 @@ pub fn install(source: &Utf8Path, root: &Utf8Path) -> Result<Installed> {
 pub fn install_checked(
     source: &Utf8Path,
     root: &Utf8Path,
-    expected: &[Expected],
-    trimmed: &str,
+    pinned: &Pinned<'_>,
 ) -> Result<Installed> {
-    verify(source, expected)?;
-    // L'empreinte attendue est celle des poids seuls, donc celle d'un modèle aux réglages de `e5`.
-    let settled = crate::bert::settled_in(source, trimmed)?;
-    if settled != trimmed {
+    verify(source, pinned.files)?;
+    // Ce que porteront les vecteurs : les poids, et les réglages de la source sous la déclaration.
+    let identity = crate::bert::settled_in(source, pinned.trimmed, pinned.declared)?;
+    if identity != pinned.identity {
         return Err(model_error(
             source,
             format!(
-                "les réglages de la source ({}) ne sont pas ceux de {REPOSITORY} et en \
-                 changeraient chaque vecteur : la révision épinglée ne les publie pas ainsi, \
-                 retirez-les — rien n'a été écrit",
-                crate::bert::SETTINGS.join(", ")
+                "les réglages de la source ({}) feraient un autre modèle que {REPOSITORY} — \
+                 empreinte {identity}, {} attendue — et en changeraient chaque vecteur : la \
+                 révision épinglée ne les publie pas ainsi, retirez-les — rien n'a été écrit",
+                crate::bert::SETTINGS.join(", "),
+                pinned.identity
             ),
         ));
     }
     let target = crate::bert::default_dir(root);
-    let trim = crate::trim::trim(source, &target)?;
-    if trim.digest != trimmed {
+    let trim = crate::trim::trim_declaring(source, &target, pinned.declared)?;
+    if trim.digest != pinned.trimmed {
         discard(&target);
         return Err(model_error(
             &target,
             format!(
-                "modèle taillé d'empreinte {}, {trimmed} attendue : la règle de taille a changé \
-                 sans que l'empreinte suive",
-                trim.digest
+                "modèle taillé d'empreinte {}, {} attendue : la règle de taille a changé sans que \
+                 l'empreinte suive",
+                trim.digest, pinned.trimmed
             ),
         ));
     }
-    Ok(Installed { target, trim })
+    Ok(Installed {
+        target,
+        trim,
+        identity,
+    })
 }
 
 /// Retire tout ce qu'une installation refusée a écrit : rien qui ressemble à un modèle ne doit
@@ -230,35 +303,78 @@ fn model_error(path: &Utf8Path, reason: String) -> Error {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{Expected, blake3_of, install_checked};
+    use super::{DECLARED, Expected, FILES, IDENTITY, Pinned, TRIMMED_DIGEST, blake3_of};
+    use super::{install_checked, verify};
+    use crate::bert::{Bert, Role};
+    use crate::pass::Encoder;
     use crate::testing::{TINY_PIECES, tiny_bert};
-    use camino::Utf8PathBuf;
+    use camino::{Utf8Path, Utf8PathBuf};
 
-    /// Le transformeur minuscule, et ses empreintes réelles.
-    fn source() -> (tempfile::TempDir, Utf8PathBuf, Vec<Expected>) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
-        let source = root.join("source");
-        tiny_bert(&source, TINY_PIECES);
-        let expected = ["config.json", "tokenizer.json", "model.safetensors"]
-            .into_iter()
+    /// Le `1_Pooling/config.json` de la révision épinglée, mot pour mot.
+    const CLS: &str = "{\n  \"word_embedding_dimension\": 384,\n  \"pooling_mode_cls_token\": \
+                       true,\n  \"pooling_mode_mean_tokens\": false,\n  \
+                       \"pooling_mode_max_tokens\": false,\n  \
+                       \"pooling_mode_mean_sqrt_len_tokens\": false\n}\n";
+
+    /// Ajoute un fichier à la source.
+    fn with_setting(root: &Utf8Path, name: &str, text: &str) {
+        let path = root.join("source").join(name);
+        std::fs::create_dir_all(path.parent().unwrap().as_std_path()).unwrap();
+        std::fs::write(path.as_std_path(), text).unwrap();
+    }
+
+    /// Les empreintes réelles des fichiers `names` de la source.
+    fn expected(root: &Utf8Path, names: &[&'static str]) -> Vec<Expected> {
+        names
+            .iter()
             .map(|name| {
-                let path = source.join(name);
+                let path = root.join("source").join(name);
                 Expected {
                     name,
                     size: std::fs::metadata(path.as_std_path()).unwrap().len(),
                     blake3: Box::leak(blake3_of(&path).unwrap().into_boxed_str()),
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    const RECEIVED: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+
+    /// Le transformeur minuscule, aux réglages de `e5`, et ses empreintes réelles.
+    fn source() -> (tempfile::TempDir, Utf8PathBuf, Vec<Expected>) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        tiny_bert(&root.join("source"), TINY_PIECES);
+        let expected = expected(&root, &RECEIVED);
         (dir, root, expected)
     }
 
-    fn trimmed_digest(root: &Utf8PathBuf) -> String {
+    /// Le même, avec la mise en commun reçue et les préfixes déclarés de la révision épinglée :
+    /// la forme de l'installation de `granite-embedding`.
+    fn granite_like() -> (tempfile::TempDir, Utf8PathBuf, Vec<Expected>) {
+        let (dir, root, _) = source();
+        with_setting(&root, "1_Pooling/config.json", CLS);
+        let mut names = RECEIVED.to_vec();
+        names.push("1_Pooling/config.json");
+        let expected = expected(&root, &names);
+        (dir, root, expected)
+    }
+
+    fn trimmed_digest(root: &Utf8Path) -> String {
         let probe = root.join("probe");
         crate::trim::trim(&root.join("source"), &probe)
             .unwrap()
             .digest
+    }
+
+    /// Un modèle aux réglages de `e5` : son identité est l'empreinte de ses poids.
+    fn e5_like<'a>(files: &'a [Expected], digest: &'a str) -> Pinned<'a> {
+        Pinned {
+            files,
+            declared: &[],
+            trimmed: digest,
+            identity: digest,
+        }
     }
 
     #[test]
@@ -266,9 +382,11 @@ mod tests {
         let (_dir, root, expected) = source();
         let digest = trimmed_digest(&root);
         let store = root.join("store");
-        let installed = install_checked(&root.join("source"), &store, &expected, &digest).unwrap();
+        let installed =
+            install_checked(&root.join("source"), &store, &e5_like(&expected, &digest)).unwrap();
         assert_eq!(installed.target, crate::bert::default_dir(&store));
-        crate::bert::Bert::load(&installed.target).unwrap();
+        assert_eq!(installed.identity, digest);
+        Bert::load(&installed.target).unwrap();
     }
 
     #[test]
@@ -283,7 +401,7 @@ mod tests {
         std::fs::write(weights.as_std_path(), bytes).unwrap();
 
         let store = root.join("store");
-        let error = install_checked(&root.join("source"), &store, &expected, &digest)
+        let error = install_checked(&root.join("source"), &store, &e5_like(&expected, &digest))
             .unwrap_err()
             .to_string();
         assert!(error.contains("empreinte"), "{error}");
@@ -294,7 +412,8 @@ mod tests {
     fn a_trim_that_drifted_from_its_digest_leaves_no_model() {
         let (_dir, root, expected) = source();
         let store = root.join("store");
-        let error = install_checked(&root.join("source"), &store, &expected, "0000000000000000")
+        let drifted = "0000000000000000";
+        let error = install_checked(&root.join("source"), &store, &e5_like(&expected, drifted))
             .unwrap_err()
             .to_string();
         assert!(error.contains("règle de taille"), "{error}");
@@ -303,13 +422,6 @@ mod tests {
                 .join("config.json")
                 .exists()
         );
-    }
-
-    /// Ajoute un fichier de réglages à la source, que les empreintes reçues ne couvrent pas.
-    fn with_setting(root: &Utf8PathBuf, name: &str, value: &serde_json::Value) {
-        let path = root.join("source").join(name);
-        std::fs::create_dir_all(path.parent().unwrap().as_std_path()).unwrap();
-        std::fs::write(path.as_std_path(), value.to_string()).unwrap();
     }
 
     #[test]
@@ -321,10 +433,10 @@ mod tests {
         with_setting(
             &root,
             "config_sentence_transformers.json",
-            &serde_json::json!({"prompts": {}}),
+            r#"{"prompts": {}}"#,
         );
         let store = root.join("store");
-        let error = install_checked(&root.join("source"), &store, &expected, &digest)
+        let error = install_checked(&root.join("source"), &store, &e5_like(&expected, &digest))
             .unwrap_err()
             .to_string();
         assert!(error.contains("réglages"), "{error}");
@@ -340,10 +452,10 @@ mod tests {
         with_setting(
             &root,
             "1_Pooling/config.json",
-            &serde_json::json!({"pooling_mode_max_tokens": true}),
+            r#"{"pooling_mode_max_tokens": true}"#,
         );
         let store = root.join("store");
-        let error = install_checked(&root.join("source"), &store, &expected, &digest)
+        let error = install_checked(&root.join("source"), &store, &e5_like(&expected, &digest))
             .unwrap_err()
             .to_string();
         assert!(error.contains("mise en commun"), "{error}");
@@ -351,21 +463,118 @@ mod tests {
     }
 
     #[test]
-    fn the_settings_the_pinned_revision_publishes_are_accepted() {
-        // Le contrôle inverse : la révision épinglée publie `1_Pooling/config.json`, en moyenne.
-        // Un instantané complet du dépôt doit s'installer, et rendre le même modèle.
+    fn a_settings_file_that_changes_nothing_is_accepted() {
+        // Le contrôle inverse : la révision de `e5` publiait `1_Pooling/config.json`, en moyenne.
+        // Un fichier qui redit le réglage par défaut ne change pas le modèle, et s'installe.
         let (_dir, root, expected) = source();
         let digest = trimmed_digest(&root);
-        let mean = serde_json::json!({
-            "word_embedding_dimension": 8,
-            "pooling_mode_cls_token": false,
-            "pooling_mode_mean_tokens": true,
-            "pooling_mode_max_tokens": false,
-            "pooling_mode_mean_sqrt_len_tokens": false
-        });
-        with_setting(&root, "1_Pooling/config.json", &mean);
+        with_setting(
+            &root,
+            "1_Pooling/config.json",
+            r#"{"pooling_mode_cls_token": false, "pooling_mode_mean_tokens": true}"#,
+        );
         let store = root.join("store");
-        let installed = install_checked(&root.join("source"), &store, &expected, &digest).unwrap();
+        let installed =
+            install_checked(&root.join("source"), &store, &e5_like(&expected, &digest)).unwrap();
         assert!(installed.target.join("1_Pooling/config.json").is_file());
+    }
+
+    #[test]
+    fn the_declared_prompts_are_installed_and_name_the_model() {
+        let (_dir, root, expected) = granite_like();
+        let digest = trimmed_digest(&root);
+        let source = root.join("source");
+        let identity = crate::bert::settled_in(&source, &digest, &DECLARED).unwrap();
+        let pinned = Pinned {
+            files: &expected,
+            declared: &DECLARED,
+            trimmed: &digest,
+            identity: &identity,
+        };
+        let store = root.join("store");
+        let installed = install_checked(&source, &store, &pinned).unwrap();
+
+        // La déclaration est écrite telle quelle, à côté de la mise en commun reçue.
+        let (name, text) = DECLARED[0];
+        let written = std::fs::read_to_string(installed.target.join(name).as_std_path()).unwrap();
+        assert_eq!(written, text);
+        assert!(installed.target.join("1_Pooling/config.json").is_file());
+        // Le modèle chargé — par l'autre chemin, celui du démon — est celui qu'on attendait : ni
+        // les préfixes de `e5`, ni l'empreinte des poids seuls.
+        let model = Bert::load(&installed.target).unwrap();
+        assert_eq!(model.identity().digest, installed.identity);
+        assert_ne!(installed.identity, digest);
+        let tokens = model.tokens("bonjour", Role::Query).unwrap();
+        assert_eq!(tokens[1], "▁bon", "{tokens:?}");
+    }
+
+    #[test]
+    fn a_prompts_file_beside_the_declared_one_is_refused_before_anything_is_written() {
+        // Même identique à la déclaration : deux versions du même fichier, et rien pour dire
+        // laquelle est vraie. Le répertoire où granite a été mesuré en porte une — c'est le cas
+        // le plus probable.
+        let (_dir, root, expected) = granite_like();
+        let digest = trimmed_digest(&root);
+        let source = root.join("source");
+        let identity = crate::bert::settled_in(&source, &digest, &DECLARED).unwrap();
+        with_setting(&root, DECLARED[0].0, DECLARED[0].1);
+        let pinned = Pinned {
+            files: &expected,
+            declared: &DECLARED,
+            trimmed: &digest,
+            identity: &identity,
+        };
+        let store = root.join("store");
+        let error = install_checked(&source, &store, &pinned)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("retirez-le"), "{error}");
+        assert!(!crate::bert::default_dir(&store).exists());
+    }
+
+    #[test]
+    fn a_missing_pooling_file_is_refused() {
+        // Sans `1_Pooling/config.json`, le modèle ferait la moyenne : c'est un fichier reçu, et
+        // son absence se voit avant toute écriture.
+        let (_dir, root, expected) = granite_like();
+        let digest = trimmed_digest(&root);
+        let source = root.join("source");
+        let identity = crate::bert::settled_in(&source, &digest, &DECLARED).unwrap();
+        std::fs::remove_file(source.join("1_Pooling/config.json").as_std_path()).unwrap();
+        let pinned = Pinned {
+            files: &expected,
+            declared: &DECLARED,
+            trimmed: &digest,
+            identity: &identity,
+        };
+        let store = root.join("store");
+        let error = install_checked(&source, &store, &pinned)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("absent"), "{error}");
+        assert!(!crate::bert::default_dir(&store).exists());
+    }
+
+    #[test]
+    fn the_pinned_constants_agree_with_each_other() {
+        // La mise en commun de la révision épinglée est bien celle que `FILES` attend…
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        with_setting(&root, "1_Pooling/config.json", CLS);
+        let source = root.join("source");
+        let pooling = FILES
+            .iter()
+            .filter(|file| file.name == "1_Pooling/config.json")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(pooling.len(), 1);
+        verify(&source, &pooling).unwrap();
+        // … et avec elle et la déclaration, les poids taillés donnent l'identité écrite : changer
+        // l'une des trois sans les autres fait tomber ce test, pas une installation.
+        assert_eq!(
+            crate::bert::settled_in(&source, TRIMMED_DIGEST, &DECLARED).unwrap(),
+            IDENTITY
+        );
+        assert_ne!(IDENTITY, TRIMMED_DIGEST);
     }
 }
