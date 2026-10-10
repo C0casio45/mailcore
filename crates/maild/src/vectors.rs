@@ -594,12 +594,11 @@ struct Fingerprint(Vec<Option<(u64, std::time::SystemTime)>>);
 impl Fingerprint {
     fn of(root: &Utf8Path) -> Self {
         let model = mailvec::bert::default_dir(root);
-        let files: Vec<Utf8PathBuf> = vec![
-            model.join("model.safetensors"),
-            model.join("config.json"),
-            model.join("tokenizer.json"),
-            root.join("vectors.bin"),
-        ];
+        let files: Vec<Utf8PathBuf> = mailvec::bert::MODEL_FILES
+            .iter()
+            .map(|name| model.join(name))
+            .chain([root.join("vectors.bin")])
+            .collect();
         Self(
             files
                 .iter()
@@ -899,7 +898,30 @@ fn command(program: &std::path::Path, root: &Utf8Path) -> Command {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{Explicit, Failure, Outcome};
+    use super::{Explicit, Failure, Fingerprint, Outcome};
+
+    #[test]
+    fn a_settings_file_lifts_a_refusal() {
+        // Ces fichiers font l'empreinte du modèle : en ajouter, en retirer ou en corriger un peut
+        // lever un refus, donc le démon doit le voir. L'empreinte des quatre autres ne bougeait pas.
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let model = mailvec::bert::default_dir(&root);
+        std::fs::create_dir_all(model.join("1_Pooling").as_std_path()).unwrap();
+        for name in ["model.safetensors", "tokenizer.json", "config.json"] {
+            std::fs::write(model.join(name).as_std_path(), "x").unwrap();
+        }
+        for name in mailvec::bert::SETTINGS {
+            let before = Fingerprint::of(&root);
+            std::fs::write(model.join(name).as_std_path(), "{}").unwrap();
+            let added = Fingerprint::of(&root);
+            assert_ne!(before, added, "{name} ajouté");
+            std::fs::remove_file(model.join(name).as_std_path()).unwrap();
+            assert_ne!(added, Fingerprint::of(&root), "{name} retiré");
+        }
+        // Le contrôle inverse : rien n'a bougé, rien ne change.
+        assert_eq!(Fingerprint::of(&root), Fingerprint::of(&root));
+    }
 
     #[test]
     fn every_outcome_survives_its_line() {

@@ -589,19 +589,16 @@ struct Fingerprint(Vec<Option<(u64, SystemTime)>>);
 fn fingerprint(root: &Utf8Path) -> Fingerprint {
     let model = mailvec::bert::default_dir(root);
     Fingerprint(
-        [
-            model.join("config.json"),
-            model.join("model.safetensors"),
-            model.join("tokenizer.json"),
-            mailcore::Store::vectors_path_in(root),
-        ]
-        .iter()
-        .map(|path| {
-            std::fs::metadata(path.as_std_path())
-                .and_then(|meta| Ok((meta.len(), meta.modified()?)))
-                .ok()
-        })
-        .collect(),
+        mailvec::bert::MODEL_FILES
+            .iter()
+            .map(|name| model.join(name))
+            .chain([mailcore::Store::vectors_path_in(root)])
+            .map(|path| {
+                std::fs::metadata(path.as_std_path())
+                    .and_then(|meta| Ok((meta.len(), meta.modified()?)))
+                    .ok()
+            })
+            .collect(),
     )
 }
 
@@ -1008,6 +1005,22 @@ fn follow_in(running: &mut Running, at_most: u64) -> Option<crate::vectors::Outc
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{Asked, Said, Unavailable};
+
+    #[test]
+    fn a_settings_file_lifts_a_remembered_refusal() {
+        // La même liste que la passe de fond, `mailvec::bert::MODEL_FILES` : un refus de la
+        // recherche retenu sur l'empreinte doit tomber quand la mise en commun ou les préfixes
+        // changent.
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let model = mailvec::bert::default_dir(&root);
+        std::fs::create_dir_all(model.join("1_Pooling").as_std_path()).unwrap();
+        for name in mailvec::bert::SETTINGS {
+            let before = super::fingerprint(&root);
+            std::fs::write(model.join(name).as_std_path(), "{}").unwrap();
+            assert_ne!(before, super::fingerprint(&root), "{name}");
+        }
+    }
 
     fn ready() -> super::Facts {
         super::Facts {

@@ -105,19 +105,17 @@ impl Prompts {
     /// Le document s'appelle `passage` chez `e5` et `document` chez d'autres ; une clé absente
     /// veut dire « pas de préfixe pour ce rôle », c'est ce que fait `sentence-transformers`.
     fn read(dir: &Utf8Path) -> Result<Self> {
-        let path = dir.join("config_sentence_transformers.json");
+        let path = dir.join(SETTINGS[1]);
         if !path.is_file() {
             return Ok(Self::e5());
         }
         let value: serde_json::Value =
-            serde_json::from_str(&read(dir, "config_sentence_transformers.json")?).map_err(
-                |e| {
-                    model_error(
-                        dir,
-                        format!("config_sentence_transformers.json illisible : {e}"),
-                    )
-                },
-            )?;
+            serde_json::from_str(&read(dir, SETTINGS[1])?).map_err(|e| {
+                model_error(
+                    dir,
+                    format!("config_sentence_transformers.json illisible : {e}"),
+                )
+            })?;
         let prompts = value.get("prompts");
         let pick = |keys: &[&str]| {
             keys.iter()
@@ -148,12 +146,11 @@ enum Pooling {
 impl Pooling {
     /// Lit `1_Pooling/config.json`, ou rend la moyenne s'il n'existe pas.
     fn read(dir: &Utf8Path) -> Result<Self> {
-        if !dir.join("1_Pooling").join("config.json").is_file() {
+        if !dir.join(SETTINGS[0]).is_file() {
             return Ok(Self::Mean);
         }
-        let value: serde_json::Value =
-            serde_json::from_str(&read(dir, "1_Pooling/config.json")?)
-                .map_err(|e| model_error(dir, format!("1_Pooling/config.json illisible : {e}")))?;
+        let value: serde_json::Value = serde_json::from_str(&read(dir, SETTINGS[0])?)
+            .map_err(|e| model_error(dir, format!("1_Pooling/config.json illisible : {e}")))?;
         let on = |key: &str| value.get(key).and_then(serde_json::Value::as_bool) == Some(true);
         // Un seul mode, et l'un des deux que ce crate calcule. Plusieurs à la fois — que
         // `sentence-transformers` concatène — ou un autre seraient approchés, donc faux.
@@ -177,6 +174,56 @@ impl Pooling {
             )),
         }
     }
+}
+
+/// L'empreinte qu'aurait un modèle de ces poids avec les réglages de `dir`, sans le charger.
+///
+/// Les mêmes lectures que [`Bert::load`], donc la même réponse : c'est ce qui permet à
+/// l'installation de refuser des réglages **avant** d'écrire dans le store, où le démon chargerait
+/// le modèle pendant qu'on le vérifie.
+///
+/// # Errors
+///
+/// [`Error::Model`] si un fichier de réglages de `dir` est illisible ou demande une mise en commun
+/// que ce crate ne calcule pas.
+pub(crate) fn settled_in(dir: &Utf8Path, weights: &str) -> Result<String> {
+    Ok(settled(
+        weights.to_owned(),
+        Pooling::read(dir)?,
+        &Prompts::read(dir)?,
+    ))
+}
+
+/// L'empreinte d'un modèle : celle de ses poids, et ce qui en fait des vecteurs s'il s'écarte de
+/// `e5`.
+///
+/// **La provenance nomme tout ce qui fait le vecteur.** Les mêmes poids, encodés avec deux
+/// préfixes ou deux mises en commun, rendent deux familles de vecteurs qu'on ne compare pas — et
+/// sur l'empreinte des seuls poids, elles portaient le même nom. Trouvé le 2026-10-10 :
+/// `granite-embedding` a tourné une nuit avec les préfixes de `e5`, faute de fichier qui dise
+/// les siens, et ses vecteurs seraient passés pour ceux du même modèle sans préfixe.
+///
+/// Les réglages de `e5` laissent l'empreinte **inchangée** : c'est le modèle installé, et un
+/// magasin écrit avant ce jour doit rester le sien.
+fn settled(weights: String, pooling: Pooling, prompts: &Prompts) -> String {
+    if pooling == Pooling::Mean && *prompts == Prompts::e5() {
+        return weights;
+    }
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        weights.as_str(),
+        match pooling {
+            Pooling::Mean => "mean",
+            Pooling::Cls => "cls",
+        },
+        &prompts.query,
+        &prompts.passage,
+    ] {
+        // La longueur avant chaque morceau : deux découpages du même texte ne se confondent pas.
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_hex()[..16].to_owned()
 }
 
 /// Le réseau, selon l'architecture que nomme `config.json`.
@@ -350,7 +397,7 @@ impl Bert {
         let identity = crate::pass::Identity {
             name: crate::pass::Identity::name_of(&dir),
             family: "transformeur".to_owned(),
-            digest,
+            digest: settled(digest, pooling, &prompts),
         };
 
         tracing::info!(
@@ -692,6 +739,24 @@ impl crate::pass::Encoder for Bert {
     }
 }
 
+/// Les fichiers qui disent comment le modèle fait un vecteur, chacun facultatif : sans eux, les
+/// réglages de `e5`.
+pub const SETTINGS: [&str; 2] = ["1_Pooling/config.json", "config_sentence_transformers.json"];
+
+/// Tous les fichiers dont un changement change le modèle chargé, ou s'il se charge.
+///
+/// **Une liste, pour tous ceux qui surveillent un modèle.** Le démon retient un refus tant que ces
+/// fichiers n'ont pas bougé ; il ne regardait que les trois premiers, et une mise en commun
+/// corrigée — ou un fichier de préfixes ajouté puis retiré, qui fait basculer l'empreinte — laissait
+/// la passe et la recherche refusées jusqu'au redémarrage. Trouvé par une relecture le 2026-10-10.
+pub const MODEL_FILES: [&str; 5] = [
+    "model.safetensors",
+    "tokenizer.json",
+    "config.json",
+    SETTINGS[0],
+    SETTINGS[1],
+];
+
 /// Le répertoire où ce modèle s'installe, sous la racine du store.
 #[must_use]
 pub fn default_dir(store_root: &Utf8Path) -> Utf8PathBuf {
@@ -702,6 +767,7 @@ pub fn default_dir(store_root: &Utf8Path) -> Utf8PathBuf {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{Bert, MAX_BATCH, MAX_TOKENS, PIECE_BUDGET, Role, plan};
+    use crate::pass::Encoder;
     use crate::testing::{TINY_PIECES, tiny_bert};
 
     fn tiny() -> (tempfile::TempDir, Bert) {
@@ -961,6 +1027,40 @@ mod tests {
             bare.tokens("bonjour", Role::Query).unwrap(),
             bare.tokens("bonjour", Role::Passage).unwrap()
         );
+    }
+
+    #[test]
+    fn the_same_weights_with_other_settings_are_another_model() {
+        // Les réglages de `e5` gardent l'empreinte des poids : un magasin déjà écrit reste le sien.
+        let (dir, e5) = tiny_xlm(&[]);
+        let weights = camino::Utf8Path::from_path(dir.path())
+            .unwrap()
+            .join("model.safetensors");
+        assert_eq!(
+            e5.identity().digest,
+            crate::pass::Identity::digest_of(&weights)
+        );
+        // Sans préfixe, ou au premier jeton : mêmes poids, autres vecteurs, autre nom.
+        let none = serde_json::json!({"prompts": {}});
+        let (_d1, bare) = tiny_xlm(&[("config_sentence_transformers.json", none)]);
+        let cls =
+            serde_json::json!({"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false});
+        let (_d2, first) = tiny_xlm(&[("1_Pooling/config.json", cls)]);
+        let digests = [
+            e5.identity().digest,
+            bare.identity().digest,
+            first.identity().digest,
+        ];
+        for (i, a) in digests.iter().enumerate() {
+            for b in &digests[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // Et un fichier qui redit les préfixes de `e5` ne change rien : c'est le réglage qui compte,
+        // pas le fichier.
+        let same = serde_json::json!({"prompts": {"query": "query: ", "passage": "passage: "}});
+        let (_d3, explicit) = tiny_xlm(&[("config_sentence_transformers.json", same)]);
+        assert_eq!(explicit.identity().digest, digests[0]);
     }
 
     #[test]

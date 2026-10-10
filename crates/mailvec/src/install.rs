@@ -22,6 +22,20 @@
 //! Puis **le modèle taillé** — voir [`crate::trim`] —, contre sa propre empreinte : la taille ne
 //! dépend que de sa source, donc son résultat aussi est une constante. Une empreinte qui ne
 //! correspond pas fait retirer ce qui a été écrit.
+//!
+//! Et **les réglages de la source**, avant toute écriture. La taille recopie la mise en commun et
+//! les préfixes tels quels, que la révision épinglée ne publie pas tous et qu'aucune empreinte
+//! ci-dessous ne couvre : un `config_sentence_transformers.json` égaré dans le répertoire source
+//! ôterait à `e5` ses préfixes, en silence, sur chaque vecteur. L'empreinte d'identité nomme les
+//! poids **et** ces réglages, et elle n'est celle des poids seuls qu'avec les réglages de `e5` :
+//! la calculer sur la source et la comparer à l'empreinte attendue couvre tout ce qui fait un
+//! vecteur. Trouvé par une relecture le 2026-10-10.
+//!
+//! **Sur la source, pas sur le modèle installé.** La première correction chargeait le modèle
+//! taillé pour lire son empreinte — donc après l'avoir mis où le démon regarde, qui pouvait le
+//! charger pendant les secondes de la vérification et vectoriser avec des réglages qu'on allait
+//! refuser. La seconde relecture l'a vu ; la règle est celle de la taille, tout ce qui peut être
+//! refusé l'est avant la première écriture.
 
 use std::io::Read;
 
@@ -167,13 +181,23 @@ pub fn install_checked(
     trimmed: &str,
 ) -> Result<Installed> {
     verify(source, expected)?;
+    // L'empreinte attendue est celle des poids seuls, donc celle d'un modèle aux réglages de `e5`.
+    let settled = crate::bert::settled_in(source, trimmed)?;
+    if settled != trimmed {
+        return Err(model_error(
+            source,
+            format!(
+                "les réglages de la source ({}) ne sont pas ceux de {REPOSITORY} et en \
+                 changeraient chaque vecteur : la révision épinglée ne les publie pas ainsi, \
+                 retirez-les — rien n'a été écrit",
+                crate::bert::SETTINGS.join(", ")
+            ),
+        ));
+    }
     let target = crate::bert::default_dir(root);
     let trim = crate::trim::trim(source, &target)?;
     if trim.digest != trimmed {
-        // Rien qui ressemble à un modèle ne doit rester : le démon le chargerait.
-        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
-            let _ = std::fs::remove_file(target.join(name).as_std_path());
-        }
+        discard(&target);
         return Err(model_error(
             &target,
             format!(
@@ -184,6 +208,16 @@ pub fn install_checked(
         ));
     }
     Ok(Installed { target, trim })
+}
+
+/// Retire tout ce qu'une installation refusée a écrit : rien qui ressemble à un modèle ne doit
+/// rester, le démon le chargerait.
+fn discard(target: &Utf8Path) {
+    for name in crate::bert::MODEL_FILES {
+        let _ = std::fs::remove_file(target.join(name).as_std_path());
+    }
+    // Vide, il ne gênerait rien ; retiré quand même, pour qu'un refus ne laisse aucune trace.
+    let _ = std::fs::remove_dir(target.join("1_Pooling").as_std_path());
 }
 
 fn model_error(path: &Utf8Path, reason: String) -> Error {
@@ -269,5 +303,69 @@ mod tests {
                 .join("config.json")
                 .exists()
         );
+    }
+
+    /// Ajoute un fichier de réglages à la source, que les empreintes reçues ne couvrent pas.
+    fn with_setting(root: &Utf8PathBuf, name: &str, value: &serde_json::Value) {
+        let path = root.join("source").join(name);
+        std::fs::create_dir_all(path.parent().unwrap().as_std_path()).unwrap();
+        std::fs::write(path.as_std_path(), value.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_stray_settings_file_that_changes_the_vectors_is_refused() {
+        // Les poids sont les bons — l'empreinte de la taille passe —, mais un fichier de préfixes
+        // vide ôterait à `e5` « query: » et « passage: ». Rien ne doit rester.
+        let (_dir, root, expected) = source();
+        let digest = trimmed_digest(&root);
+        with_setting(
+            &root,
+            "config_sentence_transformers.json",
+            &serde_json::json!({"prompts": {}}),
+        );
+        let store = root.join("store");
+        let error = install_checked(&root.join("source"), &store, &expected, &digest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("réglages"), "{error}");
+        // Refusé **avant** d'écrire : un modèle posé puis retiré aurait pu être chargé par le démon
+        // entre les deux.
+        assert!(!crate::bert::default_dir(&store).exists());
+    }
+
+    #[test]
+    fn an_unreadable_pooling_file_is_refused_before_anything_is_written() {
+        let (_dir, root, expected) = source();
+        let digest = trimmed_digest(&root);
+        with_setting(
+            &root,
+            "1_Pooling/config.json",
+            &serde_json::json!({"pooling_mode_max_tokens": true}),
+        );
+        let store = root.join("store");
+        let error = install_checked(&root.join("source"), &store, &expected, &digest)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mise en commun"), "{error}");
+        assert!(!crate::bert::default_dir(&store).exists());
+    }
+
+    #[test]
+    fn the_settings_the_pinned_revision_publishes_are_accepted() {
+        // Le contrôle inverse : la révision épinglée publie `1_Pooling/config.json`, en moyenne.
+        // Un instantané complet du dépôt doit s'installer, et rendre le même modèle.
+        let (_dir, root, expected) = source();
+        let digest = trimmed_digest(&root);
+        let mean = serde_json::json!({
+            "word_embedding_dimension": 8,
+            "pooling_mode_cls_token": false,
+            "pooling_mode_mean_tokens": true,
+            "pooling_mode_max_tokens": false,
+            "pooling_mode_mean_sqrt_len_tokens": false
+        });
+        with_setting(&root, "1_Pooling/config.json", &mean);
+        let store = root.join("store");
+        let installed = install_checked(&root.join("source"), &store, &expected, &digest).unwrap();
+        assert!(installed.target.join("1_Pooling/config.json").is_file());
     }
 }

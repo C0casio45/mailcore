@@ -73,6 +73,15 @@ const EMBEDDINGS: &str = "embeddings.word_embeddings.weight";
 /// Les fichiers qu'un modèle transformeur doit porter.
 const FILES: [&str; 3] = ["model.safetensors", "tokenizer.json", "config.json"];
 
+/// Ceux qui disent comment le modèle fait un vecteur, recopiés tels quels s'ils existent.
+///
+/// Ils ne portent aucun identifiant de pièce, donc la taille n'a rien à y réécrire — mais les
+/// **perdre** change chaque vecteur sans rien signaler : sans `1_Pooling/config.json`,
+/// [`crate::bert::Bert`] retombe sur la moyenne, et `granite-embedding` met en commun au premier
+/// jeton. Un modèle taillé qui aurait gardé ses poids et perdu sa mise en commun serait un autre
+/// modèle sous le même nom.
+pub(crate) const CARRIED: [&str; 2] = crate::bert::SETTINGS;
+
 /// Ce qu'une taille a fait.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
@@ -224,15 +233,21 @@ fn images(
 
 /// Taille un modèle transformeur de `source` vers `target`.
 ///
-/// `target` doit être vide de ces trois fichiers : une taille n'écrase jamais un modèle installé.
+/// `target` doit être vide de ces fichiers et de ceux de [`CARRIED`] : une taille n'écrase jamais
+/// un modèle installé.
 ///
 /// ## Tout ou rien
 ///
 /// **Tout ce qui peut être refusé l'est avant la première écriture** : le tokeniseur et la
-/// configuration sont réécrits en mémoire d'abord. Puis les trois fichiers sont écrits sous des
-/// noms provisoires, et renommés ensemble à la fin, `config.json` en dernier — c'est lui que le
-/// chargement lit d'abord, donc un répertoire interrompu est un modèle absent, jamais un modèle à
-/// moitié écrit. Un échec en route retire ce que l'appel avait écrit.
+/// configuration sont réécrits en mémoire d'abord, et les fichiers recopiés lus. Puis tout est écrit
+/// sous des noms provisoires, et renommé ensemble à la fin, `config.json` en dernier — c'est lui
+/// que le chargement lit d'abord, donc un répertoire interrompu est un modèle absent, jamais un
+/// modèle à moitié écrit. Un échec en route retire ce que l'appel avait écrit.
+///
+/// Les fichiers recopiés passent **avant** `config.json` pour la même raison, et elle y est plus
+/// forte : un répertoire coupé entre `config.json` et la mise en commun se chargerait, ferait la
+/// moyenne là où le modèle prend le premier jeton, et porterait l'empreinte des réglages de `e5`.
+/// La première version les renommait après ; trouvé par une relecture le 2026-10-10.
 ///
 /// La première version lisait `config.json` **après** avoir mis les poids en place : une
 /// configuration illisible laissait un `model.safetensors` derrière elle, et la taille suivante
@@ -255,6 +270,14 @@ pub fn trim(source: &Utf8Path, target: &Utf8Path) -> Result<Report> {
             ));
         }
     }
+    for name in CARRIED {
+        if target.join(name).exists() {
+            return Err(model_error(
+                target,
+                format!("{name} existe déjà : une taille n'écrase pas un modèle"),
+            ));
+        }
+    }
 
     let tokenizer = std::fs::read_to_string(source.join("tokenizer.json").as_std_path())
         .map_err(|e| model_error(source, format!("tokenizer.json : {e}")))?;
@@ -263,6 +286,15 @@ pub fn trim(source: &Utf8Path, target: &Utf8Path) -> Result<Report> {
         .map_err(|e| model_error(source, format!("config.json : {e}")))?;
     let config =
         rewrite_config(&config, &rewritten).map_err(|reason| model_error(source, reason))?;
+    let mut carried = Vec::new();
+    for name in CARRIED {
+        let from = source.join(name);
+        if from.is_file() {
+            let bytes = std::fs::read(from.as_std_path())
+                .map_err(|e| model_error(source, format!("{name} : {e}")))?;
+            carried.push((name, bytes));
+        }
+    }
 
     std::fs::create_dir_all(target.as_std_path())
         .map_err(|e| model_error(target, format!("création du répertoire : {e}")))?;
@@ -275,7 +307,22 @@ pub fn trim(source: &Utf8Path, target: &Utf8Path) -> Result<Report> {
     )
     .map_err(|reason| model_error(source, reason))?;
     staged.write(&target.join("tokenizer.json"), rewritten.text.as_bytes())?;
+    for (name, bytes) in &carried {
+        let to = target.join(name);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent.as_std_path())
+                .map_err(|e| model_error(target, format!("création de {parent} : {e}")))?;
+        }
+        staged.write(&to, bytes)?;
+    }
     staged.write(&target.join("config.json"), config.as_bytes())?;
+    // L'ordre d'écriture est l'ordre des renommages : vérifié ici, où une écriture ajoutée après
+    // coup le casserait, et par chaque test qui taille un modèle porteur de réglages.
+    debug_assert_eq!(
+        staged.files.last().map(|(_, path)| path.as_path()),
+        Some(target.join("config.json").as_path()),
+        "config.json doit être renommé en dernier"
+    );
     staged.commit()?;
 
     Ok(Report {
@@ -569,8 +616,13 @@ fn rewrite_weights(
         return Err(format!("{EMBEDDINGS} n'est pas une matrice"));
     };
     let (rows, hidden) = (*rows, *hidden);
-    if table.kind != crate::weights::Kind::F32 {
-        return Err(format!("{EMBEDDINGS} n'est pas en F32"));
+    // Les lignes sont recopiées à l'octet, donc le format importe peu tant qu'on sait sa largeur ;
+    // `granite-embedding` est publié en BF16, et le chargement l'élargit.
+    if !matches!(
+        table.kind,
+        crate::weights::Kind::F32 | crate::weights::Kind::BF16
+    ) {
+        return Err(format!("{EMBEDDINGS} n'est ni en F32 ni en BF16"));
     }
     if let Some(beyond) = kept.iter().find(|id| **id >= rows) {
         return Err(format!(
@@ -804,6 +856,68 @@ mod tests {
         }
         for c in ['Ж', 'α', '中', 'ש', 'ع', 'ก', '한'] {
             assert!(!is_kept(c), "{c:?} ne devrait pas être gardé");
+        }
+    }
+
+    #[test]
+    fn a_bf16_model_keeps_its_format_and_the_files_that_say_how_it_pools() {
+        // `granite-embedding` : poids en BF16, mise en commun au premier jeton, aucun préfixe.
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let full = root.join("full");
+        tiny_bert(&full, TINY_PIECES);
+        let weights = full.join("model.safetensors");
+        let device = candle_core::Device::Cpu;
+        let half: std::collections::HashMap<String, candle_core::Tensor> =
+            candle_core::safetensors::load(weights.as_std_path(), &device)
+                .unwrap()
+                .into_iter()
+                .map(|(name, t)| (name, t.to_dtype(candle_core::DType::BF16).unwrap()))
+                .collect();
+        candle_core::safetensors::save(&half, weights.as_std_path()).unwrap();
+        let carried = [
+            (
+                "1_Pooling/config.json",
+                r#"{"pooling_mode_cls_token": true, "pooling_mode_mean_tokens": false}"#,
+            ),
+            ("config_sentence_transformers.json", r#"{"prompts": {}}"#),
+        ];
+        for (name, text) in carried {
+            let path = full.join(name);
+            std::fs::create_dir_all(path.parent().unwrap().as_std_path()).unwrap();
+            std::fs::write(path.as_std_path(), text).unwrap();
+        }
+
+        let trimmed = root.join("trimmed");
+        trim(&full, &trimmed).unwrap();
+        for (name, text) in carried {
+            assert_eq!(
+                std::fs::read_to_string(trimmed.join(name).as_std_path()).unwrap(),
+                text,
+                "{name}"
+            );
+        }
+        let table = candle_core::safetensors::load(
+            trimmed.join("model.safetensors").as_std_path(),
+            &device,
+        )
+        .unwrap()
+        .remove(super::EMBEDDINGS)
+        .unwrap();
+        assert_eq!(table.dtype(), candle_core::DType::BF16);
+
+        // Mêmes vecteurs : sans la mise en commun recopiée, le taillé ferait la moyenne là où le
+        // modèle entier prend le premier jeton, et ce test tomberait — c'est son contrôle inverse,
+        // la différence entre les deux étant vérifiée par les tests de `bert`.
+        let texts = vec!["bonjour été 😀".to_owned(), "bon jour".to_owned()];
+        let full = Bert::load(&full).unwrap();
+        let small = Bert::load(&trimmed).unwrap();
+        for role in [Role::Passage, Role::Query] {
+            assert_eq!(
+                full.encode_as(&texts, role).unwrap(),
+                small.encode_as(&texts, role).unwrap(),
+                "{role:?}"
+            );
         }
     }
 
