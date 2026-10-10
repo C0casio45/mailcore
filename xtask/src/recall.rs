@@ -141,7 +141,8 @@ impl Outcome {
 ///
 /// Si le store est illisible, si le fichier de requêtes est absent ou mal formé, si une cible
 /// n'existe pas dans ce store, ou si l'index plein texte ne couvre pas exactement les messages
-/// indexables — auquel cas les fréquences de mots, donc la partition, seraient fausses.
+/// indexables — auquel cas les fréquences de mots, donc la partition, seraient fausses. Et si
+/// `ranks` désigne un fichier qui existe déjà ou qu'on ne peut pas créer.
 pub fn measure(
     store_root: &Utf8PathBuf,
     queries: &Utf8PathBuf,
@@ -149,7 +150,12 @@ pub fn measure(
     model: Option<&Utf8PathBuf>,
     k: f32,
     bert: bool,
+    ranks: Option<&Utf8PathBuf>,
 ) -> Result<()> {
+    // Créé **avant** de mesurer, en création exclusive : une minute de relevé pour découvrir à la
+    // fin qu'on ne peut pas garder ce qu'il a donné serait perdue, et vérifier l'existence puis
+    // créer laisserait un écart entre les deux.
+    let mut kept = ranks.map(PendingRanks::create).transpose()?;
     let raw = std::fs::read_to_string(queries)
         .with_context(|| format!("lecture du jeu de requêtes {queries}"))?;
     let ground: Ground = toml::from_str(&raw).with_context(|| {
@@ -192,6 +198,7 @@ pub fn measure(
         }
     );
 
+    let mut provenance: Option<String> = None;
     // Le moteur sémantique est **optionnel** ici comme dans le produit : sans modèle, le banc
     // rend le relevé de référence, celui du 2026-09-15. C'est ce qui permet de rejouer l'ancien
     // chiffre avec le code d'aujourd'hui plutôt que de le recopier depuis le journal.
@@ -212,8 +219,9 @@ pub fn measure(
             // Un rappel se lit sur des vecteurs, et des vecteurs viennent d'un modèle et d'un
             // budget. Sans cette ligne, deux relevés du même jour sur deux magasins différents
             // se ressemblent — c'est exactement ce qui est arrivé.
-            match engine.provenance() {
-                Some(provenance) => println!("Provenance         {}", provenance.summary()),
+            provenance = engine.provenance().map(|it| it.summary());
+            match &provenance {
+                Some(summary) => println!("Provenance         {summary}"),
                 None => println!(
                     "Provenance         INCONNUE — magasin au format de version 1.\n\
                      \x20                  Les chiffres ci-dessous ne disent pas quel modèle ni \
@@ -335,6 +343,339 @@ pub fn measure(
     }
 
     report(store_root, queries, &engines, k, &outcomes);
+    if let Some(pending) = kept.as_mut() {
+        pending.write(&Ranked {
+            queries: queries.to_string(),
+            provenance,
+            k,
+            depth: limit,
+            truncated,
+            rows: outcomes.iter().map(RankedRow::of).collect(),
+        })?;
+        println!("Rangs gardés       {}", pending.path);
+    }
+    Ok(())
+}
+
+/// Le fichier des rangs gardés, créé avant le relevé et retiré s'il n'a rien reçu.
+///
+/// Un relevé qui échoue en route laisserait sinon un fichier vide, que le relevé suivant
+/// refuserait d'écraser.
+struct PendingRanks {
+    path: Utf8PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl PendingRanks {
+    /// Crée le fichier, et refuse s'il existe : des rangs gardés ne s'écrasent pas, ils se
+    /// comparent.
+    fn create(path: &Utf8PathBuf) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "création de {path} : un fichier de rangs gardés ne s'écrase pas — s'il \
+                     existe, il se compare avec `recall-models`"
+                )
+            })?;
+        Ok(Self {
+            path: path.clone(),
+            file: Some(file),
+        })
+    }
+
+    fn write(&mut self, ranked: &Ranked) -> Result<()> {
+        let file = self
+            .file
+            .take()
+            .context("des rangs gardés ne s'écrivent qu'une fois")?;
+        serde_json::to_writer_pretty(file, ranked)
+            .with_context(|| format!("écriture de {}", self.path))
+    }
+}
+
+impl Drop for PendingRanks {
+    fn drop(&mut self) {
+        // Encore ouvert : rien n'a été écrit, donc le fichier est vide et le retirer ne perd rien.
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Les rangs d'un relevé, gardés pour comparer **deux modèles** sur le même jeu.
+///
+/// Le relevé compare des moteurs entre eux — plein texte, sens, hybride — sur **un** magasin de
+/// vecteurs. Choisir un modèle demande l'autre comparaison : le même bras, sur deux magasins. Elle
+/// se faisait en relisant deux sorties texte, ce qui recopiait le comptage hors de ce module — la
+/// leçon du 2026-09-10 : un banc qui réimplémente ce qu'il vérifie ne vérifie rien.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct Ranked {
+    /// Le jeu de requêtes mesuré.
+    queries: String,
+    /// La provenance des vecteurs, telle que le relevé l'imprime. `None` pour un relevé sans
+    /// modèle, qui n'a rien à comparer.
+    provenance: Option<String>,
+    /// L'amortissement de la fusion : il change chaque rang hybride.
+    k: f32,
+    /// La profondeur demandée à chaque moteur.
+    depth: usize,
+    /// La profondeur était-elle coupée ? Alors une absence veut dire « classée au-delà », et la
+    /// compter comme une défaite fabriquerait des victoires.
+    truncated: bool,
+    rows: Vec<RankedRow>,
+}
+
+/// Une requête du relevé gardé.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RankedRow {
+    text: String,
+    /// `fr`, `en` ou `??`, comme dans le détail du relevé.
+    lang: String,
+    /// La fréquence du mot commun le plus rare, `None` s'il n'y en a aucun — voir [`Reach`].
+    shared: Option<u64>,
+    fulltext: Option<usize>,
+    semantic: Option<usize>,
+    hybrid: Option<usize>,
+}
+
+impl RankedRow {
+    fn of(outcome: &Outcome) -> Self {
+        Self {
+            text: outcome.text.clone(),
+            lang: outcome.lang.mark().to_owned(),
+            shared: match outcome.reach {
+                Reach::None => None,
+                Reach::Group(freq) | Reach::Word(freq) => Some(freq),
+            },
+            fulltext: outcome.rank(Engine::FullText),
+            semantic: outcome.rank(Engine::Semantic),
+            hybrid: outcome.rank(Engine::Hybrid),
+        }
+    }
+
+    const fn rank(&self, engine: Engine) -> Option<usize> {
+        match engine {
+            Engine::FullText => self.fulltext,
+            Engine::Semantic => self.semantic,
+            Engine::Hybrid => self.hybrid,
+        }
+    }
+}
+
+fn read_ranks(path: &Utf8PathBuf) -> Result<Ranked> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("lecture de {path}"))?;
+    serde_json::from_str(&text).with_context(|| format!("analyse de {path}"))
+}
+
+/// Le nom court d'un modèle, lu dans sa provenance : `granite-latin (transformeur, …)` → `granite-latin`.
+fn model_name(ranked: &Ranked) -> String {
+    ranked
+        .provenance
+        .as_deref()
+        .and_then(|it| it.split(" (").next())
+        .unwrap_or("inconnu")
+        .to_owned()
+}
+
+/// Les sous-ensembles d'une comparaison de modèles, dans l'ordre d'impression.
+///
+/// La langue de la cible et le mot commun se calculent sur l'index et les cibles, sans le modèle :
+/// deux relevés du même jeu sur le même store les ont donc identiques, et [`compare_models`] le
+/// vérifie avant de comparer quoi que ce soit.
+fn model_subsets(rows: &[RankedRow]) -> Vec<(&'static str, Vec<usize>)> {
+    let hard = |row: &RankedRow| row.shared.is_none();
+    let pick = |keep: &dyn Fn(&RankedRow) -> bool| -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| keep(row))
+            .map(|(index, _)| index)
+            .collect()
+    };
+    vec![
+        ("tout le jeu", pick(&|_| true)),
+        ("sans mot commun", pick(&hard)),
+        (
+            "sans mot commun, cible française",
+            pick(&|row| hard(row) && row.lang == "fr"),
+        ),
+        (
+            "sans mot commun, cible anglaise",
+            pick(&|row| hard(row) && row.lang == "en"),
+        ),
+    ]
+}
+
+/// Compare deux relevés gardés du **même jeu**, bras par bras : le modèle de `base` contre celui de
+/// `candidate`.
+///
+/// La comparaison primaire est `primary` sur tout le jeu — celle qu'une déclaration écrite avant
+/// le relevé a nommée ; ce banc ne la choisit pas, il l'imprime en premier et la retire des pistes.
+///
+/// # Errors
+///
+/// Si un fichier est illisible, ou si les deux relevés ne portent pas le même jeu sur le même store
+/// — mêmes requêtes dans le même ordre, mêmes langues de cible, mêmes mots communs.
+pub fn compare_models(base: &Utf8PathBuf, candidate: &Utf8PathBuf, primary: &str) -> Result<()> {
+    let primary = match primary {
+        "hybride" | "hybrid" => Engine::Hybrid,
+        "sens" | "semantic" => Engine::Semantic,
+        other => anyhow::bail!("bras primaire inconnu : {other} (hybride ou sens)"),
+    };
+    let a = read_ranks(base)?;
+    let b = read_ranks(candidate)?;
+    same_set(&a, &b)?;
+    let (left, right) = labels(&a, &b);
+
+    println!("Jeu de requêtes    {}", a.queries);
+    println!(
+        "Base               {}",
+        a.provenance.as_deref().unwrap_or("provenance inconnue")
+    );
+    println!(
+        "Candidat           {}",
+        b.provenance.as_deref().unwrap_or("provenance inconnue")
+    );
+    println!("Fusion             K = {}, profondeur {}", a.k, a.depth);
+    println!(
+        "Une victoire est une requête où la base — « {left} », nommée en premier — met la première\n\
+         réponse acceptable plus haut que le candidat ; une défaite, l'inverse. Absente d'un seul\n\
+         côté, elle compte pour l'autre ; absente des deux, nulle part.\n"
+    );
+
+    let plan = model_plan(&a.rows, primary);
+    println!(
+        "=== COMPARAISON PRIMAIRE — bras {}, tout le jeu, {} requêtes ===",
+        short_label(primary),
+        plan.primary.len()
+    );
+    report_paired(
+        &left,
+        &right,
+        plan.primary.len(),
+        &paired_ranks(model_pairs(&a, &b, primary, &plan.primary).into_iter()),
+    );
+
+    println!(
+        "=== COMPARAISONS EXPLORATOIRES — {} pistes à 5 %, donc jusqu'à {} % de chances qu'au \
+         moins une sorte « significative » par hasard ===\n",
+        plan.tracks.len(),
+        (plan.tracks.len() * 5).min(100)
+    );
+    for (engine, label, indexes) in &plan.tracks {
+        println!(
+            "--- bras {}, {label} — {} requêtes ---",
+            short_label(*engine),
+            indexes.len()
+        );
+        report_paired(
+            &left,
+            &right,
+            indexes.len(),
+            &paired_ranks(model_pairs(&a, &b, *engine, indexes).into_iter()),
+        );
+    }
+    Ok(())
+}
+
+/// Les noms des deux côtés. Le même modèle avec d'autres réglages donnerait « X contre X », et le
+/// verdict « X est meilleur que X » : le rôle s'ajoute alors au nom.
+fn labels(a: &Ranked, b: &Ranked) -> (String, String) {
+    let (left, right) = (model_name(a), model_name(b));
+    if left == right {
+        (format!("{left} (base)"), format!("{right} (candidat)"))
+    } else {
+        (left, right)
+    }
+}
+
+/// Ce que [`compare_models`] compare, décidé avant d'imprimer — la leçon de [`Plan`] : une
+/// propriété qui vit dans du code qui imprime, aucun test ne la voit.
+struct ModelPlan {
+    /// Les requêtes de la comparaison primaire : tout le jeu.
+    primary: Vec<usize>,
+    /// Les pistes, dans l'ordre d'impression, la primaire **retirée**.
+    tracks: Vec<(Engine, &'static str, Vec<usize>)>,
+}
+
+fn model_plan(rows: &[RankedRow], primary: Engine) -> ModelPlan {
+    let subsets = model_subsets(rows);
+    let all = subsets[0].1.clone();
+    let mut tracks = Vec::new();
+    for engine in [Engine::Hybrid, Engine::Semantic] {
+        for (index, (label, indexes)) in subsets.iter().enumerate() {
+            if engine == primary && index == 0 {
+                continue;
+            }
+            tracks.push((engine, *label, indexes.clone()));
+        }
+    }
+    ModelPlan {
+        primary: all,
+        tracks,
+    }
+}
+
+/// Les couples de rangs d'un bras, **base d'abord** : c'est l'ordre qui fait qu'une victoire est
+/// celle de la base.
+fn model_pairs(
+    a: &Ranked,
+    b: &Ranked,
+    engine: Engine,
+    indexes: &[usize],
+) -> Vec<(Option<usize>, Option<usize>)> {
+    indexes
+        .iter()
+        .map(|&i| (a.rows[i].rank(engine), b.rows[i].rank(engine)))
+        .collect()
+}
+
+/// Les deux relevés se comparent-ils ? Même jeu, même store, mêmes réglages, profondeur entière.
+fn same_set(a: &Ranked, b: &Ranked) -> Result<()> {
+    anyhow::ensure!(
+        a.provenance.is_some() && b.provenance.is_some(),
+        "un des deux relevés n'a pas de provenance de vecteurs : sans modèle il n'a pas de bras \
+         sémantique, et un magasin non daté ne dit pas quel modèle comparer"
+    );
+    // Les réglages qui changent les rangs sans changer de modèle : un écart ferait passer pour
+    // l'effet du modèle ce qui est celui du réglage.
+    anyhow::ensure!(
+        a.k.to_bits() == b.k.to_bits() && a.depth == b.depth,
+        "réglages différents — K {} contre {}, profondeur {} contre {} : l'écart viendrait d'eux",
+        a.k,
+        b.k,
+        a.depth,
+        b.depth
+    );
+    anyhow::ensure!(
+        !a.truncated && !b.truncated,
+        "un relevé à profondeur coupée : une absence y veut dire « classée au-delà », et la \
+         compter comme une défaite fabriquerait des victoires. Relancer sans --limit"
+    );
+    anyhow::ensure!(
+        a.rows.len() == b.rows.len(),
+        "{} requêtes contre {} : ce ne sont pas deux relevés du même jeu",
+        a.rows.len(),
+        b.rows.len()
+    );
+    for (x, y) in a.rows.iter().zip(&b.rows) {
+        anyhow::ensure!(
+            x.text == y.text,
+            "« {} » contre « {} » : les requêtes ne sont pas les mêmes, ou pas dans le même ordre",
+            x.text,
+            y.text
+        );
+        // Ni la langue, ni le mot commun, ni le rang plein texte ne dépendent du modèle : un écart
+        // dit un autre store ou un autre index, et les sous-ensembles ne seraient plus les mêmes.
+        anyhow::ensure!(
+            x.lang == y.lang && x.shared == y.shared && x.fulltext == y.fulltext,
+            "« {} » : langue, mot commun ou rang plein texte différents entre les deux relevés — \
+             pas le même store",
+            x.text
+        );
+    }
     Ok(())
 }
 
@@ -959,14 +1300,24 @@ struct Paired {
 /// Le test de signe, lui, compte ces requêtes — un moteur qui trouve contre un moteur qui ne
 /// trouve pas, c'est une victoire sans ambiguïté.
 fn paired(left: Engine, right: Engine, set: &[&Outcome]) -> Paired {
+    paired_ranks(
+        set.iter()
+            .map(|outcome| (outcome.rank(left), outcome.rank(right))),
+    )
+}
+
+/// [`paired`] sur des couples de rangs, d'où qu'ils viennent : deux moteurs d'un même relevé, ou
+/// le même moteur dans deux relevés — voir [`compare_models`]. Une seule règle de comptage pour
+/// les deux, sinon deux comparaisons « identiques » finiraient par compter différemment.
+fn paired_ranks(pairs: impl Iterator<Item = (Option<usize>, Option<usize>)>) -> Paired {
     let mut wins = 0usize;
     let mut losses = 0usize;
     let mut ties = 0usize;
     let mut neither = 0usize;
     let mut logs: Vec<f64> = Vec::new();
 
-    for outcome in set {
-        match (outcome.rank(left), outcome.rank(right)) {
+    for pair in pairs {
+        match pair {
             (None, None) => neither += 1,
             (Some(_), None) => wins += 1,
             (None, Some(_)) => losses += 1,
@@ -1076,9 +1427,18 @@ fn ratio_disagrees(result: &Paired) -> bool {
 
 /// Imprime une comparaison et son verdict.
 fn report_pair(left: Engine, right: Engine, set: &[&Outcome]) {
-    let result = paired(left, right, set);
+    report_paired(
+        short_label(left),
+        short_label(right),
+        set.len(),
+        &paired(left, right, set),
+    );
+}
+
+/// Imprime une comparaison déjà comptée, entre deux bras nommés `l` et `r`, sur `total` requêtes.
+fn report_paired(l: &str, r: &str, total: usize, result: &Paired) {
+    let result = *result;
     let decided = result.wins + result.losses;
-    let (l, r) = (short_label(left), short_label(right));
 
     println!("{l} contre {r}");
     println!(
@@ -1088,7 +1448,7 @@ fn report_pair(left: Engine, right: Engine, set: &[&Outcome]) {
     // Chaque requête a une place précise, et la première version les confondait. Rendue par les
     // deux : dans le rapport, et dans le signe sauf ex æquo. Rendue d'un seul côté : dans le
     // signe seulement. Rendue par aucun : nulle part.
-    let one_sided = set.len() - result.both - result.neither;
+    let one_sided = total - result.both - result.neither;
     match result.ratio {
         Some(ratio) => println!(
             "  rang de « {r} » ÷ rang de « {l} » = ×{ratio:.2} en moyenne géométrique, sur les {} \
@@ -1407,6 +1767,218 @@ fn short(subject: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn row(text: &str, shared: Option<u64>, semantic: Option<usize>) -> RankedRow {
+        RankedRow {
+            text: text.to_owned(),
+            lang: "fr".to_owned(),
+            shared,
+            fulltext: None,
+            semantic,
+            hybrid: semantic,
+        }
+    }
+
+    #[test]
+    fn two_models_are_counted_like_two_engines() {
+        // La base gagne quand elle met la cible plus haut ; une absence d'un seul côté compte pour
+        // l'autre ; absente des deux, nulle part. Les mêmes règles que `paired`.
+        let result = paired_ranks(
+            [
+                (Some(1), Some(3)),
+                (Some(9), Some(2)),
+                (Some(4), None),
+                (None, Some(7)),
+                (None, None),
+                (Some(5), Some(5)),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            (result.wins, result.losses, result.ties, result.neither),
+            (2, 2, 1, 1)
+        );
+        assert_eq!(result.both, 3);
+    }
+
+    fn ranked(model: &str, rows: Vec<RankedRow>) -> Ranked {
+        Ranked {
+            queries: "v5".to_owned(),
+            provenance: Some(format!("{model} (transformeur, x)")),
+            k: 60.0,
+            depth: 73_658,
+            truncated: false,
+            rows,
+        }
+    }
+
+    #[test]
+    fn two_reports_of_different_sets_are_not_compared() {
+        let base = ranked(
+            "e5",
+            vec![row("a", None, Some(1)), row("b", Some(40), Some(2))],
+        );
+        let same = ranked(
+            "granite-latin",
+            vec![row("a", None, Some(3)), row("b", Some(40), None)],
+        );
+        same_set(&base, &same).unwrap();
+        assert_eq!(model_name(&same), "granite-latin");
+
+        // Chaque refus, et chacun seul : les autres champs sont ceux d'un relevé comparable.
+        let refused = |other: Ranked, why: &str| {
+            assert!(same_set(&base, &other).is_err(), "accepté : {why}");
+        };
+        refused(
+            Ranked {
+                rows: vec![row("b", Some(40), Some(2)), row("a", None, Some(1))],
+                ..same.clone()
+            },
+            "requêtes dans un autre ordre",
+        );
+        refused(
+            Ranked {
+                rows: vec![row("a", None, Some(1))],
+                ..same.clone()
+            },
+            "une requête de moins",
+        );
+        refused(
+            Ranked {
+                rows: vec![row("a", Some(3), Some(1)), row("b", Some(40), Some(2))],
+                ..same.clone()
+            },
+            "un autre mot commun",
+        );
+        let mut english = row("a", None, Some(3));
+        english.lang = "en".to_owned();
+        refused(
+            Ranked {
+                rows: vec![english, row("b", Some(40), None)],
+                ..same.clone()
+            },
+            "une autre langue de cible",
+        );
+        let mut other_fulltext = row("a", None, Some(3));
+        other_fulltext.fulltext = Some(7);
+        refused(
+            Ranked {
+                rows: vec![other_fulltext, row("b", Some(40), None)],
+                ..same.clone()
+            },
+            "un autre rang plein texte",
+        );
+        refused(
+            Ranked {
+                k: 30.0,
+                ..same.clone()
+            },
+            "un autre K",
+        );
+        refused(
+            Ranked {
+                depth: 50,
+                ..same.clone()
+            },
+            "une autre profondeur",
+        );
+        refused(
+            Ranked {
+                truncated: true,
+                ..same.clone()
+            },
+            "une profondeur coupée",
+        );
+        refused(
+            Ranked {
+                provenance: None,
+                ..same
+            },
+            "un relevé sans modèle",
+        );
+    }
+
+    #[test]
+    fn a_win_is_the_base_s_and_the_primary_is_not_counted_twice() {
+        // Seule la base trouve la cible de « a » : une victoire de la base, pas du candidat.
+        let base = ranked(
+            "e5",
+            vec![row("a", None, Some(4)), row("b", Some(40), None)],
+        );
+        let candidate = ranked(
+            "granite",
+            vec![row("a", None, None), row("b", Some(40), Some(2))],
+        );
+        let plan = model_plan(&base.rows, Engine::Hybrid);
+        let result =
+            paired_ranks(model_pairs(&base, &candidate, Engine::Hybrid, &plan.primary).into_iter());
+        assert_eq!((result.wins, result.losses), (1, 1));
+        let first = paired_ranks(model_pairs(&base, &candidate, Engine::Hybrid, &[0]).into_iter());
+        assert_eq!((first.wins, first.losses), (1, 0));
+
+        // Quatre sous-ensembles par bras, deux bras, la primaire retirée : sept pistes.
+        assert_eq!(plan.tracks.len(), 7);
+        assert!(
+            !plan
+                .tracks
+                .iter()
+                .any(|(engine, label, _)| *engine == Engine::Hybrid && *label == "tout le jeu")
+        );
+        let semantic = model_plan(&base.rows, Engine::Semantic);
+        assert!(
+            semantic
+                .tracks
+                .iter()
+                .any(|(engine, label, _)| *engine == Engine::Hybrid && *label == "tout le jeu")
+        );
+        assert!(
+            !semantic
+                .tracks
+                .iter()
+                .any(|(engine, label, _)| *engine == Engine::Semantic && *label == "tout le jeu")
+        );
+    }
+
+    #[test]
+    fn the_same_model_on_both_sides_is_told_apart() {
+        let a = ranked("granite", vec![]);
+        let b = ranked("granite", vec![]);
+        let (left, right) = labels(&a, &b);
+        assert_ne!(left, right);
+        assert_eq!(labels(&a, &ranked("e5", vec![])).1, "e5");
+    }
+
+    #[test]
+    fn the_subsets_split_the_hard_queries_by_language() {
+        let mut english = row("c", None, Some(1));
+        english.lang = "en".to_owned();
+        let rows = vec![row("a", None, Some(1)), row("b", Some(4), Some(1)), english];
+        let subsets = model_subsets(&rows);
+        let sizes: Vec<usize> = subsets.iter().map(|(_, it)| it.len()).collect();
+        assert_eq!(sizes, vec![3, 2, 1, 1]);
+    }
+
+    #[test]
+    fn kept_ranks_survive_their_file_and_are_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("rangs.json")).unwrap();
+        let written = ranked("e5", vec![row("une requête « citée »", None, Some(12))]);
+        PendingRanks::create(&path)
+            .unwrap()
+            .write(&written)
+            .unwrap();
+        assert_eq!(read_ranks(&path).unwrap().rows, written.rows);
+
+        // Un second relevé vers le même fichier est refusé avant de mesurer, et le premier reste.
+        let before = std::fs::read(&path).unwrap();
+        assert!(PendingRanks::create(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        // Un relevé qui échoue avant d'écrire ne laisse pas de fichier vide derrière lui.
+        let failed = Utf8PathBuf::from_path_buf(dir.path().join("echec.json")).unwrap();
+        drop(PendingRanks::create(&failed).unwrap());
+        assert!(!failed.exists());
+    }
 
     /// Le défaut trouvé le 2026-09-22, sur les lots que la scission a créés.
     ///

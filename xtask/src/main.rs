@@ -331,6 +331,27 @@ enum Command {
         /// dimensions diffèrent, et le magasin refuse une dimension qui n'est pas la sienne.
         #[arg(long)]
         bert: bool,
+        /// Garder les rangs de chaque requête dans ce fichier JSON — un fichier neuf, jamais un
+        /// existant —, pour comparer ensuite deux modèles avec `recall-models`.
+        #[arg(long)]
+        ranks: Option<Utf8PathBuf>,
+    },
+
+    /// Compare deux modèles sur le même jeu de requêtes, à partir des rangs que
+    /// `measure-recall --ranks` a gardés : le même bras, deux magasins de vecteurs.
+    ///
+    /// Le relevé de `measure-recall` compare des moteurs entre eux sur un seul magasin ; choisir un
+    /// modèle demande l'autre comparaison. Mêmes règles de comptage et même test de signe.
+    RecallModels {
+        /// Les rangs du modèle en place.
+        #[arg(long)]
+        base: Utf8PathBuf,
+        /// Les rangs du modèle candidat.
+        #[arg(long)]
+        candidate: Utf8PathBuf,
+        /// Le bras de la comparaison primaire, déclaré avant le relevé : `hybride` ou `sens`.
+        #[arg(long, default_value = "hybride")]
+        primary: String,
     },
 
     /// Mesure le critère 2 de la phase 4 : la latence d'un balayage vectoriel complet.
@@ -793,7 +814,21 @@ fn main() -> Result<()> {
             model,
             k,
             bert,
-        } => recall::measure(&store, &queries, limit, model.as_ref(), k, bert),
+            ranks,
+        } => recall::measure(
+            &store,
+            &queries,
+            limit,
+            model.as_ref(),
+            k,
+            bert,
+            ranks.as_ref(),
+        ),
+        Command::RecallModels {
+            base,
+            candidate,
+            primary,
+        } => recall::compare_models(&base, &candidate, &primary),
         Command::MeasureScan {
             messages,
             dim,
