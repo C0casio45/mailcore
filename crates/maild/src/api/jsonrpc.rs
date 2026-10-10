@@ -1574,10 +1574,25 @@ mod tests {
         let bytes = store.blobs().read(line.blob).unwrap();
         let text = String::from_utf8_lossy(&bytes);
         let headers = text.split("\r\n\r\n").next().unwrap_or_default();
+        // Le **nom** de chaque en-tête, pas une sous-chaîne du bloc : un `Message-ID` est de
+        // l'hexadécimal, et `b`, `c`, `c` en sont des chiffres — le contrôle tombait une fois sur
+        // quelques centaines, le 2026-10-10 sur `…361bcc036…`. La leçon de `CLAUDE.md`, appliquée à
+        // ce test-ci qu'elle avait oublié.
+        let names = |block: &str| -> Vec<String> {
+            block
+                .split("\r\n")
+                .filter(|line| !line.starts_with([' ', '\t']))
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, _)| name.trim().to_ascii_lowercase())
+                .collect()
+        };
         assert!(
-            !headers.to_ascii_lowercase().contains("bcc"),
+            !names(headers).iter().any(|name| name == "bcc"),
             "un en-tête Bcc a été écrit : {headers}"
         );
+        // Le contrôle inverse : un vrai `Bcc:` serait vu, et un identifiant qui contient `bcc` non.
+        assert!(names("Bcc: x@y.fr\r\nTo: z@y.fr").contains(&"bcc".to_owned()));
+        assert!(!names("Message-ID: <361bcc036@y.fr>").contains(&"bcc".to_owned()));
         assert!(
             !headers.contains("discret@ailleurs.fr"),
             "la copie cachée est dans les en-têtes : {headers}"
