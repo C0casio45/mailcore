@@ -85,14 +85,14 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 
 | # | Critère | Seuil | État |
 |---|---|---|---|
-| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand. **Refait le 2026-10-08 sur les vecteurs du modèle taillé : chiffres identiques**, 26,9 % et 1 contre 9 à p = 0,021. **Élargi le 2026-10-09 à 46 requêtes** (20 neuves, écrites par l'assistant, réserve dans le journal) : **première moitié toujours non tenue**, hybride dans les 10 premiers pour **17,4 %** (9–31 %), 0 % sur les 18 sans mot commun ; **seconde moitié tenue en rang** : 2 contre 16, p = 0,001 — et 7 contre 1 sur les 8 requêtes dures neuves seules, p = 0,07 |
-| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **TENU le 2026-10-09, de bout en bout** — `cargo xtask measure-semantic-search`, machine au repos, 22 requêtes × 3 tours dont le premier jeté, trois exécutions : hybride **33,1 à 33,4 ms** de p95 (p50 26,1–26,7), les mots seuls 9,6–10,6 ms. Les trois exécutions s'accordent à 1 %. La recherche qui réveille le sens répond par les mots en 12–15 ms ; le réveil coûte 0,43–0,67 s, hors de la recherche. Pour mémoire, le balayage seul, 2026-09-21 — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8 |
-| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente. **Modèle taillé et lots triés, 2026-10-08 : au moins 5,78 msg/s, 3 h 33** — un plancher, la passe tournant en priorité minimale sur une machine qui servait |
-| 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | **TENU le 2026-10-09 au soir dans les cinq minutes qui suivent une recherche, toujours pas à froid** — machine au repos, trois exécutions dont la première jetée : l'enfant de la recherche chaud vectorise une arrivée en **171,3 et 171,9 ms** de médiane (101 à 183 ms), sous les 200 ms ; à froid, **580,8 et 578,6 ms**. Avant la délégation — `cargo xtask measure-arrival`, machine au repos : **0,52 à 0,90 s** par arrivée, médiane 0,59 s sur l'exécution la plus stable. Le chargement du modèle **seul** prend 0,24 s, déjà au-dessus du seuil : c'est la décision du 2026-10-08 — un enfant par passage, la mémoire rendue aussitôt — qui le fait payer à chaque arrivée. La décision du démon coûte 1,5 ms. Voir le journal pour les remèdes |
-| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **TENU sur la passe complète du 2026-10-09, avec 24,6 Mio de marge** — transformeur taillé, trois longs textes par lot : **452,2 Mio** de crête pour 476,8 permis (500 Mo). 8,5 au démarrage, 9,9 store ouvert, 343,3 modèle chargé, 382,3 passe finie. La veille, à quatre longs textes par lot, la même passe crevait de 5 Mio (481,9). Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. **Réserve écrite** : la crête monte encore d'une vingtaine de mébioctets d'un bout à l'autre de la passe — une dérive, devancée et non bornée ; les enfants successifs la borneraient. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio |
+| 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand. **Refait le 2026-10-08 sur les vecteurs du modèle taillé : chiffres identiques**, 26,9 % et 1 contre 9 à p = 0,021. **Élargi le 2026-10-09 à 46 requêtes** (20 neuves, écrites par l'assistant, réserve dans le journal) : **première moitié toujours non tenue**, hybride dans les 10 premiers pour **17,4 %** (9–31 %), 0 % sur les 18 sans mot commun ; **seconde moitié tenue en rang** : 2 contre 16, p = 0,001 — et 7 contre 1 sur les 8 requêtes dures neuves seules, p = 0,07. **Granite taillé, 2026-10-10 — adopté, pas encore installé** : sur v5, 30 requêtes neuves, hybride dans les 10 premiers pour **26,7 %** (8 sur 30, contre 3 avec e5) ; première moitié toujours non tenue. Contre e5, 22 requêtes mieux classées sur 30, p = 0,004 — voir le journal |
+| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **TENU le 2026-10-09, de bout en bout** — `cargo xtask measure-semantic-search`, machine au repos, 22 requêtes × 3 tours dont le premier jeté, trois exécutions : hybride **33,1 à 33,4 ms** de p95 (p50 26,1–26,7), les mots seuls 9,6–10,6 ms. Les trois exécutions s'accordent à 1 %. La recherche qui réveille le sens répond par les mots en 12–15 ms ; le réveil coûte 0,43–0,67 s, hors de la recherche. Pour mémoire, le balayage seul, 2026-09-21 — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8. **Granite taillé, 2026-10-10**, trois tours dont le premier jeté : hybride **25,8 et 28,1 ms** de p95, e5 32,0 et 31,6 dans la même séance |
+| 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente. **Modèle taillé et lots triés, 2026-10-08 : au moins 5,78 msg/s, 3 h 33** — un plancher, la passe tournant en priorité minimale sur une machine qui servait. **Granite taillé, 2026-10-10 : 16,65 msg/s, 1 h 14**, plancher pour la même raison |
+| 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | **TENU le 2026-10-09 au soir dans les cinq minutes qui suivent une recherche, toujours pas à froid** — machine au repos, trois exécutions dont la première jetée : l'enfant de la recherche chaud vectorise une arrivée en **171,3 et 171,9 ms** de médiane (101 à 183 ms), sous les 200 ms ; à froid, **580,8 et 578,6 ms**. Avant la délégation — `cargo xtask measure-arrival`, machine au repos : **0,52 à 0,90 s** par arrivée, médiane 0,59 s sur l'exécution la plus stable. Le chargement du modèle **seul** prend 0,24 s, déjà au-dessus du seuil : c'est la décision du 2026-10-08 — un enfant par passage, la mémoire rendue aussitôt — qui le fait payer à chaque arrivée. La décision du démon coûte 1,5 ms. Voir le journal pour les remèdes. **Granite taillé, 2026-10-10**, trois tours dont le premier jeté : **80,9 et 82,4 ms** à chaud (e5 167,2 et 195,3 dans la même séance), 435,1 et 462,6 ms à froid — toujours pas tenu à froid, et les séries à froid des deux modèles s'écartent d'une exécution à l'autre, jusqu'à 41 % — voir le journal |
+| 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **TENU sur la passe complète du 2026-10-09, avec 24,6 Mio de marge** — transformeur taillé, trois longs textes par lot : **452,2 Mio** de crête pour 476,8 permis (500 Mo). 8,5 au démarrage, 9,9 store ouvert, 343,3 modèle chargé, 382,3 passe finie. La veille, à quatre longs textes par lot, la même passe crevait de 5 Mio (481,9). Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. **Réserve écrite** : la crête monte encore d'une vingtaine de mébioctets d'un bout à l'autre de la passe — une dérive, devancée et non bornée ; les enfants successifs la borneraient. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio. **Granite taillé, 2026-10-10 : 394,7 Mio** de crête, 82 Mio de marge, modèle chargé 316,6 ; non taillé, il crevait à 752,7 |
 | 6 | Zéro requête réseau déclenchée par le contenu | **exactement 0**, le harnais de `mailprivacy` étendu à une moisson **et** à une passe de vectorisation. La seule requête tolérée du projet est l'installation du modèle, sur commande | **tenu le 2026-10-08, et verrouillé en CI.** Comportement : un canari sur le bouclage, désigné d'une quarantaine de façons par trois messages hostiles, traverse la vraie moisson, les passes dérivées et la passe de fond dans l'exécutable `maild` relancé — **0 connexion**, contrôles positifs compris (`maild/tests/contenu_hors_ligne.rs`). Surface : l'analyse de source étendue à `mailsmtp`, `mailcal`, `mailvec`, et ni `hf-hub` ni `ureq` dans le graphe. **L'installation du modèle ne fait aucune requête** : `mail model install` dit quoi télécharger et vérifie les empreintes |
 | 7 | Sans modèle, rien ne casse | le fichier de modèle supprimé : la coquille démarre **sous le même seuil qu'avant**, la recherche plein texte répond, et l'écran **dit pourquoi** le sémantique est absent et comment l'obtenir — critère 8 de la phase 3 appliqué ici | **TENU le 2026-10-09** — démarrage mesuré au repos, trois séries dont la première jetée : **198,4 et 192,1 ms avec le modèle, 184,2 et 188,7 ms sans**, sous les 225 ms du critère 1 de la phase 2 (étendue 172–203 ms). Il a fallu pour ça retirer un compte de messages fait avant la fenêtre et ouvrir le store pendant qu'elle se crée — voir le journal. **Les deux autres tiers depuis le 2026-10-08, vérifiés par test** : sans modèle, les mots répondent seuls, et la ligne au-dessus des résultats dit « Aucun modèle n'est installé… » avec la commande `mail model install` — `server.hello` le dit aussi avant toute recherche. **Le démarrage reste à mesurer**, au repos ; par construction rien ne se charge au démarrage, l'enfant du sens ne naît qu'à la première recherche |
-| 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | **mesuré le 2026-10-09, non tenu** — les 46 requêtes sont françaises, sur le corpus réel. Sur les 8 sans mot commun dont la cible est française, aucune n'est dans les 10 premiers, quel que soit le moteur ; le sens seul les classe de 37ᵉ à 35 146ᵉ. Le critère 8 tombe avec le premier : ce n'est pas le passage à l'anglais qui manque, c'est la synonymie en français |
+| 8 | Le français, pas l'anglais | le critère 1 mesuré sur des requêtes **françaises** contre un corpus français. Un modèle anglophone donne des chiffres flatteurs sur un banc anglais et s'effondre sur le corpus réel | **mesuré le 2026-10-09, non tenu** — les 46 requêtes sont françaises, sur le corpus réel. Sur les 8 sans mot commun dont la cible est française, aucune n'est dans les 10 premiers, quel que soit le moteur ; le sens seul les classe de 37ᵉ à 35 146ᵉ. Le critère 8 tombe avec le premier : ce n'est pas le passage à l'anglais qui manque, c'est la synonymie en français. **Granite, 2026-10-10 : pas décidablement mieux** — sur ces requêtes, 5 contre 3 (v3), 3 contre 1 (v4), 0 contre 1 (v5) face à e5 ; son gain est ailleurs |
 | 9 | Les deux magasins ne se contredisent pas | drapeaux en SQLite, vecteurs ailleurs : le contrôle du 2026-09-11 sur l'index, refait ici. Un magasin de vecteurs vidé pendant que les drapeaux disent « fait » doit être **détecté au point d'usage**, pas laissé silencieux | **tenu, vérifié par test.** Au point d'usage, à trois endroits : la passe explicite le détecte et refait tout (`pass::update_with`) ; la passe de fond le détecte et **refuse** sans rien effacer (`pass::plan`, raison « divergent ») ; la recherche refuse des vecteurs d'un autre modèle. Dans les trois cas l'écran le dit, avec la commande qui répare — étape 8 |
 
 Le critère 1 est celui qui décide si la phase valait la peine. Les autres disent si elle est
@@ -3002,3 +3002,128 @@ Deux défauts de test trouvés en route, aucun dans le code livré :
 - **un test HTTP du démon** a vu une indexation de fond ne pas finir en « fait », une fois, sous la
   charge d'une compilation release. Pas reproduit en dix-neuf essais ; noté ici pour qu'une
   seconde occurrence ne passe pas pour la première.
+
+### 2026-10-10 — granite contre e5 : six conditions déclarées d'avance, six tenues au second essai du protocole
+
+**En clair d'abord.** Un autre modèle, `granite-embedding-107m-multilingual` (IBM), taillé comme
+e5 l'avait été, classe le bon message plus haut que e5 sur 22 requêtes neuves sur 30. Il est plus
+léger en mémoire, plus rapide en passe, en recherche, et à l'arrivée d'un message quand l'enfant de
+la recherche est chaud. La règle d'adoption avait été écrite avant de mesurer, et toutes ses
+conditions tiennent : **il remplace e5**. Mais le premier passage des mesures de temps **ne suivait
+pas le protocole déclaré** ; une relecture l'a vu, et elles ont été refaites comme écrit — c'est ce
+second passage qui décide. Ce que granite ne règle pas : la synonymie en français, où rien ne montre
+qu'il fasse mieux.
+
+**Pourquoi un deuxième essai.** Le premier relevé de granite, la veille au soir, l'avait déjà
+donné meilleur (18 contre 6 sur v4, p = 0,023), mais il tournait **avec les préfixes de e5** —
+« query: », « passage: » — que son producteur ne prévoit pas : son dépôt ne publie pas le fichier
+qui les dit, et sa fiche encode sans préfixe. La configuration à adopter n'était donc pas celle qui
+avait été mesurée, et v4 avait été vu une fois. Il fallait un jeu que **aucun** moteur n'avait vu,
+et une règle de décision écrite avant de le lire.
+
+**Le code d'abord**, parce que cette erreur pouvait se reproduire en silence. Mêmes poids, autres
+préfixes ou autre mise en commun : deux familles de vecteurs qui portaient le même nom. Depuis ce
+jour, l'empreinte d'identité nomme les poids, la mise en commun et les préfixes — et reste celle des
+poids seuls avec les réglages de e5, donc les magasins déjà écrits restent les leurs. La taille
+accepte les poids BF16 et garde les fichiers de réglages, `config.json` toujours renommé en
+dernier. Deux relectures adversariales ont trouvé trois défauts de plus, tous corrigés avec un test
+et son contrôle négatif : le démon retenait un refus de modèle jusqu'au redémarrage même après
+correction du fichier fautif ; une taille coupée au mauvais moment laissait un modèle chargeable
+aux réglages de e5 ; et `mail model install` recopiait sans les vérifier des fichiers capables
+d'ôter à e5 ses préfixes. La première correction de ce dernier défaut vérifiait le modèle **après**
+l'avoir posé où le démon regarde ; la seconde relecture l'a vu, et la vérification se fait
+maintenant sur la source, avant toute écriture.
+
+**La règle**, écrite pendant la passe, avant qu'un seul vecteur de granite taillé ait été lu :
+granite remplace e5 si et seulement si (1) il est meilleur sur un jeu neuf, bras hybride, rangs,
+test de signe à 5 % ; (2) la passe tient le critère 5 ; (3) la recherche tient le critère 2 ;
+(4) l'arrivée tient au moins là où e5 tient ; (5) le démarrage tient ; (6) aucun signe ne s'inverse
+sur v3 ni v4. Et pour les mesures de temps : « machine au repos, e5 et granite dans la même séance,
+trois exécutions dont la première jetée ».
+
+**Le protocole n'a pas été suivi la première fois**, et c'est l'assistant qui l'avait écrit. La
+chaîne lancée après la passe a fait **deux** exécutions par modèle pour la recherche et l'arrivée,
+**une** pour le démarrage, sans en jeter aucune, sur une machine chargée de 7 à 68 %. La première
+série d'arrivées de granite y a donné **252,5 ms** à chaud — un échec —, la seconde 157,2. Le
+critère a alors été tranché par une remesure à douze arrivées par série, choisie **après** avoir vu
+l'échec, et le journal la présentait comme la condition déclarée. Une relecture adversariale du
+journal contre les sorties brutes l'a relevé, avec sept autres inexactitudes du journal et six
+défauts de l'outil de comparaison, tous corrigés ici.
+
+Les mesures de temps ont donc été **refaites comme déclaré** : trois tours, le premier jeté, les
+deux modèles alternés dans chaque tour ; une porte de calme d'abord — la charge de fond, troisième
+plus basse de douze relevés sur une minute, était de 21 %, le seuil a été posé à 31 % et tenu une
+minute —, et la charge notée avant chaque exécution, de 6 à 43 %, dont une arrivée gardée de granite
+partie à 34 %, au-dessus du seuil. C'est ce passage qui décide les conditions (3) à (5).
+
+**Le jeu v5**, 30 requêtes : tirage à graine fixe de 120 messages, non relancé, deux cibles déjà
+utilisées écartées ; tri, écriture, puis relecture adversariale de chaque requête par un agent
+distinct — fuite des mots du sujet, réponses acceptables manquantes ou en trop. Dix-huit gardées
+telles quelles, douze corrigées, aucune retirée. **Aucun moteur lancé pendant l'écriture**, et la
+même réserve que v3 et v4 : l'assistant les a écrites, une paraphrase n'est pas un souvenir.
+
+| condition — temps : tours 2 et 3 du protocole déclaré | e5 taillé | granite taillé, sans préfixe | |
+|---|---|---|---|
+| (1) v5, hybride : requêtes où il classe mieux | 6 | **22** (2 égales), p = 0,004, rang ÷ 4,7 | tenue |
+| (2) critère 5 : crête de la passe | 452,2 Mio | **394,7 Mio** | tenue |
+| (3) critère 2 : hybride p95 | 32,0 / 31,6 ms | **25,8 / 28,1 ms** | tenue |
+| (4) critère 4 : une arrivée, enfant chaud | 167,2 / 195,3 ms | **80,9 / 82,4 ms** | tenue |
+| (5) critère 7 : démarrage à chaud, avec / sans modèle | 177,6 / 182,3 — 177,4 / 177,0 ms | 178,6 / 183,0 — 176,9 / 175,4 ms | tenue |
+| (6) v4 et v3, hybride | — | 20 contre 4 ; 31 contre 10 | tenue |
+
+À froid, l'arrivée échoue pour les deux, comme avant : 568,6 et 708,7 ms pour e5, 435,1 et
+462,6 ms pour granite. Le premier passage, hors protocole, tenait chaque condition sauf la première
+série d'arrivées de granite ; granite y était devant partout — recherche 25,0 et 25,3 ms contre 31,7
+et 31,0, démarrage avec modèle 187,2 contre 195,5 — sauf au démarrage sans modèle, 200,8 contre
+186,7, un écart du même ordre que celui d'une série à l'autre.
+
+Les comparaisons de modèles sont faites par `cargo xtask recall-models`, neuf, qui lit les rangs
+que `measure-recall --ranks` garde et les compte avec la règle et le test de signe du banc
+lui-même. Relancés pour ça, les six relevés ont rendu **les mêmes rangs au mot près** que la
+première fois. La première lecture, faite à la main en attendant, avait une fonction de test de
+signe fausse — `[Math]::Min(1, p)` en PowerShell choisit la surcharge entière et rend 0 ou 1 :
+la leçon du 2026-09-10 de nouveau, un banc qui réimplémente ce qu'il vérifie ne vérifie rien.
+
+**Le reste, sans valeur de preuve.**
+
+- **Le coût de la passe** (critère 3) : **1 h 14, 16,65 messages/s**, contre 3 h 07 et 6,56 pour
+  e5 — en priorité minimale, avec l'écriture de v5 qui tournait à côté pendant les deux tiers de
+  la passe, donc un plancher. Modèle chargé : 316,6 Mio contre 343,3. Le modèle entier, non
+  taillé, crevait le critère 5 à 752,7 Mio.
+- **Dans les dix premiers**, v5 : hybride 3 sur 30 avec e5, **8 sur 30** avec granite ; le sens
+  seul, 3 puis 9. Le critère 1 reste loin des 80 %.
+- **Les préfixes** : granite taillé sans préfixe bat granite **entier** avec ceux de e5, 19 contre
+  5 sur v4 et 29 contre 12 sur v3. Deux choses ont changé à la fois, la taille et les préfixes, donc
+  le chiffre ne dit pas laquelle compte ; la taille ne change aucun vecteur d'un texte latin —
+  vérifié au bit près sur deux cents messages —, ce qui désigne les préfixes sans le prouver.
+- **D'où vient le gain** : pas d'où on l'attendait. Sur v5, **19 des 22 victoires** sont sur des
+  requêtes qui partagent un mot avec leur cible ; les requêtes sans mot commun n'y sont que cinq.
+  Sur v3 et v4, les plus gros écarts de rang sont interlangues — granite gagne 8 sur 8 et 4 sur 4
+  quand la cible est anglaise —, mais la moitié des victoires ou davantage vient encore des
+  requêtes à mot commun : 16 sur 31 sur v3, 12 sur 20 sur v4. Granite classe mieux partout, pas
+  seulement d'une langue à l'autre. Sur les requêtes sans mot commun dont la cible est française —
+  **le critère 8** —, 5 contre 3, 3 contre 1, puis 0 contre 1 sur v5 : rien de décidable. La
+  synonymie en français reste le trou.
+- **La fusion** dilue toujours : le sens seul de granite bat son hybride sur v4, comme celui de e5.
+
+**Deux anomalies, notées et non expliquées.**
+
+- **Les 252,5 ms de la première série d'arrivées de granite**, enfant chaud, valeurs de 222 à
+  311 ms, ne se sont reproduits nulle part ensuite : ni dans la seconde série du même passage
+  (157,2), ni à douze arrivées par série (82,2 et 81,7 ms, de 34 à 87 ; e5 171,2 et 179,6), ni dans
+  les trois tours du protocole déclaré (80,9 à 83,3 ms). Les deux séries de granite à douze
+  arrivées s'accordent à la milliseconde, celles de e5 à 8 ms. La cause n'est pas connue ; une
+  seconde occurrence ne devra pas passer pour la première.
+- **À froid, les séries s'écartent, et pas chez un seul modèle.** Granite : 437,7 et 615,2 ms au
+  premier passage, 442,9 et 608,0 à douze arrivées — jusqu'à 41 % d'écart, avec une arrivée à
+  3,3 s —, mais 435,1 et 462,6 ms, à 6 % l'une de l'autre, dans le protocole déclaré. Là, c'est e5
+  qui s'écarte : 568,6 puis 708,7 ms, une arrivée à 4,9 s, et un chargement du modèle mesuré seul
+  à 0,90 s contre 0,23 au tour d'avant. Ce critère échoue pour les deux modèles, mais un écart de
+  cette taille entre deux exécutions identiques est un symptôme, pas du bruit ; qu'il touche l'un
+  puis l'autre désigne le système plus que le modèle — la lecture du modèle depuis le disque à
+  chaque arrivée est le premier suspect.
+
+**Ce qui reste à faire pour que granite soit le modèle livré** : épingler sa révision et les
+empreintes de ses fichiers dans `mail model install`, déclarer ses réglages — son producteur ne
+publie pas de fichier de préfixes —, et revectoriser le store de production, environ une heure et
+quart d'après la passe mesurée.
