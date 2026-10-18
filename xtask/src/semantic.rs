@@ -101,7 +101,7 @@ impl Replica {
 }
 
 /// Refuse le profil de débogage : `mailcore`, `mailvec` et `maild` n'y sont pas optimisés.
-fn release_only(name: &str) -> Result<()> {
+pub(crate) fn release_only(name: &str) -> Result<()> {
     anyhow::ensure!(
         !cfg!(debug_assertions),
         "{name} chronomètre du code qui n'est pas optimisé en profil de débogage — le relevé \
@@ -164,7 +164,7 @@ fn children_rss() -> Vec<u64> {
 }
 
 /// Le percentile d'une série.
-fn percentile(latencies: &[Duration], quantile: f64) -> Duration {
+pub(crate) fn percentile(latencies: &[Duration], quantile: f64) -> Duration {
     if latencies.is_empty() {
         return Duration::ZERO;
     }

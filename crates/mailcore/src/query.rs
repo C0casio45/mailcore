@@ -1407,6 +1407,110 @@ mod tests {
     }
 
     #[test]
+    fn an_index_kept_up_to_date_merges_its_segments() {
+        // Chaque passe qui apporte du courrier valide un segment, et une recherche les parcourt
+        // tous. Treize passes, au moins treize segments — quatorze au contrôle négatif : c'est ce
+        // que faisait un écrivain lâché sitôt validé, qui abandonne ses fusions — 149 segments
+        // dans le store du quotidien après une semaine, le 2026-10-18. La politique de tantivy
+        // fusionne huit segments de même taille ; il en reste donc moins de huit, sinon les
+        // fusions n'aboutissent pas.
+        let (_dir, mailbox) = mailbox();
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        for n in 0..12 {
+            add_numbered_message(mailbox.store(), n);
+            let stats = crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+            assert_eq!(stats.indexed, 1);
+        }
+
+        let (index, _) = crate::index::open_or_create(mailbox.store()).unwrap();
+        let segments = index.searchable_segment_ids().unwrap().len();
+        assert!(
+            segments < 8,
+            "{segments} segments pour treize passes : les fusions n'aboutissent pas"
+        );
+        // Rien n'est perdu dans la fusion : les quatorze messages y sont, et chacun une fois.
+        let reopened = Mailbox::open(mailbox.store().root()).unwrap();
+        assert_eq!(reopened.indexed_documents(), Some(14));
+        assert_eq!(reopened.search("chantier", 50).unwrap().len(), 12);
+    }
+
+    #[test]
+    fn a_cancelled_pass_starts_no_merge() {
+        // Le dernier `commit` d'une passe annulée valide ce qui a été fait — et un `commit`, même
+        // vide, déclenche les fusions que la politique juge possibles. Sur un store de 149
+        // segments, c'était la fusion de tout l'arriéré : des secondes, qu'on attend désormais
+        // jusqu'au bout plutôt que de les laisser tourner hors du job. L'annulation doit donc
+        // rendre la main sans en lancer aucune.
+        let (_dir, mailbox) = mailbox();
+        let (index, fields) = crate::index::open_or_create(mailbox.store()).unwrap();
+        {
+            // Huit segments que rien n'a fusionnés : de quoi faire une fusion de la politique.
+            let mut writer: tantivy::IndexWriter = index.writer(15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+            for n in 0..8_i64 {
+                writer
+                    .add_document(tantivy::doc!(fields.id => -1_000 - n))
+                    .unwrap();
+                writer.commit().unwrap();
+            }
+            writer.wait_merging_threads().unwrap();
+        }
+        assert_eq!(index.searchable_segment_ids().unwrap().len(), 8);
+
+        let cancelled = crate::Progress::new();
+        cancelled.cancel();
+        let stats = crate::index::update(mailbox.store(), &cancelled).unwrap();
+        assert_eq!(stats.indexed, 0);
+        let (index, _) = crate::index::open_or_create(mailbox.store()).unwrap();
+        assert_eq!(
+            index.searchable_segment_ids().unwrap().len(),
+            8,
+            "la passe annulée a fusionné"
+        );
+
+        // Le contrôle inverse : la passe suivante, elle, fusionne.
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let (index, _) = crate::index::open_or_create(mailbox.store()).unwrap();
+        assert!(index.searchable_segment_ids().unwrap().len() < 8);
+    }
+
+    /// Ajoute un message distinct par `n` — même dossier, contenu différent, donc un blob neuf.
+    fn add_numbered_message(store: &Store, n: u32) {
+        let raw = format!(
+            "From: Le Couvreur <couvreur@exemple.fr>\r\n\
+             To: moi@exemple.fr\r\n\
+             Subject: chantier {n}\r\n\
+             Message-ID: <chantier-{n}@exemple.fr>\r\n\
+             \r\n\
+             Le point sur le chantier, semaine {n}.\r\n"
+        );
+        let folder = store.folders().unwrap()[0].id;
+        let put = store.blobs().put(raw.as_bytes()).unwrap();
+        let writer = store.writer().unwrap();
+        let (id, _) = writer
+            .insert_message(&NewMessage {
+                blob: put.hash,
+                rfc822_id: None,
+                date: 1_700_000_200 + i64::from(n),
+                from_addr: "couvreur@exemple.fr",
+                from_name: None,
+                subject: "chantier",
+                size: raw.len() as u64,
+                has_attachments: false,
+            })
+            .unwrap();
+        writer
+            .insert_ref(
+                id,
+                folder,
+                1_700_000_200 + i64::from(n),
+                MessageFlags::empty(),
+            )
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
+    #[test]
     fn a_second_pass_indexes_nothing_and_costs_nothing() {
         let (_dir, mailbox) = mailbox();
         crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();

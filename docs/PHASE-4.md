@@ -3220,3 +3220,77 @@ qu'elle voulait dire.
 `measure-startup-model` prenaient encore e5 par défaut, `model-trim-bert` et `model-check-bert`
 sa source : un relevé lancé sans argument aurait mesuré un modèle qui n'est plus livré. Ils
 prennent granite.
+
+### 2026-10-18 (suite) — l'index plein texte ne fusionnait jamais ses segments
+
+**En clair d'abord.** L'index de la recherche par mots est fait de morceaux — des segments —, un
+de plus à chaque moisson qui apporte du courrier, et chaque recherche les parcourt tous. Tantivy
+les fusionne au fil de l'eau ; ici il ne l'a jamais fait, parce que le code lâchait l'outil
+d'écriture avant qu'une fusion puisse être enregistrée. **149 segments dans le store du
+quotidien après une semaine**, 115 dans le corpus de mesure, et rien ne les aurait jamais
+réduits : la recherche par mots ralentissait un peu à chaque moisson, pour toujours. Corrigé —
+149 deviennent 2 à la première arrivée, et le nombre reste borné ensuite.
+
+**Comment il s'est vu.** En cherchant pourquoi le store du quotidien répondait plus lentement que
+le corpus de mesure, sous la même charge : son index était plus gros pour moins de messages, 189
+Mio contre 117. Le `meta.json` de tantivy liste les segments ; 141 des 149 avaient moins de 2 000
+documents, la taille d'un paquet de l'indexation.
+
+**La cause, lue dans tantivy 0.26.1.** `index::writer::advance` ouvrait un écrivain par paquet,
+le validait et le lâchait. Un `commit` déclenche les fusions dans des fils de fond ; `Drop` marque
+l'écrivain mort, la fusion en cours va au bout — elle écrit son segment — puis tantivy la jette,
+faute d'écrivain vivant pour l'enregistrer. Aucune fusion n'était donc gardée, et l'historique public —
+depuis le 2026-09-15 — n'a pas connu d'autre forme. Le corpus de mesure porte une seule
+exception, un segment de 28 000 documents, d'une origine que cet historique ne dit pas.
+
+**La correction.** Un écrivain pour toute la passe — les fusions avancent pendant qu'on indexe
+—, et `wait_merging_threads` avant de le rendre. Annulation comprise : une fusion qu'on n'attend
+pas n'est pas arrêtée, elle tournerait hors du job et hors du compte de `Activity`, pour un
+résultat jeté ; sur une annulation, le dernier `commit` se fait donc sans politique de fusion, et
+il ne reste à attendre que les fusions déjà lancées. Deux tests, chacun avec son contrôle
+négatif : treize passes laissent moins de huit segments — quatorze sans l'attente ; une passe
+annulée sur huit segments n'en fusionne aucun — elle les fusionne sans la politique retirée.
+
+**Ce que la relecture a corrigé dans la correction.** La première version croyait que `Drop`
+arrêtait la fusion, et n'attendait pas sur une annulation : une première moisson annulée après la
+mise à jour aurait lancé la fusion de tout l'arriéré et l'aurait laissée tourner, détachée, pour
+rien. Et le banc mettait ses liens vers les blobs un cran trop bas, où le balayage des exécutions
+tuées ne les cherche pas : après un `Ctrl-C`, l'exécution suivante aurait effacé un répertoire qui
+menait encore au corpus. Chaque réplique a maintenant son répertoire jetable, le lien à sa racine.
+
+**Le banc, `cargo xtask measure-merge`**, sur deux répliques d'un store réel : la première
+arrivée après la correction, qui fusionne l'arriéré, les suivantes, puis la recherche plein texte
+sur l'index d'avant et sur celui d'après, requêtes alternées. Une arrivée y est un message
+existant remis à indexer, jamais un blob neuf — les blobs de la réplique sont ceux du store
+d'origine, par un lien. Relevés **indicatifs**, pris pendant que le jeu tenait la machine :
+
+| | corpus de mesure | store du quotidien |
+|---|---|---|
+| segments trouvés | 115, dont 104 de moins de 2 000 | 149, dont 141 |
+| première arrivée, fusion de l'arriéré comprise | 11,4 s, +81,8 Mio | 14,5 s, +128,2 Mio |
+| segments ensuite | 3 | 2 |
+| arrivées suivantes, médiane | 67,3 ms sur huit (max 135,8) | 64,7 ms sur deux |
+| recherche par mots, p95 avant → après | 2,37 → 1,83 ms | 3,31 → 2,06 ms |
+
+Pour chacune des 408 requêtes, **le même nombre de résultats** avant et après, compté sans
+plafond : la fusion ne perd rien. Avant la correction, une passe d'un message coûtait 55,9 à 69,3
+ms (`measure-followup`, corpus synthétique, 2026-09-11) ; les médianes d'aujourd'hui sont du même
+ordre, et le maximum est probablement l'arrivée qui fusionne huit petits segments — à établir au
+repos.
+
+**Le premier relevé a accusé le banc**, encore. Sur le store du quotidien, la première arrivée
+a travaillé quinze secondes et laissé 149 segments ; la fusion n'a abouti qu'à une arrivée
+suivante. Tantivy le disait, mais par `log` et pas par une erreur rendue — un banc sans abonné ne
+le voyait pas : « couldn't find segment in SegmentManager ». Le banc remettait à indexer les
+messages **les plus récents**, et le plus récent vivait seul dans un segment d'un document : le
+retirer vidait le segment, qui disparaissait au `commit`, et tantivy jetait la fusion qui le
+comptait. Un message neuf, dans le produit, ne retire rien ; le banc prend maintenant les plus
+anciens, qui vivent dans les segments de 2 000 de la reconstruction — et la fusion de l'arriéré
+aboutit à la première arrivée, 149 → 2, sans un avertissement.
+
+**Ce qui reste.** Les mêmes relevés au repos, trois exécutions dont la première jetée. Et deux
+réserves écrites : **toutes les latences de recherche de ce projet ont été relevées sur un index
+fragmenté** — fidèle à ce que le produit vivait, mais pas à ce qu'il vivra ; et la première
+arrivée après la mise à jour coûte, une fois, une quinzaine de secondes de job de fond et environ
+130 Mio de plus dans le processus qui indexe — le démon, ou la coquille qui l'embarque —, dont la
+crête n'a pas été mesurée sous le seuil de 500 Mo de la phase 2.

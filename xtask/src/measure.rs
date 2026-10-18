@@ -494,7 +494,7 @@ const SEARCH_BUDGET: Duration = Duration::from_millis(50);
 const PAGE: usize = 50;
 
 /// Une recherche complète : index, puis métadonnées. Rend le nombre de résultats.
-fn run_once(
+pub(crate) fn run_once(
     store: &Store,
     searcher: &mailcore::index::Searcher,
     query: &str,

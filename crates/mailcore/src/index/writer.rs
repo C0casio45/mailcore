@@ -14,6 +14,7 @@
 use crate::progress::Progress;
 
 use mail_parser::MessageParser;
+use tantivy::merge_policy::NoMergePolicy;
 use tantivy::{Index, IndexWriter, doc};
 
 use crate::error::Result;
@@ -134,6 +135,28 @@ pub fn update(store: &Store, progress: &Progress) -> Result<IndexStats> {
 /// marquer : une coupure entre les deux fait réindexer, sans conséquence.
 ///
 /// L'ordre inverse — marquer puis indexer — rendrait un message introuvable pour toujours.
+///
+/// ## Un écrivain pour toute la passe, qu'on laisse finir ses fusions
+///
+/// Chaque `commit` écrit un segment, et une recherche les parcourt **tous**. Tantivy les fusionne
+/// dans des fils de fond que le `commit` déclenche, et **seul un écrivain vivant en garde le
+/// résultat** : `Drop` marque l'écrivain mort, la fusion en cours va pourtant au bout — elle
+/// écrit son segment — puis tantivy la jette, faute de qui l'enregistre. La première version
+/// ouvrait un écrivain par paquet et le lâchait sitôt validé ; aucune fusion n'était donc jamais
+/// gardée, et chaque moisson qui apportait du courrier laissait un segment de plus, pour toujours.
+/// Trouvé le 2026-10-18 : **149 segments** dans le store du quotidien après une semaine d'usage,
+/// dont 141 de moins de 2 000 documents, et 115 dans le corpus de mesure — sur lequel les
+/// latences de la recherche ont toutes été relevées.
+///
+/// L'écrivain vit donc le temps de la passe — les fusions avancent pendant qu'on indexe — et on
+/// attend la fin des siennes avant de le rendre, **annulation comprise** : une fusion qu'on
+/// n'attend pas n'est pas arrêtée, elle tourne hors du job, hors du compte de `Activity`, pour un
+/// résultat jeté. Sur une annulation, le dernier `commit` se fait sans règle de fusion, pour ne
+/// rien lancer de neuf — sur un store de 149 segments, il aurait lancé la fusion de tout
+/// l'arriéré ; ne restent à attendre que les fusions des paquets précédents, déjà en route. Seul
+/// un échec en chemin, par `?`, laisse encore une fusion se perdre : rare, et sans perte de
+/// document. La première version de cette correction croyait que `Drop` arrêtait la fusion, et
+/// n'attendait pas sur une annulation — lu dans tantivy 0.26.1 par une relecture le même jour.
 fn advance(
     store: &Store,
     index: &Index,
@@ -150,6 +173,8 @@ fn advance(
     let pending = store.unindexed_total()?;
     progress.set_total(pending);
     let mut remaining = pending;
+    let mut writer: Option<IndexWriter> = None;
+    let mut cancelled = false;
 
     while remaining > 0 {
         let rows = store.unindexed(ROWS.min(remaining as usize))?;
@@ -158,9 +183,11 @@ fn advance(
         }
         remaining = remaining.saturating_sub(rows.len() as u64);
 
-        let mut writer: IndexWriter = index.writer(WRITER_HEAP)?;
+        let writer = match &mut writer {
+            Some(writer) => writer,
+            None => writer.insert(index.writer(WRITER_HEAP)?),
+        };
         let mut done: Vec<crate::MessageId> = Vec::with_capacity(rows.len());
-        let mut cancelled = false;
 
         for row in &rows {
             if progress.is_cancelled() {
@@ -168,7 +195,7 @@ fn advance(
                 cancelled = true;
                 break;
             }
-            index_one(store, &writer, fields, &parser, row, &mut text, &mut stats)?;
+            index_one(store, writer, fields, &parser, row, &mut text, &mut stats)?;
             done.push(row.id);
             progress.advance(1);
 
@@ -178,12 +205,23 @@ fn advance(
         }
 
         // Ce qui a été écrit est validé même sur une annulation : une interruption arrête le
-        // travail, elle ne le jette pas.
+        // travail, elle ne le jette pas. Mais ce `commit`-là ne lance aucune fusion.
+        if cancelled {
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+        }
         writer.commit()?;
         store.mark_indexed(&done)?;
         if cancelled {
             break;
         }
+    }
+
+    if let Some(writer) = writer
+        && let Err(error) = writer.wait_merging_threads()
+    {
+        // Les documents sont validés et marqués : une fusion ratée coûte de la vitesse, pas un
+        // message, et la suivante la retentera.
+        tracing::warn!(%error, "fusion des segments de l'index interrompue");
     }
 
     tracing::info!(

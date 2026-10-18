@@ -245,7 +245,14 @@ il ajoute deux leçons que le carnet ne pouvait pas donner :
 - **rendre l'écriture idempotente est ce qui rend l'ordre sûr.** Chaque indexation retire d'abord
   le document de même identifiant (`delete_term`), donc réindexer ne fait rien. C'est ce qui
   permet de valider l'index **puis** de marquer : une coupure entre les deux fait réindexer sans
-  conséquence, là où l'ordre inverse rendrait un message introuvable pour toujours.
+  conséquence, là où l'ordre inverse rendrait un message introuvable pour toujours ;
+- **un écrivain tantivy lâché ne garde aucune fusion** — trouvé le 2026-10-18, un mois après.
+  `Drop` laisse la fusion en cours aller au bout, puis la jette. Un écrivain par paquet, lâché
+  sitôt validé, n'a donc jamais rien fusionné : chaque moisson ajoutait un segment que toute
+  recherche parcourt, 149 en une semaine dans le store du quotidien. L'écrivain vit le temps de
+  la passe et attend ses fusions (`wait_merging_threads`), **annulation comprise**, la politique
+  de fusion retirée avant le dernier `commit`. Et tantivy dit une fusion jetée par `log`, pas par
+  une erreur rendue : un banc sans abonné ne la voit pas.
 
 **Le banc `measure-followup` existe depuis le 2026-09-11**, et il a payé son écriture en une
 heure — deux leçons de méthode :

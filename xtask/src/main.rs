@@ -23,6 +23,7 @@ mod findq;
 mod followup;
 mod inspect;
 mod measure;
+mod merge;
 mod model;
 mod probe;
 mod profile;
@@ -115,6 +116,24 @@ enum Command {
         /// Taille du corpus synthétique.
         #[arg(long, default_value_t = 20_000)]
         messages: usize,
+    },
+
+    /// Ce que coûte et rapporte la fusion des segments de l'index plein texte, sur deux répliques
+    /// d'un store réel : la première arrivée, qui fusionne l'arriéré, les suivantes, et la recherche
+    /// avant et après. **Ne compile pas** : compiler d'abord, laisser la machine retomber.
+    ///
+    /// Le store est lu, jamais écrit : le banc travaille sur des copies, et une arrivée y est un
+    /// message existant remis à indexer — jamais un blob neuf, qui passerait par le lien des blobs.
+    MeasureMerge {
+        /// Le store d'origine. Lu, jamais écrit.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Combien d'arrivées, une par passe ; la première fusionne l'arriéré.
+        #[arg(long, default_value_t = 9)]
+        arrivals: usize,
+        /// Tours du jeu de requêtes ; le premier est jeté.
+        #[arg(long, default_value_t = 4)]
+        repeats: usize,
     },
 
     /// Mesure la latence de recherche et rend le p95 (critère 4).
@@ -887,6 +906,11 @@ fn main() -> Result<()> {
         Command::MeasureInvitations { store, gaps } => calendar::measure(&store, gaps),
         Command::MeasureReplies { store, limit } => replies::measure(&store, limit),
         Command::MeasureFollowup { messages } => followup::measure(messages),
+        Command::MeasureMerge {
+            store,
+            arrivals,
+            repeats,
+        } => merge::measure(&store, arrivals, repeats),
         Command::MeasureSemanticSearch {
             store,
             vectors,
