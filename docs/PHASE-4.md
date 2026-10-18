@@ -3209,9 +3209,9 @@ dont la première jetée, jeu v5, 30 requêtes × 3 tours. Hybride **39,3 et 42,
 32,9 et 33,0), les mots seuls 21,0 et 22,3 ; le réveil du sens 382 et 373 ms, l'enfant chaud à
 371 Mio. **Le critère 2 tient sur le store du quotidien, avec 7 à 11 ms de marge** — la moitié de
 celle du corpus de mesure, 25,8 et 28,1 ms le 2026-10-10. **Et l'écart est l'index fragmenté.**
-Sur les mêmes phrases, tantivy seul y met 17 à 18 ms de médiane et 24 de p95 avec ses 149
-segments, 4,2 à 4,5 et 6,7 à 7,3 une fois fusionné (`measure-merge --phrases`, entrée de la
-nuit) : l'essentiel des 21 ms des mots seuls de bout en bout. La correction des fusions n'est pas
+Sur les mêmes phrases, tantivy seul y met 16 ms de médiane et 24 de p95 avec ses 149 segments,
+4,2–4,3 et 6,7–6,9 une fois fusionné (`measure-merge --phrases`, au calme, entrée de la nuit) :
+l'essentiel des 21 ms des mots seuls de bout en bout. La correction des fusions n'est pas
 encore dans l'application du quotidien ; ce relevé est à refaire quand son index aura fusionné.
 *La première version de ce paragraphe disait l'inverse — « l'écart n'est pas dans tantivy » — en
 comparant des mots seuls, à 1,1–1,3 ms, à des phrases de bout en bout : deux jeux différents.
@@ -3566,16 +3566,23 @@ Puis la suite de `mailcore` cent fois de suite, nouveaux tests compris : cent su
 
 `measure-merge` prend maintenant `--phrases`, un jeu de requêtes du critère 1 dont il ne lit que
 les textes, et compare avant et après sur les mêmes requêtes, l'ordre alterné. Jeu v5, 30
-phrases, trois exécutions par store en alternant les stores, la première jetée. **Réserve** : la
-relecture lisait le code pendant ce relevé — une charge légère, non chiffrée. Les valeurs absolues
-en sont un peu gonflées — l'ouverture y monte à 44–46 ms contre 37 au calme — ; le rapport avant
-après, lui, est pris requête par requête en alternant, et c'est lui qui compte. À refaire au repos.
+phrases, trois exécutions par store en alternant les stores, la première jetée. Deux séries : la
+première pendant que la relecture lisait le code, une charge légère non chiffrée ; la seconde au
+calme, à 23 h 08, sur **une copie de l'index fragmenté du store du quotidien**, gardée juste avant
+que l'application recompilée ne le fusionne — après, la comparaison n'y serait plus possible. Les
+deux séries s'accordent ; la table donne la seconde.
 
 | tantivy seul, avant → après la fusion | corpus de mesure | store du quotidien |
 |---|---|---|
-| phrases du critère 1, p50 | 13,9–14,3 → 5,3–5,5 ms | 17,1–18,0 → 4,2–4,5 ms |
-| phrases du critère 1, p95 | 20,9–23,1 → 8,8–8,9 ms | 24,2–24,7 → 6,7–7,3 ms |
-| mots seuls, p95 | 1,35–1,40 → 1,12–1,16 ms | 1,49–1,77 → 1,14–1,26 ms |
+| phrases du critère 1, p50 | 14,0–17,1 → 5,6–6,4 ms | 15,8–16,1 → 4,2–4,3 ms |
+| phrases du critère 1, p95 | 21,2–23,4 → 9,4–9,6 ms | 23,6–23,7 → 6,7–6,9 ms |
+| mots seuls, p95 | 1,37–1,47 → 1,18–1,35 ms | 1,47–1,55 → 1,18–1,20 ms |
+| ouverture de l'index, p50 | 33,0–34,1 → 1,71–1,74 ms | 41,4–41,5 → 1,43–1,44 ms |
+
+Et le disque, encore : dans la dernière exécution sur la copie, la première arrivée a pris
+**39 s** et les suivantes 1 à 3 s, après plusieurs gigaoctets de répliques écrites d'affilée. La
+fusion de l'arriéré que l'application fera une fois coûtera donc de six secondes à une
+quarantaine selon l'état de ce disque — toujours dans un job de fond.
 
 Pour chacune des 30 phrases, le même nombre de résultats des deux côtés, compté sans plafond.
 **Trois à quatre fois plus rapide sur ce qu'on tape, presque rien sur un mot seul** : chaque mot
