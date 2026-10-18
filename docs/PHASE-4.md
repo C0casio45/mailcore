@@ -3264,6 +3264,11 @@ La décision revient à l'utilisateur : une passe explicite maintenant, environ 
 limite recalée sur la durée qu'elle voulait dire ; ou l'arriéré rendu à la passe de fond, avec ses
 deux conditions, les grosses passes qui effacent restant seules à demander un geste.
 
+**Rattrapé le soir même**, par la passe explicite que l'utilisateur a demandée : `mail vectors
+--bert` sur le store du quotidien, **1 520 messages en 109,2 s, 14 msg/s** — le débit du
+2026-10-10, un jeu tournant à côté. Recompté en lecture seule : 50 100 vectorisés sur 50 100. La
+question de fond — rendre l'arriéré à la passe de fond, avec ses deux conditions — reste ouverte.
+
 **Les bancs mesurent ce qui est livré.** `measure-semantic-search`, `measure-arrival` et
 `measure-startup-model` prenaient encore e5 par défaut, `model-trim-bert` et `model-check-bert`
 sa source : un relevé lancé sans argument aurait mesuré un modèle qui n'est plus livré. Ils
