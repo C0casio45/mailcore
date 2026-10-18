@@ -292,6 +292,43 @@ pub fn list(root: Option<&Utf8PathBuf>) -> Result<()> {
 fn report(store: &Store, id: mailcore::OutboxId, outcome: Outcome) -> Result<()> {
     let line = store.outgoing(id)?;
     let error = line.as_ref().and_then(|it| it.last_error.clone());
+    // **Pris en charge ailleurs n'est pas « tout va bien ».** Un autre remettant — le facteur
+    // d'une coquille ouverte sur le même store — a pris la ligne ; ce qui compte est comment sa
+    // tentative a fini. Un doute ou un refus doivent se dire, et faire échouer la commande,
+    // exactement comme s'ils venaient d'ici : relevé par une relecture le 2026-10-19, la
+    // première version rendait 0 et taisait le doute.
+    let outcome = match (outcome, line.as_ref().map(|it| it.state)) {
+        (Outcome::NoLongerDue, None) => {
+            println!("#{} : annulé avant de partir — rien n'est parti.", id.0);
+            return Ok(());
+        }
+        (Outcome::NoLongerDue, Some(SendState::Sent)) => {
+            println!(
+                "#{} envoyé — par un autre remettant, le facteur de la coquille sans doute.",
+                id.0
+            );
+            return Ok(());
+        }
+        (Outcome::NoLongerDue, Some(SendState::Sending)) => {
+            println!(
+                "#{} : en cours d'envoi par un autre remettant — `mail outbox` dira la suite.",
+                id.0
+            );
+            return Ok(());
+        }
+        (Outcome::NoLongerDue, Some(state)) => {
+            println!(
+                "#{} : pris en charge par un autre remettant, dont la tentative a fini ainsi :",
+                id.0
+            );
+            match state {
+                SendState::Committing => Outcome::Doubtful,
+                SendState::Failed => Outcome::Failed,
+                _ => Outcome::Deferred,
+            }
+        }
+        (other, _) => other,
+    };
     match outcome {
         Outcome::Sent => {
             println!("#{} envoyé.", id.0);
@@ -332,6 +369,8 @@ fn report(store: &Store, id: mailcore::OutboxId, outcome: Outcome) -> Result<()>
             println!("Vérifier dans les messages envoyés du fournisseur avant de décider.");
             bail!("#{} est dans un état incertain", id.0)
         }
+        // Traité plus haut : chaque état de la ligne y a sa phrase ou son équivalent.
+        Outcome::NoLongerDue => Ok(()),
     }
 }
 
@@ -661,4 +700,65 @@ pub fn cancel(root: Option<&Utf8PathBuf>, id: i64) -> Result<()> {
     println!("#{id} annulé : il ne partira pas.");
     println!("Son contenu devient un blob orphelin — `mail doctor` le compte.");
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use mailcore::{AccountKind, BlobHash};
+
+    /// Une ligne de file dans l'état donné ; `None` pour une ligne annulée.
+    fn line_in(state: Option<SendState>) -> (tempfile::TempDir, Store, mailcore::OutboxId) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let store = Store::open(&root).unwrap();
+        let account = {
+            let writer = store.writer().unwrap();
+            let id = writer
+                .upsert_account(AccountKind::Imap.as_str(), "compte")
+                .unwrap();
+            writer.commit().unwrap();
+            id
+        };
+        let id = store
+            .enqueue(
+                account,
+                BlobHash::from_bytes([7_u8; 32]),
+                "marie@exemple.fr",
+                &["jean@ailleurs.fr".to_owned()],
+                42,
+                1_000,
+                None,
+            )
+            .unwrap();
+        match state {
+            None => assert!(store.cancel_outgoing(id).unwrap()),
+            Some(state) => store.commit_outgoing(id, state).unwrap(),
+        }
+        (dir, store, id)
+    }
+
+    #[test]
+    fn a_line_taken_elsewhere_reports_how_that_attempt_ended() {
+        // Un autre remettant — le facteur d'une coquille ouverte — a pris la ligne. Ce qui compte
+        // est la fin de **sa** tentative : un doute ou un refus font échouer la commande comme
+        // s'ils venaient d'ici ; un envoi réussi, une annulation, un envoi en cours ou un report
+        // ne sont pas des échecs. La première version rendait 0 dans tous les cas.
+        for (state, fails) in [
+            (None, false),
+            (Some(SendState::Sent), false),
+            (Some(SendState::Sending), false),
+            (Some(SendState::Queued), false),
+            (Some(SendState::Committing), true),
+            (Some(SendState::Failed), true),
+        ] {
+            let (_dir, store, id) = line_in(state);
+            assert_eq!(
+                report(&store, id, Outcome::NoLongerDue).is_err(),
+                fails,
+                "{state:?}"
+            );
+        }
+    }
 }

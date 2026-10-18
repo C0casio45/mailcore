@@ -28,5 +28,8 @@ mailauth.workspace           = true
 mailsmtp.workspace           = true
 rpassword.workspace          = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

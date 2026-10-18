@@ -1628,22 +1628,31 @@ mod tests {
         let (_dir, mailbox) = mailbox();
         crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
         assert!(mailbox.store().indexed_count().unwrap() > 0);
+        // **La boîte relâche l'index avant qu'on l'efface.** Son lecteur suit les validations et
+        // garde les segments mappés en mémoire ; sous Windows, un fichier mappé qu'on supprime
+        // reste « en suppression », et le répertoire refuse de partir — erreur 145. C'est ce qui
+        // faisait tomber ce test sur la CI Windows le 2026-10-09, et pas le comportement qu'il
+        // vérifie : la divergence entre les drapeaux et l'index, pas un effacement sous une
+        // application ouverte.
+        let root = mailbox.store().root().to_owned();
+        drop(mailbox);
+        let store = Store::open(&root).unwrap();
 
         // Le répertoire de recherche disparaît — disque remplacé, nettoyage trop zélé.
-        std::fs::remove_dir_all(mailbox.store().search_dir().as_std_path()).unwrap();
+        std::fs::remove_dir_all(store.search_dir().as_std_path()).unwrap();
 
         // Le compromis, vérifié plutôt que décrit : sans rien de nouveau, la passe ne fait rien
         // et ne le découvre pas. C'est ce qu'on a acheté avec les 15 ms.
-        let quiet = crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let quiet = crate::index::update(&store, &crate::Progress::new()).unwrap();
         assert_eq!(quiet.indexed, 0);
 
         // Un message arrive, comme une moisson l'apporterait.
-        add_one_message(mailbox.store());
+        add_one_message(&store);
 
-        let stats = crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let stats = crate::index::update(&store, &crate::Progress::new()).unwrap();
         assert_eq!(stats.indexed, 3, "la divergence n'a pas été rattrapée");
 
-        let reopened = Mailbox::open(mailbox.store().root()).unwrap();
+        let reopened = Mailbox::open(&root).unwrap();
         assert_eq!(reopened.search("facture", 10).unwrap().len(), 2);
     }
 

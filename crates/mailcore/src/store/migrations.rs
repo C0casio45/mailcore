@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// La version de schéma que ce binaire sait lire et écrire.
-pub const SCHEMA_VERSION: u32 = 15;
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Le schéma initial.
 ///
@@ -742,6 +742,55 @@ const SCHEMA_V15: &str = r"
 ALTER TABLE flag_pushes ADD COLUMN seen INTEGER NOT NULL DEFAULT 1;
 ";
 
+/// v16 — `outbox.id` en `AUTOINCREMENT` : un numéro d'envoi ne désigne qu'un seul message, pour
+/// toujours.
+///
+/// ## Pourquoi, depuis le 2026-10-19
+///
+/// `INTEGER PRIMARY KEY` sans `AUTOINCREMENT` est un alias de `rowid`, et SQLite **réutilise**
+/// le plus grand `rowid` libéré — la leçon du carnet, écrite le 2026-09-11 pour `messages.id`.
+/// Dans la file, ce n'était pas une hypothèse lointaine : on annule le dernier message, on en
+/// envoie un autre, il reprend le même numéro. Une relecture l'a trouvé le jour où la remise a
+/// appris à relire sa ligne : un facteur qui tenait encore l'ancien numéro dans son lot relisait
+/// le **nouveau** message et l'envoyait avec le compte de l'ancien — son serveur, ses
+/// identifiants. Et les gestes de l'utilisateur désignent une ligne par ce numéro : annuler,
+/// renvoyer, trancher un doute sur une liste affichée un instant trop tôt atteignaient un
+/// autre message.
+///
+/// ## La table est refaite, colonne par colonne
+///
+/// SQLite ne sait pas ajouter `AUTOINCREMENT` à une colonne existante. Les colonnes sont
+/// nommées une à une à la copie, jamais `SELECT *` : `size` (v7) et `resendable` (v10) ont été
+/// ajoutées en fin de table, et une liste implicite dépendrait de cet ordre. Les numéros sont
+/// gardés tels quels — un client en a peut-être un en main —, et `sqlite_sequence` part du plus
+/// grand. L'index de la boucle de remise disparaît avec l'ancienne table et se recrée.
+const SCHEMA_V16: &str = r"
+CREATE TABLE outbox_v16 (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    blob_hash   BLOB NOT NULL,
+    sender      TEXT NOT NULL,
+    recipients  TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    queued_at   INTEGER NOT NULL,
+    tried_at    INTEGER,
+    last_error  TEXT,
+    retry_after INTEGER,
+    size        INTEGER NOT NULL DEFAULT 0,
+    resendable  INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO outbox_v16
+    (id, account_id, blob_hash, sender, recipients, state, attempts, queued_at, tried_at,
+     last_error, retry_after, size, resendable)
+SELECT id, account_id, blob_hash, sender, recipients, state, attempts, queued_at, tried_at,
+       last_error, retry_after, size, resendable
+  FROM outbox;
+DROP TABLE outbox;
+ALTER TABLE outbox_v16 RENAME TO outbox;
+CREATE INDEX outbox_pending ON outbox (state, retry_after);
+";
+
 /// Applique les migrations manquantes.
 ///
 /// Sans effet si le store est déjà à jour — l'appeler à chaque ouverture est le mode
@@ -810,6 +859,9 @@ pub fn apply(conn: &Connection) -> Result<()> {
     }
     if current < 15 {
         tx.execute_batch(SCHEMA_V15)?;
+    }
+    if current < 16 {
+        tx.execute_batch(SCHEMA_V16)?;
     }
     // `PRAGMA` ne se paramètre pas ; la valeur interpolée est une constante de compilation.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1413,6 +1465,138 @@ mod tests {
             !resendable,
             "une ligne d'avant la migration se dit renvoyable sans que rien ne l'ait classée"
         );
+    }
+
+    /// Une base au schéma 15, avec deux envois consécutifs, 6 et 7 — le lot du facteur de la
+    /// relecture. Consécutifs, parce que SQLite donne le plus grand numéro présent plus un :
+    /// c'est en effaçant le dernier qu'on le récupère.
+    fn at_v15_with_two_sends() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        db::apply_pragmas(&conn).unwrap();
+        for step in [
+            SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+            SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
+        ] {
+            conn.execute_batch(step).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 15_u32).unwrap();
+        fixture(&conn);
+        for (id, state) in [(6, "sent"), (7, "committing")] {
+            conn.execute(
+                "INSERT INTO outbox
+                     (id, account_id, blob_hash, sender, recipients, state, attempts, queued_at,
+                      tried_at, last_error, retry_after, size, resendable)
+                 VALUES (?1, 1, ?2, 'marie@exemple.fr', 'jean@ailleurs.fr', ?3, 2, 900, 950,
+                         'coupure après le point final', 1200, 42, 1)",
+                rusqlite::params![id, &[0xAB_u8; 32][..], state],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn insert_send(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO outbox (account_id, blob_hash, sender, recipients, state, queued_at)
+             VALUES (1, ?1, 'marie@exemple.fr', 'paul@ailleurs.fr', 'queued', 2000)",
+            [&[0xCD_u8; 32][..]],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn a_freed_send_number_is_never_given_to_another_message_after_v16() {
+        // **Le contrôle qui prouve le défaut d'abord.** Au schéma 15, effacer le dernier envoi
+        // puis en mettre un en file redonne le même numéro : un client qui tenait « #7 » désigne
+        // alors un autre message.
+        let before = at_v15_with_two_sends();
+        before
+            .execute("DELETE FROM outbox WHERE id = 7", [])
+            .unwrap();
+        assert_eq!(
+            insert_send(&before),
+            7,
+            "la précondition : sans AUTOINCREMENT, SQLite réutilise le numéro"
+        );
+
+        let conn = at_v15_with_two_sends();
+        apply(&conn).unwrap();
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // Rien n'est perdu à la copie : chaque colonne, numéros compris.
+        let row: (
+            i64,
+            String,
+            i64,
+            i64,
+            Option<i64>,
+            String,
+            Option<i64>,
+            i64,
+            bool,
+        ) = conn
+            .query_row(
+                "SELECT id, state, attempts, queued_at, tried_at, last_error, retry_after, size,
+                        resendable
+                   FROM outbox WHERE id = 7",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                7,
+                "committing".to_owned(),
+                2,
+                900,
+                Some(950),
+                "coupure après le point final".to_owned(),
+                Some(1200),
+                42,
+                true
+            ),
+            "une colonne d'un envoi a bougé pendant la migration — un doute surtout"
+        );
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // Le défaut, fermé : le numéro libéré ne revient pas.
+        conn.execute("DELETE FROM outbox WHERE id = 7", []).unwrap();
+        assert_eq!(insert_send(&conn), 8, "un numéro d'envoi a été réutilisé");
+
+        // Ce que la table refaite doit garder : l'index de la boucle de remise, et la cascade
+        // depuis le compte.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM outbox
+                  WHERE state IN ('queued', 'sending') AND retry_after IS NULL",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("outbox_pending"), "{plan}");
+        conn.execute("DELETE FROM accounts WHERE id = 1", [])
+            .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "la file d'un compte supprimé lui a survécu");
     }
 
     #[test]

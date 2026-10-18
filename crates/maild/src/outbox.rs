@@ -251,6 +251,12 @@ fn deliver(store: &Store, accounts: &[Account], job: &Outgoing, now: i64) -> boo
             );
             false
         }
+        Ok(Outcome::NoLongerDue) => {
+            // Annulée, remise par un autre remettant, reportée ou tranchée depuis la lecture du
+            // lot : rien n'est parti, et ce n'est pas un échec.
+            tracing::debug!(job = job.id.0, "ligne plus à remettre");
+            false
+        }
         Ok(other) => {
             tracing::info!(job = job.id.0, outcome = ?other, "envoi non abouti");
             false

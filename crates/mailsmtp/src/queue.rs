@@ -137,6 +137,10 @@ pub enum Outcome {
     Failed,
     /// Le serveur a peut-être le message. **Rien d'automatique ne suivra.**
     Doubtful,
+    /// La ligne n'était plus à remettre au moment de la prendre — annulée, remise par un autre
+    /// remettant, reportée, ou tranchée — et **rien n'est parti**. Voir
+    /// `mailcore::store::outbox::DeliveryLock`.
+    NoLongerDue,
 }
 
 impl Outcome {
@@ -156,32 +160,64 @@ impl Outcome {
 ///
 /// ## Une erreur du store arrête l'envoi
 ///
-/// Si `commit_outgoing` échoue avant la remise, rien n'est envoyé. Si le rappel `frontier`
+/// Si la prise de la ligne échoue avant la remise, rien n'est envoyé. Si le rappel `frontier`
 /// échoue, `deliver` doit renoncer **avant** le point final — c'est son contrat, et
 /// [`Transport::deliver`] le dit. Sans la frontière sur le disque, envoyer serait indéfendable :
 /// une coupure juste après laisserait une ligne en `sending`, donc remise, donc un doublon.
 ///
+/// ## La ligne passée est une lecture **ancienne**, et elle est relue sous le verrou
+///
+/// `job` vient d'une lecture faite plus tôt — le lot de dix du facteur, la ligne que
+/// `mail send` vient de mettre en file. Entre-temps, elle a pu être annulée, remise par un autre
+/// remettant, reportée ou tranchée. Jusqu'au 2026-10-19, cette fonction écrivait `sending` sans
+/// regarder : un message annulé partait quand même, et deux remettants sur un même store
+/// envoyaient deux fois. Elle prend maintenant le verrou de remise du store, **relit** la ligne,
+/// ne la prend que si elle est encore dans l'état relu, et rend [`Outcome::NoLongerDue`] sinon —
+/// sans un octet sur le réseau. Voir `mailcore::store::outbox::DeliveryLock`.
+///
+/// ## L'état décide sur la relecture, pas sur la lecture de l'appelant
+///
+/// La lecture passée ne sert qu'à désigner la ligne. Un état douteux n'est jamais remis — c'est
+/// la règle du critère 2, ici **en plus** du filtre SQL de `Store::deliverable`, parce qu'un
+/// appelant peut passer une ligne qu'il a lue lui-même —, mais c'est la relecture qui le dit :
+/// `mail send` relit sa ligne juste après l'avoir mise en file, et le facteur d'une coquille
+/// ouverte peut l'avoir prise entre-temps. La refuser comme une faute de l'appelant faisait
+/// échouer la commande sur un message parfaitement envoyé.
+///
 /// # Errors
 ///
-/// [`Error::Unsendable`] si la ligne n'est pas remettable — un état douteux, ou un corps absent
-/// du magasin de blobs. Les échecs de remise, eux, ne sont **pas** des erreurs de cette
-/// fonction : ils sont écrits dans le store et rendus comme [`Outcome`].
+/// [`Error::Unsendable`] si le corps est absent du magasin de blobs, ou si le verrou de remise
+/// ou la relecture échouent. Les échecs de remise, eux, ne sont **pas** des erreurs de cette
+/// fonction : ils sont écrits dans le store et rendus comme [`Outcome`] — et une ligne qui n'est
+/// plus à remettre, douteuse comprise, rend [`Outcome::NoLongerDue`].
 pub fn deliver_one(
     store: &Store,
     transport: &mut dyn Transport,
     job: &Outgoing,
     now: i64,
 ) -> Result<Outcome> {
-    if !job.state.is_deliverable() {
-        // Le refus est ici **en plus** du filtre SQL de `Store::deliverable`. Deux barrières
-        // pour la même règle, parce qu'un appelant peut passer une ligne qu'il a lue lui-même.
-        return Err(Error::Unsendable {
-            reason: format!(
-                "un message à l'état {} ne se remet pas automatiquement",
-                job.state.as_str()
-            ),
-        });
+    // **Un seul remettant à la fois**, tenu jusqu'au retour de cette fonction : la ligne est
+    // relue, prise, remise et consignée sous le même verrou.
+    let _lock = store.lock_delivery().map_err(|source| Error::Unsendable {
+        reason: format!("le verrou de remise n'a pas pu être pris : {source}"),
+    })?;
+    let fresh = store.outgoing(job.id).map_err(|source| Error::Unsendable {
+        reason: format!("la file n'a pas pu être relue : {source}"),
+    })?;
+    let Some(fresh) = fresh else {
+        tracing::info!(job = job.id.0, "ligne disparue avant la remise : annulée");
+        return Ok(Outcome::NoLongerDue);
+    };
+    let due = fresh.state.is_deliverable() && fresh.retry_after.is_none_or(|at| at <= now);
+    if !due {
+        tracing::info!(
+            job = job.id.0,
+            state = fresh.state.as_str(),
+            "ligne plus à remettre : remise, reportée ou tranchée entre-temps"
+        );
+        return Ok(Outcome::NoLongerDue);
     }
+    let job = &fresh;
 
     // Le corps est lu **avant** de marquer la ligne : un blob absent est un défaut local, et
     // marquer `sending` pour rien poserait une tentative que rien n'a tentée.
@@ -206,30 +242,41 @@ pub fn deliver_one(
         })?;
 
     // **Avant tout octet réseau.** Une coupure ici laisse la ligne en `sending`, donc
-    // remettable — ce qui est exact, puisque rien n'est parti.
-    store
-        .commit_outgoing(job.id, SendState::Sending)
+    // remettable — ce qui est exact, puisque rien n'est parti. Et la prise est conditionnelle :
+    // une annulation arrivée entre la relecture et ici la fait échouer, et rien ne part.
+    let claimed = store
+        .claim_outgoing(job.id, job.state)
         .map_err(|source| Error::Unsendable {
             reason: format!("la file n'a pas pu être marquée avant l'envoi : {source}"),
         })?;
+    if !claimed {
+        tracing::info!(
+            job = job.id.0,
+            "ligne changée avant la prise : rien n'est parti"
+        );
+        return Ok(Outcome::NoLongerDue);
+    }
 
     let mut frontier_error = None;
     let outcome = {
         let mut frontier = || -> Result<()> {
-            match store.commit_outgoing(job.id, SendState::Committing) {
-                Ok(()) => Ok(()),
-                Err(source) => {
-                    let reason = format!("la frontière du doute n'a pas pu être écrite : {source}");
-                    frontier_error = Some(reason.clone());
-                    Err(Error::Unsendable { reason })
-                }
-            }
+            let refusal = match store.cross_frontier(job.id) {
+                Ok(true) => return Ok(()),
+                Ok(false) => "la ligne n'était plus en cours d'envoi au moment du corps".to_owned(),
+                Err(source) => format!("la frontière du doute n'a pas pu être écrite : {source}"),
+            };
+            frontier_error = Some(refusal.clone());
+            Err(Error::Unsendable { reason: refusal })
         };
         transport.deliver(job, &mut body, &mut frontier)
     };
 
     match outcome {
         Ok(()) => {
+            // **Inconditionnelle, et c'est voulu.** Pendant le transfert du corps, la ligne est
+            // `committing`, donc montrée comme douteuse, et l'utilisateur peut trancher. S'il a
+            // cliqué « Renvoyer », une écriture conditionnée à `committing` ne s'appliquerait
+            // pas : la ligne resterait en file, et le message — qui vient de partir — repartirait.
             store
                 .record_attempt(job.id, SendState::Sent, now, None, None, false)
                 .map_err(|source| Error::Unsendable {
@@ -688,6 +735,12 @@ mod tests {
     fn a_doubtful_line_is_refused_even_when_handed_over_directly() {
         // La deuxième barrière : le filtre SQL de `Store::deliverable` ne protège que les
         // appelants qui l'utilisent. Un appelant qui lit la ligne lui-même se heurte à celle-ci.
+        //
+        // **Ce que ce test vérifie a changé de forme le 2026-10-19, pas de fond.** Il attendait
+        // une erreur ; il attend maintenant `NoLongerDue`. Sa raison écrite — un message douteux
+        // ne part pas, même passé à la main — tient toujours, et c'est elle qu'il vérifie : rien
+        // n'arrive au transport. L'erreur, elle, faisait échouer `mail send` sur un message que
+        // le facteur d'une coquille ouverte venait d'envoyer — voir `deliver_one`.
         let (_dir, store, account, blob) = fixture();
         let job = enqueue(&store, account, blob);
         store
@@ -696,11 +749,16 @@ mod tests {
         let doubtful = store.outgoing(job.id).unwrap().unwrap();
 
         let mut transport = Scripted::succeeding();
-        let outcome = deliver_one(&store, &mut transport, &doubtful, 2_000);
-        assert!(matches!(outcome, Err(Error::Unsendable { .. })));
+        let outcome = deliver_one(&store, &mut transport, &doubtful, 2_000).unwrap();
+        assert_eq!(outcome, Outcome::NoLongerDue);
         assert!(
             transport.body.is_empty(),
             "le corps est parti au transport malgré le refus"
+        );
+        assert_eq!(
+            store.outgoing(job.id).unwrap().unwrap().state,
+            SendState::Committing,
+            "le doute a été effacé"
         );
     }
 
@@ -881,6 +939,168 @@ mod tests {
         let ready = store.deliverable(1_000 + HOLD, 10).unwrap();
         assert_eq!(ready.len(), 1, "à l'échéance, la ligne devient remettable");
         assert_eq!(ready[0].id, id);
+    }
+
+    // ------------------------------------------------------------------------------------
+    // Une lecture ancienne, et deux remettants — le verrou du 2026-10-19
+    // ------------------------------------------------------------------------------------
+
+    #[test]
+    fn a_line_already_sent_is_not_sent_again_from_an_old_read() {
+        // Le facteur lit dix lignes d'un coup, puis les remet une à une : quand il arrive à la
+        // dixième, sa lecture a des secondes, parfois des minutes. Un autre remettant a pu
+        // l'envoyer entre-temps. Sans la relecture, la ligne repartait — et l'état `sent` était
+        // écrasé par `sending`.
+        let (_dir, store, account, blob) = fixture();
+        let job = enqueue(&store, account, blob);
+        let mut first = Scripted::succeeding();
+        assert_eq!(
+            deliver_one(&store, &mut first, &job, 2_000).unwrap(),
+            Outcome::Sent
+        );
+
+        let mut second = Scripted::succeeding();
+        assert_eq!(
+            deliver_one(&store, &mut second, &job, 2_100).unwrap(),
+            Outcome::NoLongerDue
+        );
+        assert!(second.body.is_empty(), "le message est reparti");
+        assert_eq!(
+            store.outgoing(job.id).unwrap().unwrap().state,
+            SendState::Sent
+        );
+    }
+
+    #[test]
+    fn a_line_cancelled_after_it_was_read_never_leaves() {
+        // **Le défaut que la coquille rendait visible.** On envoie deux messages coup sur coup ;
+        // pendant que le facteur remet le premier, on annule le second. L'annulation réussit, la
+        // coquille dit « le message ne partira pas » — et le facteur l'envoyait avec sa lecture
+        // d'avant : `sending` écrit sur une ligne effacée change zéro ligne, sans erreur.
+        let (_dir, store, account, blob) = fixture();
+        let job = enqueue(&store, account, blob);
+        assert!(store.cancel_outgoing(job.id).unwrap());
+
+        let mut transport = Scripted::succeeding();
+        assert_eq!(
+            deliver_one(&store, &mut transport, &job, 2_000).unwrap(),
+            Outcome::NoLongerDue
+        );
+        assert!(
+            transport.body.is_empty(),
+            "un message annulé est parti au transport"
+        );
+    }
+
+    #[test]
+    fn a_line_deferred_meanwhile_waits_its_turn() {
+        // Un refus passager posé par un autre remettant après notre lecture : la ligne a un
+        // recul, et notre lecture ne le connaît pas.
+        let (_dir, store, account, blob) = fixture();
+        let job = enqueue(&store, account, blob);
+        store
+            .record_attempt(
+                job.id,
+                SendState::Queued,
+                1_500,
+                Some("serveur occupé"),
+                Some(5_000),
+                false,
+            )
+            .unwrap();
+
+        let mut transport = Scripted::succeeding();
+        assert_eq!(
+            deliver_one(&store, &mut transport, &job, 2_000).unwrap(),
+            Outcome::NoLongerDue
+        );
+        assert!(transport.body.is_empty());
+        // Le contrôle inverse : à l'échéance, elle part.
+        let due = store.outgoing(job.id).unwrap().unwrap();
+        assert_eq!(
+            deliver_one(&store, &mut transport, &due, 5_000).unwrap(),
+            Outcome::Sent
+        );
+    }
+
+    /// Un transport qui prend son temps, et qui compte les messages qu'il a vraiment remis.
+    struct Slow {
+        /// Les points finaux envoyés, tous remettants confondus.
+        sent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Prévenu quand la remise a commencé — verrou tenu, ligne en `sending`.
+        started: Option<std::sync::mpsc::Sender<()>>,
+        pause: std::time::Duration,
+    }
+
+    impl Transport for Slow {
+        fn deliver(
+            &mut self,
+            _job: &Outgoing,
+            body: &mut dyn Read,
+            frontier: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            std::io::copy(body, &mut std::io::sink()).map_err(|source| Error::Network {
+                stage: crate::Stage::Data,
+                source,
+            })?;
+            if let Some(started) = self.started.take() {
+                started.send(()).unwrap();
+            }
+            std::thread::sleep(self.pause);
+            frontier()?;
+            self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn two_deliverers_on_one_store_send_once() {
+        // **Le doublon chez le destinataire.** Deux remettants sur un même store — la coquille
+        // ouverte deux fois, ou la coquille et `mail send`. Le second lit la ligne pendant que le
+        // premier l'envoie : il la voit en `sending`, ce que la file a toujours lu comme « un
+        // remettant mort avant le corps », et il la reprenait. Deux `DATA`.
+        let (dir, store, account, blob) = fixture();
+        let job = enqueue(&store, account, blob);
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let other = Store::open(&root).unwrap();
+        let id = job.id;
+
+        let sent = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started, has_started) = std::sync::mpsc::channel();
+        let first = std::thread::spawn({
+            let sent = std::sync::Arc::clone(&sent);
+            move || {
+                let mut slow = Slow {
+                    sent,
+                    started: Some(started),
+                    pause: std::time::Duration::from_millis(300),
+                };
+                deliver_one(&store, &mut slow, &job, 2_000).unwrap()
+            }
+        });
+
+        has_started.recv().unwrap();
+        let seen = other.outgoing(id).unwrap().unwrap();
+        assert_eq!(
+            seen.state,
+            SendState::Sending,
+            "la précondition : le second lit la ligne pendant l'envoi du premier"
+        );
+        let mut quick = Slow {
+            sent: std::sync::Arc::clone(&sent),
+            started: None,
+            pause: std::time::Duration::ZERO,
+        };
+        let second = deliver_one(&other, &mut quick, &seen, 2_000).unwrap();
+
+        assert_eq!(first.join().unwrap(), Outcome::Sent);
+        assert_eq!(second, Outcome::NoLongerDue);
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "deux points finaux pour une seule ligne"
+        );
+        drop(dir);
     }
 
     #[test]

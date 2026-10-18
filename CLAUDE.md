@@ -38,7 +38,7 @@ requêtes écrit après le choix du modèle ressemble toujours au choix.
 d'envoi expédie un message à quelqu'un. Les critères 1, 2 et 8 de `docs/PHASE-3.md` sont là pour
 ça, et l'ordre de travail met la file d'envoi avant l'interface.
 
-**L'envoi marche depuis le 2026-09-09**, et deux règles en sortent, à ne pas défaire :
+**L'envoi marche depuis le 2026-09-09**, et trois règles en sortent, à ne pas défaire :
 
 - **un message en `committing` ne se remet jamais automatiquement.** C'est le critère 2. La règle
   vit à deux endroits — la clause `WHERE` de `Store::deliverable` et `SendState::is_deliverable` —
@@ -46,7 +46,19 @@ d'envoi expédie un message à quelqu'un. Les critères 1, 2 et 8 de `docs/PHASE
   seul endroit, `mailsmtp::queue::deliver_one` ;
 - **le serveur de soumission n'est jamais déduit du serveur IMAP.** `mail account list` suggère,
   `mail account submission` écrit. Une configuration à moitié écrite est refusée, parce que
-  deviner le mode de chiffrement rétrograderait le chiffrement à l'insu de l'utilisateur.
+  deviner le mode de chiffrement rétrograderait le chiffrement à l'insu de l'utilisateur ;
+- **une remise relit sa ligne sous le verrou de remise du store** (`Store::lock_delivery`,
+  `outbox.lock`) et ne la prend que si elle est encore dans l'état relu
+  (`Store::claim_outgoing`) — depuis le 2026-10-19. Le lot du facteur est une lecture
+  ancienne : sans ça, **un message annulé partait quand même**, et deux remettants sur un même
+  store — la coquille ouverte deux fois, la coquille et `mail send` — envoyaient deux fois.
+  C'est seulement sous le verrou qu'une ligne `sending` est celle d'un remettant mort, donc
+  reprenable. Et l'écriture finale de `sent` reste **inconditionnelle** : conditionnée à
+  `committing`, elle laisserait en file un message que l'utilisateur a « renvoyé » pendant son
+  transfert, qui repartirait. Relire par numéro suppose qu'un numéro ne désigne qu'un message :
+  `outbox.id` est en `AUTOINCREMENT` depuis `SCHEMA_V16` — SQLite redonnait le numéro du dernier
+  envoi annulé, et la relecture trouvait un autre message, qu'elle envoyait avec le compte du
+  premier. La leçon du carnet sur les `rowid`, qui n'avait été appliquée qu'aux messages.
 
 Et une leçon sur les types qui portent un secret : `#[derive(Debug)]` y est le **défaut
 dangereux**. Il affichait le mot de passe dans `Credential`, des deux côtés. Les deux ont

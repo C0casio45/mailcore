@@ -110,6 +110,14 @@ impl Store {
     ///
     /// [`crate::Error::Sqlite`] si l'écriture ou la validation échoue. **Une erreur ici doit
     /// arrêter l'envoi** : sans la transition sur le disque, la suite serait indéfendable.
+    ///
+    /// ## Elle n'est plus sur le chemin de la remise
+    ///
+    /// C'est un écrivain **inconditionnel** : il pose l'état demandé quel que soit l'état
+    /// présent. Les tests et les outils s'en servent pour placer une ligne dans un état donné.
+    /// La remise, elle, passe depuis le 2026-10-19 par [`Store::claim_outgoing`] et
+    /// [`Store::cross_frontier`], qui n'écrivent que si la ligne est encore dans l'état
+    /// attendu — voir [`DeliveryLock`].
     pub fn commit_outgoing(&self, id: OutboxId, state: SendState) -> Result<()> {
         self.durably(|conn| {
             conn.execute(
@@ -117,6 +125,89 @@ impl Store {
                 params![id.0, state.as_str()],
             )?;
             Ok(())
+        })
+    }
+
+    /// Prend le verrou de remise du store, **en attendant** qu'il se libère.
+    ///
+    /// Voir [`DeliveryLock`] : un seul remettant à la fois, tous processus confondus. Attendre
+    /// plutôt que renoncer, parce que les deux appelants ont de quoi attendre — le facteur est
+    /// un fil de fond, et `mail send` est une commande qu'on a lancée pour remettre.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Io`] si le fichier de verrou n'est pas ouvrable ou verrouillable.
+    pub fn lock_delivery(&self) -> Result<DeliveryLock> {
+        let path = self.root.join("outbox.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.as_std_path())
+            .map_err(|source| crate::Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+        match file.try_lock() {
+            Ok(()) => return Ok(DeliveryLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tracing::info!("un autre remettant tient la file : attente de son tour");
+            }
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(crate::Error::Io { path, source });
+            }
+        }
+        file.lock()
+            .map_err(|source| crate::Error::Io { path, source })?;
+        Ok(DeliveryLock { _file: file })
+    }
+
+    /// Prend une ligne pour la remettre : `sending`, **si elle est encore dans l'état `seen`**.
+    ///
+    /// Rend `false` — sans rien écrire — si la ligne a disparu ou changé d'état depuis qu'on
+    /// l'a lue : annulée, remise, reportée, tranchée. La condition est dans le `WHERE`, pour la
+    /// raison de [`Store::cancel_outgoing`] : lire puis écrire laisserait une fenêtre.
+    ///
+    /// Un état `seen` qui n'est pas remettable rend `false` aussi : cette fonction ne doit pas
+    /// pouvoir servir à reprendre un `committing`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`] si l'écriture échoue.
+    pub fn claim_outgoing(&self, id: OutboxId, seen: SendState) -> Result<bool> {
+        if !seen.is_deliverable() {
+            return Ok(false);
+        }
+        self.durably(|conn| {
+            let changed = conn.execute(
+                "UPDATE outbox SET state = ?3 WHERE id = ?1 AND state = ?2",
+                params![id.0, seen.as_str(), SendState::Sending.as_str()],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
+    /// La frontière du doute : `committing`, **si la ligne est encore `sending`**.
+    ///
+    /// Rend `false` si ce n'est plus le cas, et l'appelant doit alors renoncer **avant** le
+    /// point final — c'est le contrat de `mailsmtp::queue::Transport`. Sous le verrou de remise,
+    /// aucun geste de l'utilisateur ne peut sortir une ligne de `sending` ; la condition est une
+    /// seconde barrière, au cas où une évolution en ouvrirait un.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`] si l'écriture échoue.
+    pub fn cross_frontier(&self, id: OutboxId) -> Result<bool> {
+        self.durably(|conn| {
+            let changed = conn.execute(
+                "UPDATE outbox SET state = ?3 WHERE id = ?1 AND state = ?2",
+                params![
+                    id.0,
+                    SendState::Sending.as_str(),
+                    SendState::Committing.as_str()
+                ],
+            )?;
+            Ok(changed == 1)
         })
     }
 
@@ -427,6 +518,42 @@ impl Store {
         let _ = self.conn.pragma_update(None, "synchronous", "NORMAL");
         outcome
     }
+}
+
+/// Le droit de remettre les messages d'un store : **un seul remettant à la fois**, tous
+/// processus confondus.
+///
+/// ## Pourquoi, depuis le 2026-10-19
+///
+/// La remise lisait sa ligne une fois, puis écrivait `sending` sans regarder ce qu'elle était
+/// devenue. Deux défauts en sortaient, trouvés par une relecture et vérifiés par deux
+/// contradicteurs chacun :
+///
+/// - **un message annulé partait quand même.** Le facteur lit dix lignes d'un coup ; pendant
+///   qu'il remet la première, l'utilisateur annule la deuxième — l'annulation réussit, la
+///   coquille dit « le message ne partira pas » — et le facteur l'envoie avec ce qu'il en avait
+///   lu ;
+/// - **deux remettants envoyaient deux fois.** La coquille ouverte deux fois, ou la coquille et
+///   `mail send` sur le même store : chacun prenait la même ligne, ou reprenait comme
+///   « interrompue avant le corps » une ligne `sending` que l'autre était en train d'envoyer.
+///
+/// ## Ce que le verrou rend vrai
+///
+/// Sous lui, une ligne `sending` est **vraiment** celle d'un remettant mort avant le corps — le
+/// système rend le verrou à la mort du processus — donc la reprendre reste sans risque, comme
+/// le dit `SendState::is_deliverable`. Sans lui, c'était faux dès qu'il y avait deux
+/// remettants. Et c'est sous lui que la remise relit sa ligne : ce qui a été annulé, remis ou
+/// reporté entre-temps n'est plus pris.
+///
+/// ## Pourquoi un fichier à côté
+///
+/// La raison de `vectors::VectorLock` : sous Windows un verrou de fichier est obligatoire, et
+/// verrouiller la base empêcherait de la lire. `outbox.lock` ne sert qu'à ça et ne se supprime
+/// jamais — supprimer un fichier verrouillé réussit sous Windows, et le suivant en créerait un
+/// neuf que personne ne tient.
+#[derive(Debug)]
+pub struct DeliveryLock {
+    _file: std::fs::File,
 }
 
 /// Ce que l'utilisateur décide d'un message douteux.
@@ -760,6 +887,96 @@ mod tests {
             .unwrap();
         // 1 = NORMAL, 2 = FULL.
         assert_eq!(level, 1, "la connexion est restée en synchronous FULL");
+    }
+
+    #[test]
+    fn a_claim_takes_a_line_only_in_the_state_it_was_read_in() {
+        let (_dir, store, account) = store();
+        let id = queued(&store, account);
+
+        assert!(store.claim_outgoing(id, SendState::Queued).unwrap());
+        assert_eq!(
+            store.outgoing(id).unwrap().unwrap().state,
+            SendState::Sending
+        );
+        // Lue `queued`, elle ne l'est plus : la prise échoue, rien n'est écrit.
+        assert!(!store.claim_outgoing(id, SendState::Queued).unwrap());
+        // Lue `sending` — un remettant mort avant le corps, sous le verrou : elle se reprend.
+        assert!(store.claim_outgoing(id, SendState::Sending).unwrap());
+
+        // **Jamais un `committing`**, ni lu tel quel, ni lu comme `sending` d'avant la frontière.
+        store.commit_outgoing(id, SendState::Committing).unwrap();
+        assert!(!store.claim_outgoing(id, SendState::Committing).unwrap());
+        assert!(!store.claim_outgoing(id, SendState::Sending).unwrap());
+        assert_eq!(
+            store.outgoing(id).unwrap().unwrap().state,
+            SendState::Committing
+        );
+
+        // Et une ligne annulée ne se prend pas.
+        let gone = queued(&store, account);
+        assert!(store.cancel_outgoing(gone).unwrap());
+        assert!(!store.claim_outgoing(gone, SendState::Queued).unwrap());
+    }
+
+    #[test]
+    fn a_cancelled_number_is_never_given_to_another_message() {
+        // Un facteur qui tenait ce numéro dans son lot relirait l'autre message et l'enverrait
+        // avec le compte du premier ; une annulation sur une liste affichée un instant trop tôt
+        // atteindrait le mauvais message. Voir `SCHEMA_V16`.
+        let (_dir, store, account) = store();
+        queued(&store, account);
+        let last = queued(&store, account);
+        assert!(store.cancel_outgoing(last).unwrap());
+        let next = queued(&store, account);
+        assert!(next.0 > last.0, "#{} a été redonné", last.0);
+    }
+
+    #[test]
+    fn the_frontier_is_crossed_only_from_sending() {
+        let (_dir, store, account) = store();
+        let id = queued(&store, account);
+        assert!(
+            !store.cross_frontier(id).unwrap(),
+            "une ligne pas encore prise a franchi la frontière"
+        );
+        assert!(store.claim_outgoing(id, SendState::Queued).unwrap());
+        assert!(store.cross_frontier(id).unwrap());
+        assert_eq!(
+            store.outgoing(id).unwrap().unwrap().state,
+            SendState::Committing
+        );
+        assert!(!store.cross_frontier(id).unwrap());
+    }
+
+    #[test]
+    fn the_delivery_lock_is_held_by_one_connection_at_a_time() {
+        let (dir, store, _account) = store();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let held = store.lock_delivery().unwrap();
+
+        let (taken, was_taken) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let other = Store::open(&root).unwrap();
+            let lock = other.lock_delivery().unwrap();
+            taken.send(()).unwrap();
+            drop(lock);
+        });
+        assert!(
+            was_taken
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "une seconde connexion a pris le verrou pendant que la première le tenait"
+        );
+        // Le contrôle inverse : relâché, il passe à l'autre.
+        drop(held);
+        assert!(
+            was_taken
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "le verrou relâché n'est jamais passé à l'autre connexion"
+        );
+        waiter.join().unwrap();
     }
 
     #[test]

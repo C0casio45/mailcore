@@ -3595,3 +3595,90 @@ mesurer, pas à déduire, quand l'application du quotidien aura fusionné son in
 avait conclu « la recherche à peine » sur un jeu de requêtes qui ne ressemblait pas à l'usage ; le
 journal l'avait écrit, le `CLAUDE.md` aussi. Un jeu de requêtes de banc doit ressembler à ce qu'on
 tape.
+
+### 2026-10-19 — un message annulé partait quand même, et un numéro d'envoi pouvait en désigner un autre
+
+**En clair d'abord.** Hors de la phase 4, mais trouvé en la servant : en étudiant le démon sur une
+machine dédiée, une relecture a relevé que **la remise ne relisait pas la ligne qu'elle
+envoyait**. Le facteur lit dix messages d'un coup, puis les remet un à un ; pendant qu'il remet le
+premier, on annule le deuxième — la coquille dit « le message ne partira pas » — et il partait,
+avec ce que le facteur en avait lu. Le même défaut envoyait **deux fois** un message dès que deux
+remettants travaillaient sur un même store : la coquille ouverte deux fois, ou la coquille et
+`mail send`. Corrigé : un seul remettant à la fois par store, qui relit sa ligne avant de la
+prendre. La relecture de la correction a trouvé ce que la correction avait ouvert — un numéro
+d'envoi réutilisé par SQLite —, corrigé à la racine : un numéro ne désigne plus jamais qu'un seul
+message.
+
+**Comment il s'est vu.** L'étude du déploiement du démon a listé sept défauts possibles ; chacun a
+été soumis à un enquêteur et deux contradicteurs chargés de le réfuter. Les sept ont tenu. Le plus
+grave est celui-ci, atteignable avec la seule coquille : `deliver_one` écrivait `sending` par
+`UPDATE … WHERE id = ?`, sans condition sur l'état. Sur une ligne effacée, la mise à jour change
+zéro ligne **sans erreur**, et la remise continuait. Et une ligne `sending` était reprise comme
+« un remettant mort avant le corps » — vrai avec un seul remettant, faux avec deux.
+
+**La correction** (`mailcore::store::outbox`, `mailsmtp::queue::deliver_one`) :
+
+- **un verrou de remise par store**, `outbox.lock`, sur le modèle de `vectors.lock` : tenu de la
+  relecture à la consignation, rendu par le système à la mort du processus. Sous lui seulement,
+  une ligne `sending` est vraiment celle d'un remettant mort, donc reprenable ;
+- **la ligne est relue sous le verrou**, et c'est la relecture qui décide : annulée, remise,
+  reportée ou tranchée entre-temps, elle rend `Outcome::NoLongerDue`, sans un octet sur le réseau ;
+- **la prise est conditionnelle** — `queued` ou `sending` vers `sending`, seulement si la ligne est
+  encore dans l'état relu — et **la frontière aussi** — `sending` vers `committing`, sinon le
+  transport renonce avant le point final ;
+- **l'écriture finale de `sent` reste inconditionnelle**, et c'est voulu : pendant le transfert du
+  corps la ligne est `committing`, montrée comme douteuse, et l'utilisateur peut cliquer
+  « Renvoyer » ; conditionnée, l'écriture ne s'appliquerait pas, et le message qui vient de partir
+  repartirait.
+
+**Les tests, et leurs contrôles négatifs.** Une ligne déjà envoyée n'est pas renvoyée depuis une
+lecture ancienne ; une ligne annulée après lecture ne part pas ; une ligne reportée entre-temps
+attend son tour ; **deux remettants sur un store envoient une fois** — le second lit la ligne
+pendant que le premier l'envoie, ce qui faisait deux `DATA`. Cinq mutations, chacune attrapée :
+sans verrou, sans relecture, prise ou frontière inconditionnelles, verrou non exclusif. Ce que la
+mutation « sans relecture » a montré : seul le test du report tombe, parce que la prise
+conditionnelle arrête aussi l'envoyé et l'annulé. Les deux couches se gardent l'une l'autre, et
+chacune a un test qui tombe quand on la retire seule.
+
+#### La relecture de la correction, et ce qu'elle a trouvé
+
+Trois angles — concurrence et coupures, appelants, tests —, deux contradicteurs par remarque. Six
+confirmées, deux partagées, quatre réfutées.
+
+- **Un numéro d'envoi réutilisé.** `outbox.id` était un `INTEGER PRIMARY KEY` sans
+  `AUTOINCREMENT`, donc un alias de `rowid`, et SQLite redonne le plus grand numéro présent plus
+  un : on annule le dernier message, on en envoie un autre, il reprend le numéro. La relecture
+  par numéro, ajoutée le jour même, trouvait alors **un autre message** — et l'envoyait avec le
+  compte de l'ancien : son serveur, ses identifiants. Avant la correction, c'était l'ancien
+  contenu, annulé, qui partait. Les gestes de l'utilisateur — annuler, renvoyer, trancher —
+  désignent eux aussi une ligne par ce numéro. **`SCHEMA_V16`** refait la table en
+  `AUTOINCREMENT`, numéros conservés, colonnes nommées une à une ; un test montre le numéro
+  redonné au schéma 15 et refusé au 16. C'est la leçon du carnet du 2026-09-11 — un identifiant
+  qu'on croit stable doit l'être par le schéma —, qui n'avait été appliquée qu'aux messages.
+- **`mail send` taisait un doute.** Quand le facteur d'une coquille ouverte avait pris la ligne,
+  la commande rendait 0 quelle que soit la fin de sa tentative. Elle dit maintenant comment elle a
+  fini, et échoue sur un doute ou un refus comme s'ils venaient d'elle.
+- **`mail send` échouait sur un message envoyé.** La remise refusait comme une faute de l'appelant
+  une ligne qui n'était plus remettable — or `mail send` relit sa ligne juste après l'avoir mise en
+  file, et le facteur a pu la prendre entre-temps. C'est la relecture sous le verrou qui décide
+  maintenant, douteux compris ; le test du « doute passé à la main » attend `NoLongerDue` au lieu
+  d'une erreur, et sa raison écrite — rien n'arrive au transport — est ce qu'il vérifie toujours.
+- **Partagée, laissée écrite** : « Renvoyer » cliqué pendant le transfert d'un corps — la ligne
+  est alors `committing`, donc montrée douteuse — puis un remettant qui meurt entre le point final
+  et l'écriture de `sent` ferait un doublon. Antérieur à la correction, il demande un geste contre
+  l'avertissement et une coupure dans une fenêtre de quelques millisecondes. La vraie réponse est
+  que l'interface distingue un envoi en cours d'un doute ; à faire.
+
+**Le schéma change, donc l'application doit être recompilée** avant d'ouvrir le store du
+quotidien : un binaire au schéma 15 refuse un store au schéma 16.
+
+#### Ce qui reste des sept défauts vérifiés
+
+- **la file qui se tait** : un jeton OAuth2 expiré, et la coquille affiche « Il partira dans
+  10 s », puis « EN ATTENTE » pour toujours, sans phrase ni bouton ; dix lignes ainsi bloquées
+  empêchent tout envoi des autres comptes ;
+- **une marque de lecture sur le mauvais message** : `flag_pushes` ne retient pas l'UIDVALIDITY du
+  dossier, et la poussée part avant qu'elle ne soit vérifiée ;
+- moins graves, et pour un démon sur une machine dédiée : le jeton du démon hérité par ses
+  processus enfants, l'absence d'arrêt propre sur `SIGTERM`, le trousseau Linux dont l'échec reste
+  en cache pour la vie du processus, et `/mcp` qui refuse tout hôte autre que la boucle locale.
