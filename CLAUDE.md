@@ -249,19 +249,24 @@ il ajoute deux leçons que le carnet ne pouvait pas donner :
 - **un écrivain tantivy lâché ne garde aucune fusion** — trouvé le 2026-10-18, un mois après.
   `Drop` laisse la fusion en cours aller au bout, puis la jette. Un écrivain par paquet, lâché
   sitôt validé, n'a donc jamais rien fusionné : une seule réindexation a laissé 149 segments
-  dans le store du quotidien, et chaque moisson en ajoutait un. Ce qu'ils coûtaient n'était
-  pas où on l'attendait : la recherche à peine — deux dixièmes de milliseconde —, l'**ouverture**
-  de l'index trente fois plus, 37 ms contre 1,3, à chaque démarrage. L'écrivain vit le temps de
+  dans le store du quotidien — jusqu'à huit par validation, un par fil d'indexation. Ils
+  coûtaient 37 ms à chaque ouverture de l'index contre 1,3, et une recherche **par phrase**
+  quatre fois plus lente ; le banc, qui ne cherchait d'abord que des mots seuls, n'y voyait que
+  deux dixièmes de milliseconde. **Un jeu de requêtes de banc doit ressembler à ce qu'on tape.**
+  L'écrivain vit le temps de
   la passe et attend ses fusions (`wait_merging_threads`), **annulation comprise**, la politique
   de fusion retirée avant le dernier `commit`. Et tantivy dit une fusion jetée par `log`, pas par
   une erreur rendue : un banc sans abonné ne la voit pas ;
-- **sous Windows, un `commit` de tantivy peut être refusé** — « Accès refusé » — quand un autre
-  processus tient `meta.json` au moment où tantivy le remplace par un renommage ; l'antivirus,
-  quelques millisecondes. tantivy ne réessaie pas, et une fusion qui prend le refus est jetée sans
-  bruit. Tout index passe donc par `index::directory::Patient`, qui réessaie une demi-seconde au
-  plus. Trouvé parce qu'un test du jour tombait une fois sur quarante : **un test qui échoue une
-  fois n'est pas instable, il échantillonne** — relancé cent fois contre une version sans la
-  correction, c'était vingt échecs contre zéro.
+- **sous Windows, un `commit` de tantivy peut être refusé** — « Accès refusé » — quand
+  `meta.json` est ouvert **par qui que ce soit** au moment où tantivy le remplace par un
+  renommage : une ouverture ordinaire suffit, et tantivy lui-même le relit toutes les 500 ms
+  dans notre processus. tantivy ne réessaie pas, et une fusion qui prend le refus est jetée sans
+  bruit. Tout index passe donc par `index::directory::Patient`, qui réessaie — huit essais,
+  635 ms d'attente au plus —, et dont la délégation du verrou n'est pas un détail : le verrou par
+  défaut du trait bloquerait tout index qui a déjà servi. Trouvé parce qu'une exécution de la
+  suite sur quarante tombait : **un test qui échoue une fois n'est pas instable, il
+  échantillonne** — relancée cent fois contre une version sans la correction, c'était vingt
+  échecs contre zéro.
 
 **Le banc `measure-followup` existe depuis le 2026-09-11**, et il a payé son écriture en une
 heure — deux leçons de méthode :

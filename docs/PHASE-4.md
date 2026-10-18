@@ -86,7 +86,7 @@ client » — et elle a son critère chiffré ici, parce qu'une contrainte sans 
 | # | Critère | Seuil | État |
 |---|---|---|---|
 | 1 | **Trouver ce qu'un mot-clé ne trouve pas** | sur un jeu de requêtes réelles écrites à la main avec leur réponse attendue : le message visé dans les **10 premiers** pour **≥ 80 %** des requêtes, et **strictement mieux que tantivy seul** sur le sous-ensemble des requêtes qui ne partagent **aucun mot** avec le message visé | **À MOITIÉ, au 2026-09-23**, transformeur `multilingual-e5-small`, 26 requêtes. **Première moitié non tenue** : hybride dans les 10 premiers pour **26,9 %** du jeu (**14–46 %** à 95 %, Wilson), et **0 %** (0–28 %) sur les 10 requêtes sans mot commun. **Seconde moitié tenue en rang, pas en rappel** : la comparaison primaire — plein texte contre hybride sur les requêtes sans mot commun, test de signe exact apparié — rend **1 victoire contre 9, p = 0,021**, l'hybride classe la cible plus haut. Réserve écrite : cette statistique a été **choisie le 2026-09-23, après avoir vu les données**, et elle ne tient qu'une fois le bras plein texte décensuré (il était coupé à 500 en silence). Tout le reste — les modèles entre eux, sémantique contre hybride, qui bat l'hybride 9 sur 10 sur ce sous-ensemble — est **exploratoire**, borné par Bonferroni, et à confirmer sur un jeu de requêtes plus grand. **Refait le 2026-10-08 sur les vecteurs du modèle taillé : chiffres identiques**, 26,9 % et 1 contre 9 à p = 0,021. **Élargi le 2026-10-09 à 46 requêtes** (20 neuves, écrites par l'assistant, réserve dans le journal) : **première moitié toujours non tenue**, hybride dans les 10 premiers pour **17,4 %** (9–31 %), 0 % sur les 18 sans mot commun ; **seconde moitié tenue en rang** : 2 contre 16, p = 0,001 — et 7 contre 1 sur les 8 requêtes dures neuves seules, p = 0,07. **Granite taillé, 2026-10-10 — adopté, installé le soir même dans le store du quotidien** : sur v5, 30 requêtes neuves, hybride dans les 10 premiers pour **26,7 %** (8 sur 30, contre 3 avec e5) ; première moitié toujours non tenue. Contre e5, 22 requêtes mieux classées sur 30, p = 0,004 — voir le journal |
-| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **TENU le 2026-10-09, de bout en bout** — `cargo xtask measure-semantic-search`, machine au repos, 22 requêtes × 3 tours dont le premier jeté, trois exécutions : hybride **33,1 à 33,4 ms** de p95 (p50 26,1–26,7), les mots seuls 9,6–10,6 ms. Les trois exécutions s'accordent à 1 %. La recherche qui réveille le sens répond par les mots en 12–15 ms ; le réveil coûte 0,43–0,67 s, hors de la recherche. Pour mémoire, le balayage seul, 2026-09-21 — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8. **Granite taillé, 2026-10-10**, trois tours dont le premier jeté : hybride **25,8 et 28,1 ms** de p95, e5 32,0 et 31,6 dans la même séance. **Sur le store du quotidien, 2026-10-18, au repos** : hybride **39,3 et 42,8 ms**, les mots seuls 21,0 et 22,3 — tenu, avec moitié moins de marge que sur le corpus, et l'écart n'est pas dans tantivy, qui y répond en 1,1 à 1,3 ms : voir le journal |
+| 2 | Latence de la recherche, bout en bout depuis le client | **< 50 ms** en p95 sur le corpus réel — le même seuil que le critère 4 de la phase 1, parce que c'est la même attente : une liste qui arrive pendant qu'on lâche la touche | **TENU le 2026-10-09, de bout en bout** — `cargo xtask measure-semantic-search`, machine au repos, 22 requêtes × 3 tours dont le premier jeté, trois exécutions : hybride **33,1 à 33,4 ms** de p95 (p50 26,1–26,7), les mots seuls 9,6–10,6 ms. Les trois exécutions s'accordent à 1 %. La recherche qui réveille le sens répond par les mots en 12–15 ms ; le réveil coûte 0,43–0,67 s, hors de la recherche. Pour mémoire, le balayage seul, 2026-09-21 — `cargo xtask measure-scan`, 73 658 vecteurs de dimension 256 : **6,2 ms** de p95 au cas ordinaire, **10,2 ms** au pire cas du tas borné. Il reste 40 ms pour l'encodage de la requête et l'aller-retour JSON-RPC ; le bout en bout se mesure à l'étape 8. **Granite taillé, 2026-10-10**, trois tours dont le premier jeté : hybride **25,8 et 28,1 ms** de p95, e5 32,0 et 31,6 dans la même séance. **Sur le store du quotidien, 2026-10-18, au repos** : hybride **39,3 et 42,8 ms**, les mots seuls 21,0 et 22,3 — tenu, avec moitié moins de marge que sur le corpus ; l'écart est l'index fragmenté, où tantivy seul met 24 ms de p95 sur ces phrases contre 7 après fusion — à remesurer quand l'application du quotidien aura la correction des fusions : voir le journal |
 | 3 | Coût de la passe complète | le corpus entier vectorisé, **mesuré en messages/s et en durée totale**, et la passe doit être **reprenable** : tuée au milieu, elle repart où elle en était sans recalculer ce qui est fait | **tenu, remesuré le 2026-09-22** — la reprise a été vérifiée **sur le terrain** ce jour-là : une passe tuée à 37 472 messages a repris à 36 186, soit exactement le complément. Le coût, lui, dépend du modèle et de deux ordres de grandeur : statique **948 s** (78 msg/s) remesuré le jour même, transformeur **4,68 msg/s**, soit **4,37 h** — mesurées sur le corpus entier, la passe complète ayant été refaite le soir même pour que le magasin porte sa provenance. Et le débit varie d'un facteur 3,5 **à l'intérieur** d'une passe — `BatchLongest` fait payer à chaque lot son texte le plus long, donc le débit suit la distribution des longueurs. Drapeau par ligne (`SCHEMA_V14`), écriture idempotente. **Modèle taillé et lots triés, 2026-10-08 : au moins 5,78 msg/s, 3 h 33** — un plancher, la passe tournant en priorité minimale sur une machine qui servait. **Granite taillé, 2026-10-10 : 16,65 msg/s, 1 h 14**, plancher pour la même raison ; le soir même sur le store du quotidien, 48 580 messages en 54 min 39 s, 14,8 msg/s, en priorité normale sur une machine en service |
 | 4 | Coût d'un message qui arrive | **< 200 ms** de travail de fond, à comparer à sa propre passe complète — le même tableau que `measure-followup` pour l'index, le carnet et les fils | **TENU le 2026-10-09 au soir dans les cinq minutes qui suivent une recherche, toujours pas à froid** — machine au repos, trois exécutions dont la première jetée : l'enfant de la recherche chaud vectorise une arrivée en **171,3 et 171,9 ms** de médiane (101 à 183 ms), sous les 200 ms ; à froid, **580,8 et 578,6 ms**. Avant la délégation — `cargo xtask measure-arrival`, machine au repos : **0,52 à 0,90 s** par arrivée, médiane 0,59 s sur l'exécution la plus stable. Le chargement du modèle **seul** prend 0,24 s, déjà au-dessus du seuil : c'est la décision du 2026-10-08 — un enfant par passage, la mémoire rendue aussitôt — qui le fait payer à chaque arrivée. La décision du démon coûte 1,5 ms. Voir le journal pour les remèdes. **Granite taillé, 2026-10-10**, trois tours dont le premier jeté : **80,9 et 82,4 ms** à chaud (e5 167,2 et 195,3 dans la même séance), 435,1 et 462,6 ms à froid — toujours pas tenu à froid, et les séries à froid des deux modèles s'écartent d'une exécution à l'autre, jusqu'à 41 % — voir le journal |
 | 5 | Mémoire de la passe complète | **RSS < 500 Mo**, le seuil du critère 2 de la phase 2. Et la mesure dit **où** elle va : le modèle, le lot, le magasin de vecteurs | **TENU sur la passe complète du 2026-10-09, avec 24,6 Mio de marge** — transformeur taillé, trois longs textes par lot : **452,2 Mio** de crête pour 476,8 permis (500 Mo). 8,5 au démarrage, 9,9 store ouvert, 343,3 modèle chargé, 382,3 passe finie. La veille, à quatre longs textes par lot, la même passe crevait de 5 Mio (481,9). Il venait de 1 304 Mio le 2026-09-22 : la copie du tokeniseur par lot, les poids lus deux fois, le vocabulaire entier et les lots non bornés ont été retirés depuis. **Réserve écrite** : la crête monte encore d'une vingtaine de mébioctets d'un bout à l'autre de la passe — une dérive, devancée et non bornée ; les enfants successifs la borneraient. Le rognage **ne coûte rien en rappel**, mesuré sur le critère 1 lui-même le 2026-10-08. Statique, pour mémoire : 117 Mio. **Granite taillé, 2026-10-10 : 394,7 Mio** de crête, 82 Mio de marge, modèle chargé 316,6 ; non taillé, il crevait à 752,7 |
@@ -3208,11 +3208,14 @@ refaire au repos, sur le store du quotidien : c'est lui, le corpus réel.
 dont la première jetée, jeu v5, 30 requêtes × 3 tours. Hybride **39,3 et 42,8 ms** de p95 (p50
 32,9 et 33,0), les mots seuls 21,0 et 22,3 ; le réveil du sens 382 et 373 ms, l'enfant chaud à
 371 Mio. **Le critère 2 tient sur le store du quotidien, avec 7 à 11 ms de marge** — la moitié de
-celle du corpus de mesure, 25,8 et 28,1 ms le 2026-10-10. Et l'écart n'est pas dans tantivy : la
-recherche plein texte seule y coûte 1,1 à 1,3 ms de p95 (`measure-merge`, ci-dessous), là où les
-mots seuls, de bout en bout, en coûtent 21 — deux fois les 9,6 à 10,6 ms du corpus. Le temps est
-donc dans ce que l'API fait autour de la recherche, et ce store-là lui en donne plus. À chercher :
-c'est le corpus réel, et c'est lui qui a la marge la plus mince.
+celle du corpus de mesure, 25,8 et 28,1 ms le 2026-10-10. **Et l'écart est l'index fragmenté.**
+Sur les mêmes phrases, tantivy seul y met 17 à 18 ms de médiane et 24 de p95 avec ses 149
+segments, 4,2 à 4,5 et 6,7 à 7,3 une fois fusionné (`measure-merge --phrases`, entrée de la
+nuit) : l'essentiel des 21 ms des mots seuls de bout en bout. La correction des fusions n'est pas
+encore dans l'application du quotidien ; ce relevé est à refaire quand son index aura fusionné.
+*La première version de ce paragraphe disait l'inverse — « l'écart n'est pas dans tantivy » — en
+comparant des mots seuls, à 1,1–1,3 ms, à des phrases de bout en bout : deux jeux différents.
+Relevé par la relecture de la nuit.*
 
 **Ce que la passe de fond n'a pas fait.** Le store compte 50 100 messages, 48 580 vectorisés,
 **1 520 en attente** — compté en lecture seule sur la colonne `vectorised`, et le magasin n'a pas
@@ -3238,9 +3241,17 @@ Trois choses ne tiennent plus autour de ce refus :
   « chaque raison est un cas où continuer effacerait ou mélangerait » — vrai des cinq autres,
   faux de celle-ci, qui ne fait qu'ajouter. La décision du 2026-10-08 qui l'a rangée là, prise
   sans attendre et dite réversible, avait deux motifs : rien à l'écran ne montrerait une grosse
-  passe, et certaines effacent. Depuis l'étape 8, l'écran dit « la recherche par le sens rattrape
-  N messages », et une passe de fond n'efface jamais rien — elle tourne en priorité minimale, un
-  job la tue, elle reprend où elle en était, et sa mémoire est celle du critère 5 ;
+  passe, et certaines effacent. Le second ne la concerne pas ; **le premier tient encore à
+  moitié** — corrigé par la relecture du soir, la première version de ce paragraphe disait le
+  contraire. « La recherche par le sens rattrape N messages » ne s'affiche qu'au-dessus des
+  résultats d'une recherche, au moment où on la fait : une passe qui tourne pendant que personne
+  ne cherche reste invisible. Et la passe n'est pas toujours celle qu'on croit : son propre enfant
+  tourne en priorité minimale, un job le tue, il reprend où il en était, sa mémoire est celle du
+  critère 5 — mais dans les cinq minutes qui suivent une recherche, le travail est **confié à
+  l'enfant de la recherche**, par lots de huit, en priorité normale, chaque lot faisant attendre
+  les recherches, et un job n'arrête la délégation qu'entre deux lots. Rendre l'arriéré à la passe
+  de fond demande donc deux choses de plus : un état visible hors de la recherche, et un gros
+  arriéré qui ne passe pas par la délégation ;
 - **le geste que l'écran propose ne marche pas depuis la coquille.** `mail vectors --bert` ne
   nomme pas de store, et le raccourci du quotidien ouvre la coquille sur un store qui n'est pas
   celui par défaut : la commande copiée viserait un autre store. `mail` n'est d'ailleurs pas dans
@@ -3250,8 +3261,8 @@ Trois choses ne tiennent plus autour de ce refus :
   part. C'est pour ça que la cause a dû être reconstituée depuis le store.
 
 La décision revient à l'utilisateur : une passe explicite maintenant, environ deux minutes ; la
-limite recalée sur la durée qu'elle voulait dire ; ou l'arriéré rendu à la passe de fond, les
-grosses passes qui effacent restant seules à demander un geste.
+limite recalée sur la durée qu'elle voulait dire ; ou l'arriéré rendu à la passe de fond, avec ses
+deux conditions, les grosses passes qui effacent restant seules à demander un geste.
 
 **Les bancs mesurent ce qui est livré.** `measure-semantic-search`, `measure-arrival` et
 `measure-startup-model` prenaient encore e5 par défaut, `model-trim-bert` et `model-check-bert`
@@ -3260,14 +3271,15 @@ prennent granite.
 
 ### 2026-10-18 (suite) — l'index plein texte ne fusionnait jamais ses segments
 
-**En clair d'abord.** L'index de la recherche par mots est fait de morceaux — des segments —, un
-de plus à chaque moisson qui apporte du courrier, et chaque recherche les parcourt tous. Tantivy
-les fusionne au fil de l'eau ; ici il ne l'a jamais fait, parce que le code lâchait l'outil
-d'écriture avant qu'une fusion puisse être enregistrée. **149 segments dans le store du
-quotidien**, 115 dans le corpus de mesure, et rien ne les aurait jamais réduits. Corrigé — 149
-deviennent 2 à la première arrivée, et le nombre reste borné ensuite. Ce que ça coûtait, mesuré
-au repos plus bas : surtout l'**ouverture** de l'index, 37 ms au lieu de 1,3, payée à chaque
-démarrage et après chaque moisson ; la recherche elle-même, 15 % de p95 et rien en médiane.
+**En clair d'abord.** L'index de la recherche par mots est fait de morceaux — des segments —,
+jusqu'à huit de plus à chaque validation, un par fil d'indexation de tantivy, et chaque recherche
+les parcourt tous. Tantivy les fusionne au fil de l'eau ; ici il ne l'a jamais fait, parce que le
+code lâchait l'outil d'écriture avant qu'une fusion puisse être enregistrée. **149 segments dans
+le store du quotidien**, 115 dans le corpus de mesure, et rien ne les aurait jamais réduits.
+Corrigé — 149 deviennent 2 à la première arrivée, et le nombre reste borné ensuite. Ce que ça
+coûtait, mesuré plus bas et dans l'entrée de la nuit : l'**ouverture** de l'index, 37 ms au lieu de
+1,3, payée à chaque démarrage et après chaque moisson qui indexe ; et une recherche **par phrase**
+— ce qu'on tape dans la barre — quatre fois plus lente. Un mot seul, lui, ne gagne presque rien.
 
 **Comment il s'est vu.** En cherchant pourquoi le store du quotidien répondait plus lentement que
 le corpus de mesure, sous la même charge : son index était plus gros pour moins de messages, 189
@@ -3308,7 +3320,7 @@ d'origine, par un lien. Relevés **indicatifs**, pris pendant que le jeu tenait 
 | première arrivée, fusion de l'arriéré comprise | 11,4 s, +81,8 Mio | 14,5 s, +128,2 Mio |
 | segments ensuite | 3 | 2 |
 | arrivées suivantes, médiane | 67,3 ms sur huit (max 135,8) | 64,7 ms sur deux |
-| recherche par mots, p95 avant → après | 2,37 → 1,83 ms | 3,31 → 2,06 ms |
+| recherche, mots seuls, p95 avant → après | 2,37 → 1,83 ms | 3,31 → 2,06 ms |
 
 Pour chacune des 408 requêtes, **le même nombre de résultats** avant et après, compté sans
 plafond : la fusion ne perd rien. Avant la correction, une passe d'un message coûtait 55,9 à 69,3
@@ -3333,7 +3345,7 @@ arrivée après la mise à jour coûte, une fois, une quinzaine de secondes de j
 130 Mio de plus dans le processus qui indexe — le démon, ou la coquille qui l'embarque —, dont la
 crête n'a pas été mesurée sous le seuil de 500 Mo de la phase 2.
 
-#### Au repos, le soir même — et ce que les relevés indicatifs avaient grossi
+#### Au repos, le soir même — et ce que les mots seuls cachaient
 
 Le jeu arrêté, la charge entre 7 et 10 %. Deux séries de trois exécutions par store, la première
 de chaque série jetée ; la seconde série après avoir ajouté au banc deux mesures, détaillées
@@ -3349,28 +3361,30 @@ pas mêlé.
 | l'arrivée qui fusionne huit petits segments | 52,6 à 54,5 ms | 50,6 et 51,0 ms, le maximum de la première série |
 | **ouverture de l'index**, p50 avant → après | **27,5–28,3 → 1,45–1,47 ms** | **37,3–37,8 → 1,27–1,32 ms** |
 | fichiers de l'index avant → après | 706 → 29 | 905 → 24 |
-| recherche par mots, p95 avant → après | 1,13–1,17 → 1,01–1,05 ms | 1,29–1,54 → 1,10–1,27 ms |
-| recherche par mots, p50 avant → après | 0,77–0,81 → 0,79–0,80 ms | 0,82–0,95 → 0,85–0,90 ms |
+| recherche, mots seuls, p95 avant → après | 1,13–1,17 → 1,01–1,05 ms | 1,29–1,54 → 1,10–1,27 ms |
+| recherche, mots seuls, p50 avant → après | 0,77–0,81 → 0,79–0,80 ms | 0,82–0,95 → 0,85–0,90 ms |
 
-**Les relevés indicatifs avaient grossi le gain de la recherche.** Sous la charge du jeu, le p95
-passait de 3,31 à 2,06 ms ; au repos, de 1,3–1,5 à 1,1–1,3 ms, et la médiane ne bouge pas — de
-quelques centièmes, dans un sens ou dans l'autre. Sous charge, chaque segment de plus est du
-travail de plus à se faire préempter ; au repos, 149 segments ne coûtent à une requête que deux à
-trois dixièmes de milliseconde au p95. Ce n'était donc pas là que la fragmentation se payait.
+**Sur des mots seuls, la fusion ne gagne presque rien.** Sous la charge du jeu, le p95 passait de
+3,31 à 2,06 ms ; au repos, de 1,3–1,5 à 1,1–1,3 ms, et la médiane ne bouge pas — de quelques
+centièmes, dans un sens ou dans l'autre. La première version de ce paragraphe en concluait que la
+fragmentation ne se payait pas dans la recherche : **c'était vrai du jeu du banc, faux de ce qu'on
+tape.** Le banc ne cherchait que des mots tirés des sujets, une liste de postings chacun ; une
+phrase de huit mots en ouvre huit dans chacun des 149 segments. Mesuré dans l'entrée de la nuit
+sur les phrases du critère 1 : **quatre fois plus lente** avant la fusion.
 
-**Elle se payait à l'ouverture.** C'est la mesure ajoutée au banc : ce que font
+**Elle se payait aussi à l'ouverture.** C'est la mesure ajoutée au banc : ce que font
 `Mailbox::open` et `Mailbox::reload_search` de l'index — l'ouvrir, monter un `Searcher`, qui
 ouvre chaque segment, donc chacun de ses fichiers. **37 ms contre 1,3** sur le store du
 quotidien, vingt fois sur quatre tours, l'ordre alterné. La coquille le paie à chaque démarrage, et
-le service après chaque passe d'index, verrou de la boîte tenu. Le 2026-10-09, l'ouverture du store
+le service après chaque passe d'index qui a indexé quelque chose, verrou de la boîte tenu. Le 2026-10-09, l'ouverture du store
 avait été mesurée à **37 ms** sur le corpus de mesure, et cachée sous les 165 ms de la fenêtre en
 l'ouvrant dans un fil : selon toute vraisemblance, 28 de ces 37 ms étaient l'index — la même
 ouverture, mesurée aujourd'hui sur le même index, intact depuis. Le démarrage n'en
 est pas plus court aujourd'hui — le store se cachait déjà sous la fenêtre —, mais à un quart de
 milliseconde par segment, un index qui ne fusionne jamais finissait par dépasser la fenêtre. La
-première exécution de la série, jetée, montre aussi ce que coûte la **première** ouverture de
-fichiers qu'on vient d'écrire : jusqu'à 644 ms avant la fusion, 280 après — non établi au-delà de
-cette observation, mais c'est la situation de chaque fin de moisson.
+première exécution de la série, jetée, a montré des maxima de 644 ms avant la fusion et 280 après,
+sur des **ré**ouvertures — le banc jette le premier tour : non expliqués. *Une première version y
+lisait le coût de la première ouverture de fichiers neufs ; le banc ne la mesure pas.*
 
 **L'arrivée qui fusionne est établie**, c'est la seconde mesure ajoutée : le banc imprime chaque
 arrivée et les segments qu'elle laisse. Le maximum est chaque fois celle où le compte retombe de
@@ -3390,18 +3404,22 @@ secondes à vingt-cinq**. Une fois, dans un job de fond.
 **Et « après une semaine » était faux.** Les 149 segments du store du quotidien portent tous la
 date du 2026-10-13, entre 8 h 31 et 9 h 02 : huit de 2 000 documents, 141 d'une médiane de 250.
 C'est **une seule indexation complète** du store, ce matin-là — dont la cause n'est pas établie —,
-et non une accumulation de moissons. La conclusion ne change pas, et elle en sort plus forte : une
-passe suffisait à laisser 149 segments.
+et non une accumulation de moissons. La médiane de 250 dit le mécanisme : un paquet de 2 000
+messages est réparti entre les huit fils d'indexation de tantivy, et chacun ferme son propre
+segment à la validation. La conclusion ne change pas, et elle en sort plus forte : une passe
+suffisait à laisser 149 segments, et une moisson pouvait en ajouter huit.
 
-### 2026-10-18 (soir) — un `commit` sur cinq refusé par Windows, et la fusion jetée avec lui
+### 2026-10-18 (soir) — une exécution de la suite sur cinq refusée par Windows, et la fusion jetée avec elle
 
 **En clair d'abord.** En revérifiant tout avant de valider, un test de la correction des fusions
 est tombé une fois : « Accès refusé ». Ce n'était pas le test. À chaque validation, tantivy
 remplace son fichier d'état, `meta.json`, en renommant un fichier neuf par-dessus l'ancien ; sous
-Windows, ce renommage échoue tant qu'un autre processus tient l'ancien ouvert — un antivirus qui
-inspecte le fichier qu'on vient d'écrire, quelques millisecondes. tantivy ne réessaie pas. Dans le
-produit, la passe d'index échoue alors, ou une fusion est **jetée sans bruit**. Le répertoire de
-l'index attend maintenant que le fichier se libère, une demi-seconde au plus.
+Windows, ce renommage échoue tant que l'ancien est ouvert **par qui que ce soit** — à commencer par
+tantivy lui-même, qui le relit toutes les 500 ms dans notre propre processus. tantivy ne réessaie
+pas. Dans le produit, la passe d'index échoue alors, ou une fusion est **jetée sans bruit**. Le
+répertoire de l'index attend maintenant que le fichier se libère : huit essais, 635 ms d'attente
+au plus. *Corrigé par la relecture de la nuit, voir l'entrée suivante : la première version de
+cette entrée accusait l'antivirus et parlait d'« un `commit` sur cinq » et d'« une demi-seconde ».*
 
 **Comment il s'est vu.** `cargo test --workspace` a rendu un échec dans
 `an_index_kept_up_to_date_merges_its_segments`, sur l'`unwrap` d'`index::update`. Seul, le test
@@ -3412,15 +3430,17 @@ kind: PermissionDenied })`, sur un `commit` de tantivy **sans aucune politique d
 n'était donc pas la fusion.
 
 **La cause, reproduite.** `MmapDirectory::atomic_write` écrit un fichier temporaire et le renomme
-par-dessus la cible ; sous Windows, un renommage qui remplace un fichier ouvert par quelqu'un qui
-n'en partage pas la suppression est refusé avec l'erreur 5. Un test le reproduit à coup sûr :
-il ouvre `meta.json` en ne partageant que la lecture, vérifie que le répertoire de tantivy échoue
-**avec l'erreur même que la suite rencontrait** — le contrôle négatif, sans lequel le test
-pourrait passer pour une autre raison —, puis relâche le fichier après 60 ms pendant que le
-répertoire patient réessaie. Un second fait de même pour la lecture : un fichier qui ne partage
-rien fait échouer l'ouverture elle-même, par une violation de partage (32). Qui tenait le fichier
-pendant la suite n'est pas établi ; l'antivirus du système, actif, est l'explication la plus
-simple.
+par-dessus la cible ; sous Windows, ce remplacement est refusé avec l'erreur 5 dès que la cible
+est **ouverte**, quelle que soit la façon. Mesuré par une sonde : sans porteur, remplacé ; avec une
+ouverture ordinaire de la bibliothèque standard — qui partage la lecture, l'écriture et la
+suppression —, refusé ; avec un porteur qui ne partage que la lecture, refusé aussi. La première
+version de cette entrée disait « un porteur qui ne partage pas la suppression » : la condition
+était trop étroite. Et le premier porteur est dans la maison : un lecteur tantivy ouvert avec la
+politique par défaut lance un fil qui rouvre `meta.json` toutes les 500 ms, la boîte de la coquille
+et du démon en tient un en permanence, et la passe d'index en ouvrait un elle-même pour compter ses
+documents. Lequel a fait tomber la suite n'est pas établi — l'antivirus en est un autre candidat —
+; le remède vaut pour tous. Pour la lecture, c'est un porteur qui ne partage rien qui fait échouer
+l'ouverture elle-même, par une violation de partage (32).
 
 **Le contrôle, sur la suite entière.** Le binaire de test sans la correction, construit à part
 depuis le dernier commit, contre celui qui l'a :
@@ -3443,9 +3463,12 @@ la seconde parce qu'un `Searcher` remonté pendant un remplacement relit `meta.j
 y laisserait la boîte sans recherche jusqu'au rechargement suivant. Seulement pour les erreurs 5 et
 32, **seulement sous Windows** — ailleurs, une permission refusée en est une vraie —, sept
 attentes de 5 à 320 ms, 635 ms en tout, puis l'erreur remonte comme avant. Tout le reste est
-délégué à `MmapDirectory`, **verrou compris** : le verrou par défaut du trait de tantivy n'est pas
-celui du répertoire mappé. Réessayer ne change rien à ce qu'un lecteur voit : chaque essai repart
-d'un fichier temporaire neuf, et l'ancien reste en place tant qu'un renommage n'a pas réussi.
+délégué à `MmapDirectory`, **verrou compris**, et la relecture a montré que ce n'est pas un détail :
+le verrou de `MmapDirectory` laisse ses fichiers sur le disque, et le verrou par défaut du trait
+prend un fichier présent pour un verrou tenu — sans cette délégation, tout store dont l'index a
+déjà servi refuserait chaque écrivain. Réessayer ne change rien à ce qu'un lecteur voit : chaque
+essai repart d'un fichier temporaire neuf, et l'ancien reste en place tant qu'un renommage n'a pas
+réussi.
 
 **Ce que le passage par un répertoire à soi a changé à côté.** `open_or_create` appelait
 `Index::create_in_dir` quand l'ouverture échouait, et c'est cette fonction qui refusait d'écraser
@@ -3455,6 +3478,108 @@ absent —, et l'erreur rendue est celle de l'ouverture, qui dit pourquoi, au li
 `IndexAlreadyExists`.
 
 **Ce qui n'est pas établi.** Que le produit l'ait rencontré : la coquille n'a pas de journal
-lisible quand on la lance du menu Démarrer — voir l'entrée précédente. Et ce refus n'explique pas
-la réindexation complète du 2026-10-13 : un `commit` refusé fait échouer une passe, il ne vide pas
-l'index.
+lisible quand on la lance du menu Démarrer — voir l'entrée précédente. Il y est exposé en
+permanence, par son propre lecteur. Et ce refus n'explique pas la réindexation complète du
+2026-10-13 : un `commit` refusé fait échouer une passe, il ne vide pas l'index.
+
+### 2026-10-18 (nuit) — la relecture : vingt-trois remarques, les phrases, et une reconstruction qui ne réparait rien
+
+**En clair d'abord.** Une relecture indépendante du commit du soir — cinq angles, chaque remarque
+soumise à deux contradicteurs qui devaient la réfuter — en a gardé vingt-trois, deux réfutées.
+Aucune ne cassait le produit tel qu'il tournait ; beaucoup disaient que des tests prouvaient moins
+qu'annoncé, et que le journal affirmait plus que ce qu'il avait mesuré. Trois ont changé le fond :
+la cause du refus de Windows est en partie **chez nous** ; la recherche **par phrase** était quatre
+fois plus lente sur l'index fragmenté, ce que le banc ne voyait pas parce qu'il ne cherchait que
+des mots seuls ; et « Reconstruire l'index » ne réparait **pas** un index illisible.
+
+#### Ce que la relecture a établi, et ce qui a été fait
+
+- **N'importe quelle ouverture de `meta.json` fait refuser son remplacement.** Vérifié par une
+  sonde avant d'être cru : une ouverture ordinaire de la bibliothèque standard, qui partage tout,
+  suffit. Le premier porteur est le fil par lequel tantivy surveille `meta.json` — toutes les
+  500 ms, tant que l'index d'un lecteur vit. La passe d'index en ouvrait un elle-même pour compter
+  ses documents, pendant toutes ses validations : elle prend maintenant un lecteur **sans
+  veilleur** (`ReloadPolicy::Manual`), le compte se lisant une fois. La boîte de la coquille et du
+  démon garde le sien — il suit les index écrits par un autre processus — et la patience couvre ce
+  cas. Le journal et les commentaires disaient « un autre processus qui ne partage pas la
+  suppression » : corrigé.
+- **Une reconstruction répare un index illisible.** `open_or_create` refuse, à raison, d'écraser
+  un index présent qu'elle n'a pas su ouvrir : elle sert des chemins de lecture. Mais
+  `index::rebuild` passait par elle, et la coquille, quand la recherche manque, propose
+  « Reconstruire l'index » : sur un `meta.json` abîmé, une autre version de tantivy ou un schéma
+  qui ne se résout plus, la reconstruction échouait là où elle devait servir, et seul un
+  effacement de `search/` à la main en sortait — ce que rien ne disait. Elle repart maintenant
+  d'un répertoire vide, **seulement** sur ces erreurs-là : une erreur d'entrée-sortie ou de verrou
+  passe, et l'index était peut-être sain. Défaut antérieur à la journée ; deux commentaires
+  affirmaient même qu'un schéma illisible était recréé.
+- **Les tests prouvaient moins qu'annoncé**, et cinq trous ont été bouchés :
+  - rien ne vérifiait que l'index du produit passe par `Patient` ;
+  - rien ne vérifiait le refus d'écraser un `meta.json` présent ;
+  - rien ne vérifiait la délégation du verrou, alors que sans elle tout store qui a déjà servi
+    refuserait chaque écrivain : le verrou de `MmapDirectory` laisse ses fichiers, le verrou par
+    défaut prend un fichier présent pour un verrou tenu, et chaque test partait d'un répertoire
+    neuf où les deux se confondent ;
+  - le test du remplacement pouvait passer **sans** la reprise, si le premier essai durait plus
+    que les 60 ms de garde. Il est maintenant **sans course** : le fichier reste tenu pendant tout
+    le premier essai et n'est relâché qu'une fois cet essai refusé, et le compte des essais doit
+    être d'au moins deux ;
+  - rien ne vérifiait que le filtre ne laisse passer que les erreurs 5 et 32.
+- **Le journal affirmait plus qu'il n'avait mesuré**, corrigé dans les entrées concernées, chaque
+  fois en le disant : « un `commit` sur cinq » — c'était une exécution de la suite sur cinq ;
+  « une demi-seconde au plus » — c'est 635 ms d'attente et huit essais ; « un segment par paquet »
+  — c'est jusqu'à huit, un par fil d'indexation, d'où la médiane de 250 ; « l'écart n'est pas dans
+  tantivy » — il y est ; le pic de 644 ms lu comme une première ouverture — c'était une
+  réouverture ; la passe de fond « en priorité minimale, tuée par un job » et l'état « rattrape N
+  messages » présenté comme visible — vrai à moitié, et c'est ce qui entre dans la décision sur
+  l'arriéré.
+- **Deux remarques réfutées** : que les lectures de fichiers de segments, pendant une validation,
+  devraient aussi attendre — un porteur ordinaire partage la lecture et ne les bloque pas, le
+  module ne prétend couvrir que les deux écritures-lectures entières, et rien d'observé n'y a
+  échoué ; et que « l'arriéré est la seule raison de refus qui n'efface rien » serait faux pour le
+  divergent et le plus récent — la règle écrite dans `pass.rs` est « continuer effacerait **ou
+  mélangerait** », et ces deux-là mélangeraient : ajouter à un magasin qui ne correspond plus.
+
+#### Les contrôles négatifs, mutant par mutant
+
+Chaque garantie retirée, une à la fois, dans une copie de travail jetable ; chaque fois, les tests
+qui la gardent tombent, et eux seuls :
+
+| mutation | tombe |
+|---|---|
+| verrou non délégué | les fichiers de verrou laissés par tantivy |
+| ouverture qui écrase un index présent | l'index illisible |
+| aucune patience | les six tests de patience et de câblage |
+| écriture de `Patient` sans patience | le câblage en écriture, et la passe d'index qui attend |
+| lecture de `Patient` sans patience | le câblage en lecture |
+| filtre élargi à toute erreur | le filtre des erreurs 5 et 32 |
+| reconstruction sans réparation | l'index illisible |
+| toute erreur tenue pour illisible | la classification des erreurs |
+
+Puis la suite de `mailcore` cent fois de suite, nouveaux tests compris : cent sur cent.
+
+#### Les phrases, que le banc ne cherchait pas
+
+`measure-merge` prend maintenant `--phrases`, un jeu de requêtes du critère 1 dont il ne lit que
+les textes, et compare avant et après sur les mêmes requêtes, l'ordre alterné. Jeu v5, 30
+phrases, trois exécutions par store en alternant les stores, la première jetée. **Réserve** : la
+relecture lisait le code pendant ce relevé — une charge légère, non chiffrée. Les valeurs absolues
+en sont un peu gonflées — l'ouverture y monte à 44–46 ms contre 37 au calme — ; le rapport avant
+après, lui, est pris requête par requête en alternant, et c'est lui qui compte. À refaire au repos.
+
+| tantivy seul, avant → après la fusion | corpus de mesure | store du quotidien |
+|---|---|---|
+| phrases du critère 1, p50 | 13,9–14,3 → 5,3–5,5 ms | 17,1–18,0 → 4,2–4,5 ms |
+| phrases du critère 1, p95 | 20,9–23,1 → 8,8–8,9 ms | 24,2–24,7 → 6,7–7,3 ms |
+| mots seuls, p95 | 1,35–1,40 → 1,12–1,16 ms | 1,49–1,77 → 1,14–1,26 ms |
+
+Pour chacune des 30 phrases, le même nombre de résultats des deux côtés, compté sans plafond.
+**Trois à quatre fois plus rapide sur ce qu'on tape, presque rien sur un mot seul** : chaque mot
+d'une phrase est cherché, et ses documents pesés, dans chacun des segments ; un mot seul n'en
+cherche qu'un. C'est aussi l'essentiel des 21 ms que prenaient les mots seuls de bout en bout sur
+le store du quotidien. Le critère 2 y gagnerait une quinzaine de millisecondes de marge — à
+mesurer, pas à déduire, quand l'application du quotidien aura fusionné son index.
+
+**La leçon de méthode, encore la même** : le premier relevé d'un banc neuf accuse le banc. Celui-ci
+avait conclu « la recherche à peine » sur un jeu de requêtes qui ne ressemblait pas à l'usage ; le
+journal l'avait écrit, le `CLAUDE.md` aussi. Un jeu de requêtes de banc doit ressembler à ce qu'on
+tape.

@@ -608,9 +608,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_contacts_counted
 /// tantivy — deux magasins, donc deux vérités possibles.
 ///
 /// Elles divergent quand l'index est recréé sans que le store le sache : répertoire de recherche
-/// supprimé, schéma illisible, disque remplacé. `open_or_create` recrée alors un index **vide**,
-/// et des drapeaux qui disent « indexé » feraient sauter tous les messages — la recherche
-/// resterait vide pour toujours, sans que rien ne le signale.
+/// supprimé, disque remplacé. `open_or_create` crée alors un index **vide**, et des drapeaux qui
+/// disent « indexé » feraient sauter tous les messages — la recherche resterait vide pour
+/// toujours, sans que rien ne le signale. Un index présent mais illisible, lui, n'est jamais
+/// recréé en passant : c'est `index::rebuild` qui le refait.
 ///
 /// La divergence est donc cherchée au point d'usage, dans `index::update` : un index vide alors
 /// que des messages se disent indexés est le symptôme, et remettre les drapeaux est le remède.

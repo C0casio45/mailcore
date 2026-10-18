@@ -3,9 +3,9 @@
 //! ## La question
 //!
 //! Jusqu'au 2026-10-18, les segments de l'index ne fusionnaient jamais : l'écrivain était lâché
-//! sitôt validé, et tantivy abandonne alors ses fusions. Chaque paquet indexé laissait un segment
-//! de plus, et une recherche les parcourt tous — 149 dans le store du quotidien, d'une seule
-//! réindexation. La correction attend les fusions à la fin de chaque passe : elle a un **prix**,
+//! sitôt validé, et tantivy abandonne alors ses fusions. Chaque paquet indexé laissait jusqu'à
+//! huit segments de plus — un par fil d'indexation —, et une recherche les parcourt tous : 149
+//! dans le store du quotidien, d'une seule réindexation. La correction attend les fusions à la fin de chaque passe : elle a un **prix**,
 //! payé dans un job de fond, et un **gain**, à chaque ouverture de l'index et dans chaque
 //! recherche. Ce banc chiffre les deux sur une réplique d'un store réel :
 //!
@@ -139,7 +139,9 @@ pub fn measure(
     // disparaître au `commit` — tantivy jette alors la fusion qui le comptait (« couldn't find
     // segment in SegmentManager ») et la refait à la passe suivante. Vu au premier relevé du store
     // du quotidien, le 2026-10-18 : la fusion de l'arriéré y était comptée deux fois. Les plus
-    // anciens vivent dans les segments de 2 000 de la reconstruction, qu'un retrait ne vide pas.
+    // anciens vivent dans les segments de la reconstruction — des centaines de documents chacun —,
+    // qu'un retrait ne vide pas ; et passé la première arrivée, qui fusionne tout, les suivantes
+    // retirent d'un segment fusionné.
     let ids: Vec<i64> = {
         let db = rusqlite::Connection::open(after_root.join("index.sqlite").as_std_path())
             .context("copie de index.sqlite")?;

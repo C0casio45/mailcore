@@ -14,8 +14,9 @@
 use crate::progress::Progress;
 
 use mail_parser::MessageParser;
+use tantivy::directory::error::OpenReadError;
 use tantivy::merge_policy::NoMergePolicy;
-use tantivy::{Index, IndexSettings, IndexWriter, doc};
+use tantivy::{Index, IndexSettings, IndexWriter, ReloadPolicy, TantivyError, doc};
 
 use crate::error::Result;
 use crate::index::directory::Patient;
@@ -61,7 +62,30 @@ pub struct IndexStats {
 /// [`crate::Error::Tantivy`] si l'index ne peut pas être écrit, [`crate::Error::Sqlite`] si
 /// le store est illisible. Un message qui échoue individuellement est compté, pas propagé.
 pub fn rebuild(store: &Store, progress: &Progress) -> Result<IndexStats> {
-    let (index, fields) = open_or_create(store)?;
+    let (index, fields) = match open_or_create(store) {
+        Ok(opened) => opened,
+        // **Une reconstruction répare aussi un index illisible.** `open_or_create` refuse, à raison,
+        // d'écraser un index qu'elle n'a pas su ouvrir : elle sert des chemins de lecture. Une
+        // reconstruction efface l'index de toute façon — c'est ce qu'on lui demande —, donc elle
+        // peut repartir d'un répertoire vide. Sans ça, « Reconstruire l'index », que la coquille
+        // propose quand la recherche manque, échouait précisément là où il devait servir, et seul
+        // un effacement de `search/` à la main en sortait. Trouvé par une relecture le 2026-10-18.
+        // Une erreur d'entrée-sortie, elle, n'efface rien : un fichier tenu ou un disque plein
+        // passent, et l'index était peut-être sain.
+        Err(error) if unreadable(&error) => {
+            tracing::warn!(
+                ?error,
+                "index illisible : la reconstruction repart d'un répertoire vide"
+            );
+            let dir = store.search_dir();
+            std::fs::remove_dir_all(&dir).map_err(|source| crate::Error::Io {
+                path: dir.clone(),
+                source,
+            })?;
+            open_or_create(store)?
+        }
+        Err(error) => return Err(error),
+    };
     {
         let mut writer: IndexWriter = index.writer(WRITER_HEAP)?;
         writer.delete_all_documents()?;
@@ -86,9 +110,13 @@ pub fn rebuild(store: &Store, progress: &Progress) -> Result<IndexStats> {
 ///
 /// Le drapeau vit dans SQLite, les documents dans tantivy : **deux magasins, donc deux vérités
 /// possibles**. Elles divergent quand l'index est recréé sans que le store le sache — répertoire
-/// supprimé, schéma illisible, disque remplacé. `open_or_create` rend alors un index vide, et
-/// des drapeaux qui disent « indexé » feraient sauter tous les messages : la recherche resterait
-/// vide **pour toujours**, sans que rien ne le signale.
+/// supprimé, disque remplacé. `open_or_create` rend alors un index vide, et des drapeaux qui
+/// disent « indexé » feraient sauter tous les messages : la recherche resterait vide **pour
+/// toujours**, sans que rien ne le signale.
+///
+/// Un index présent mais **illisible** — `meta.json` abîmé, autre version de tantivy, schéma qui
+/// ne se résout plus — n'est pas recréé ici : `open_or_create` rend l'erreur, la passe échoue, la
+/// recherche se coupe et le dit. C'est [`rebuild`] qui répare.
 ///
 /// Un index vide alors que des messages se disent indexés est donc traité comme le symptôme
 /// qu'il est, et les drapeaux sont remis. Le contrôle est ici, au point d'usage, et non dans
@@ -115,7 +143,16 @@ pub fn update(store: &Store, progress: &Progress) -> Result<IndexStats> {
 
     let (index, fields) = open_or_create(store)?;
 
-    let documents = index.reader()?.searcher().num_docs();
+    // Un lecteur **sans veilleur**. Celui par défaut lance un fil qui rouvre `meta.json` toutes
+    // les 500 ms tant que l'index vit — toute la passe, donc — et sous Windows, un `meta.json`
+    // ouvert, même par nous, fait refuser son remplacement au `commit` : voir `directory`. Ce
+    // compte se lit une fois ; il n'a rien à suivre.
+    let reader: tantivy::IndexReader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()?;
+    let documents = reader.searcher().num_docs();
+    drop(reader);
     if documents == 0 && store.indexed_count()? > 0 {
         tracing::warn!(
             "index vide alors que des messages se disent indexés : réindexation complète"
@@ -139,17 +176,18 @@ pub fn update(store: &Store, progress: &Progress) -> Result<IndexStats> {
 ///
 /// ## Un écrivain pour toute la passe, qu'on laisse finir ses fusions
 ///
-/// Chaque `commit` écrit un segment, et une recherche les parcourt **tous**. Tantivy les fusionne
-/// dans des fils de fond que le `commit` déclenche, et **seul un écrivain vivant en garde le
-/// résultat** : `Drop` marque l'écrivain mort, la fusion en cours va pourtant au bout — elle
-/// écrit son segment — puis tantivy la jette, faute de qui l'enregistre. La première version
-/// ouvrait un écrivain par paquet et le lâchait sitôt validé ; aucune fusion n'était donc jamais
-/// gardée : chaque paquet validé laissait un segment de plus, pour toujours. Trouvé le
-/// 2026-10-18 : **149 segments** dans le store du quotidien, tous écrits par une seule
-/// réindexation, dont 141 de moins de 2 000 documents, et 115 dans le corpus de mesure — sur
-/// lequel les latences de la recherche ont toutes été relevées. Mesuré au repos, ils coûtaient
-/// peu à une requête et beaucoup à l'**ouverture** : 37 ms pour monter un `Searcher`, contre
-/// 1,3 après la fusion — `cargo xtask measure-merge`.
+/// Chaque `commit` écrit un segment **par fil d'indexation** qui a reçu un document — tantivy en
+/// lance huit pour ce budget, donc jusqu'à huit segments par paquet —, et une recherche les
+/// parcourt **tous**. Tantivy les fusionne dans des fils de fond que le `commit` déclenche, et
+/// **seul un écrivain vivant en garde le résultat** : `Drop` marque l'écrivain mort, la fusion en
+/// cours va pourtant au bout — elle écrit son segment — puis tantivy la jette, faute de qui
+/// l'enregistre. La première version ouvrait un écrivain par paquet et le lâchait sitôt validé ;
+/// aucune fusion n'était donc jamais gardée, et les segments s'accumulaient pour toujours.
+/// Trouvé le 2026-10-18 : **149 segments** dans le store du quotidien, tous écrits par une seule
+/// réindexation — 141 d'une médiane de 250 documents, le huitième d'un paquet —, et 115 dans le
+/// corpus de mesure, sur lequel les latences de la recherche ont toutes été relevées. Mesuré au
+/// repos (`cargo xtask measure-merge`) : 37 ms pour monter un `Searcher` contre 1,3 après la
+/// fusion, et une recherche par phrase **quatre fois plus lente** — un mot seul, à peine.
 ///
 /// L'écrivain vit donc le temps de la passe — les fusions avancent pendant qu'on indexe — et on
 /// attend la fin des siennes avant de le rendre, **annulation comprise** : une fusion qu'on
@@ -258,20 +296,20 @@ pub fn open_or_create(store: &Store) -> Result<(Index, Fields)> {
 
     // Le répertoire mappé de tantivy, qui attend qu'un fichier tenu ailleurs se libère au lieu
     // de faire échouer le `commit` : voir `directory`.
-    let directory = Patient::open(dir.as_std_path()).map_err(tantivy::TantivyError::from)?;
+    let directory = Patient::open(dir.as_std_path()).map_err(TantivyError::from)?;
     match Index::open(directory.clone()) {
         Ok(index) => {
             let fields = schema::resolve(&index.schema())?;
             Ok((index, fields))
         }
         Err(error) => {
-            // Index absent ou illisible : on le recrée. Il est reconstructible depuis les
-            // blobs, donc l'écraser ne perd rien — au pire quelques minutes de calcul. Mais
-            // **jamais par-dessus un `meta.json` présent** : `Index::create` effacerait un index
-            // qu'on n'a simplement pas pu ouvrir cette fois-ci. C'est le refus que faisait
-            // `Index::create_in_dir` ; l'erreur rendue est maintenant celle de l'ouverture, qui
-            // dit pourquoi.
-            if Index::exists(&directory).map_err(tantivy::TantivyError::from)? {
+            // Index absent : on le crée. Index présent mais qu'on n'a pas su ouvrir : **jamais
+            // écrasé ici** — `Index::create` effacerait un index qu'on n'a peut-être simplement
+            // pas pu lire cette fois-ci, et cette fonction sert des chemins de lecture. C'est le
+            // refus que faisait `Index::create_in_dir` ; l'erreur rendue est maintenant celle de
+            // l'ouverture, qui dit pourquoi. Réparer un index illisible est le travail de
+            // `rebuild`, qui efface de toute façon.
+            if Index::exists(&directory).map_err(TantivyError::from)? {
                 return Err(error.into());
             }
             let (schema, fields) = schema::build();
@@ -279,6 +317,23 @@ pub fn open_or_create(store: &Store) -> Result<(Index, Fields)> {
             Ok((index, fields))
         }
     }
+}
+
+/// Un index que tantivy ne sait **plus** lire, par opposition à un index qu'on n'a pas pu lire
+/// cette fois-ci : `meta.json` abîmé ou écrit par une autre version, un schéma qui ne se résout
+/// plus. Une erreur d'entrée-sortie ou de verrou n'en est pas une — elle passe, et l'index était
+/// peut-être sain : [`rebuild`] ne l'efface pas pour elle.
+fn unreadable(error: &crate::Error) -> bool {
+    matches!(
+        error,
+        crate::Error::Tantivy(
+            TantivyError::DataCorruption(_)
+                | TantivyError::IncompatibleIndex(_)
+                | TantivyError::OpenReadError(OpenReadError::IncompatibleIndex(_))
+                | TantivyError::FieldNotFound(_)
+                | TantivyError::SchemaError(_)
+        )
+    )
 }
 
 /// Indexe un message. Une défaillance individuelle est comptée, jamais propagée.
@@ -393,4 +448,39 @@ fn addresses(header: Option<&mail_parser::Address<'_>>, out: &mut String) {
 #[must_use]
 pub const fn message_id(raw: i64) -> MessageId {
     MessageId(raw)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use tantivy::TantivyError;
+    use tantivy::directory::error::LockError;
+    use tantivy::error::DataCorruption;
+
+    use super::unreadable;
+
+    #[test]
+    fn only_an_index_that_cannot_be_read_any_more_makes_a_rebuild_erase() {
+        // Ce qui fait repartir une reconstruction d'un répertoire vide : un index abîmé, ou d'une
+        // forme que ce binaire ne lit pas.
+        for error in [
+            TantivyError::DataCorruption(DataCorruption::comment_only("meta.json abîmé")),
+            TantivyError::FieldNotFound("subject".to_owned()),
+            TantivyError::SchemaError("champ d'un autre type".to_owned()),
+        ] {
+            assert!(unreadable(&error.clone().into()), "{error:?}");
+        }
+        // Le contrôle inverse : ce qui passe n'efface rien — un fichier tenu, un verrou pris, un
+        // répertoire qu'on n'a pas pu créer.
+        for error in [
+            TantivyError::from(std::io::Error::from_raw_os_error(5)),
+            TantivyError::LockFailure(LockError::LockBusy, None),
+        ] {
+            assert!(!unreadable(&error.clone().into()), "{error:?}");
+        }
+        assert!(!unreadable(&crate::Error::Io {
+            path: camino::Utf8PathBuf::from("search"),
+            source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+        }));
+    }
 }

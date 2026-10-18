@@ -910,8 +910,8 @@ impl Shell {
                         self.results = Some(Vec::new());
                         self.say(
                             theme::Tone::Attention,
-                            "L'index plein texte est absent : « Reconstruire l'index », dans \
-                             Activité, le construit.",
+                            "L'index plein texte est absent ou illisible : « Reconstruire \
+                             l'index », dans Activité, le refait.",
                         );
                     }
                 }

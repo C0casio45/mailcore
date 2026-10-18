@@ -4,16 +4,23 @@
 //!
 //! À chaque `commit`, tantivy remplace `meta.json` et `.managed.json` de la même façon : un
 //! fichier temporaire écrit à côté, puis renommé par-dessus l'ancien (`atomic_write`). Sous
-//! Windows, ce renommage échoue — « Accès refusé », erreur 5 — tant qu'un autre processus tient
-//! l'ancien fichier ouvert sans partager sa suppression ; un antivirus qui inspecte le fichier
-//! qu'on vient d'écrire le fait typiquement, quelques millisecondes. tantivy 0.26.1 ne réessaie
-//! pas : le `commit` échoue, la passe d'index avec lui, et une fusion dont l'enregistrement
-//! tombe là est jetée.
+//! Windows, ce renommage échoue — « Accès refusé », erreur 5 — tant que l'ancien fichier est
+//! ouvert **par qui que ce soit**, même par une ouverture ordinaire qui partage tout : mesuré le
+//! 2026-10-18, un `std::fs::File::open` suffit. tantivy 0.26.1 ne réessaie pas : le `commit`
+//! échoue, la passe d'index avec lui, et une fusion dont l'enregistrement tombe là est jetée.
 //!
-//! Trouvé le 2026-10-18 : une fois sur quarante, la suite de `mailcore` tombait sur un `commit`
-//! refusé, dans les deux tests qui valident huit et treize fois de suite. La correction des
-//! fusions du même jour en multipliait les occasions dans le produit — une fusion réécrit
-//! `meta.json` quelques millisecondes après le `commit` qui l'a lancée.
+//! **Le premier porteur est tantivy lui-même**, dans notre processus. Un lecteur ouvert avec la
+//! politique par défaut lance un fil qui rouvre `meta.json` toutes les 500 ms tant que l'index
+//! vit, et un `Searcher` remonté le relit : la boîte de la coquille et du démon en tient un en
+//! permanence, pendant que la passe d'index valide à côté. Un antivirus qui inspecte le fichier
+//! qu'on vient d'écrire en est un autre. Lequel a fait tomber la suite n'est pas établi ; le
+//! remède vaut pour tous.
+//!
+//! Trouvé le 2026-10-18 : une exécution de la suite de `mailcore` sur quarante tombait sur un
+//! `commit` refusé, dans les deux tests qui valident huit et treize fois de suite — puis vingt
+//! sur cent, le soir même, contre zéro avec la patience. La correction des fusions du même jour en
+//! multipliait les occasions dans le produit : une fusion réécrit `meta.json` quelques
+//! millisecondes après le `commit` qui l'a lancée.
 //!
 //! ## Ce qui est réessayé, et ce qui ne l'est pas
 //!
@@ -26,11 +33,14 @@
 //!
 //! Réessayer ne change rien à ce qu'un lecteur voit : chaque essai repart d'un fichier temporaire
 //! neuf, et l'ancien `meta.json` reste en place tant qu'un renommage n'a pas réussi. L'attente est
-//! bornée — [`WAITS`], 635 ms en tout —, puis l'erreur remonte comme avant.
+//! bornée — [`WAITS`], huit essais et 635 ms d'attente en tout —, puis l'erreur remonte comme
+//! avant.
 //!
-//! Tout le reste est délégué tel quel à [`MmapDirectory`], **verrou compris** : le verrou par
-//! défaut du trait n'est pas celui du répertoire mappé, et deux écrivains ne doivent jamais
-//! s'en disputer deux sortes.
+//! Tout le reste est délégué tel quel à [`MmapDirectory`], **verrou compris**, et ce n'est pas un
+//! détail : le verrou de [`MmapDirectory`] laisse ses fichiers `.tantivy-writer.lock` et
+//! `.tantivy-meta.lock` sur le disque, et le verrou par défaut du trait prend un fichier présent
+//! pour un verrou tenu. Sans cette délégation, tout store dont l'index a déjà servi refuserait
+//! chaque écrivain et ferait attendre chaque lecteur dix secondes — un test le vérifie.
 
 use std::io;
 use std::path::Path;
@@ -45,7 +55,7 @@ use tantivy::directory::{
     WatchHandle, WritePtr,
 };
 
-/// Les attentes entre deux essais : chacune double la précédente.
+/// Les attentes entre deux essais : chacune double la précédente, 635 ms en tout.
 const WAITS: [Duration; 7] = [
     Duration::from_millis(5),
     Duration::from_millis(10),
@@ -221,6 +231,14 @@ mod tests {
         let shared = io::Error::from_raw_os_error(32);
         assert_eq!(super::held_elsewhere(&held), cfg!(windows));
         assert_eq!(super::held_elsewhere(&shared), cfg!(windows));
+        // Le contrôle inverse : les autres erreurs du système, voisines comprises, ne font pas
+        // attendre — fichier ou chemin absent, fichier déjà là, disque plein, fichier mappé.
+        for code in [2, 3, 80, 112, 183, 1224] {
+            assert!(
+                !super::held_elsewhere(&io::Error::from_raw_os_error(code)),
+                "{code}"
+            );
+        }
         assert!(!super::held_elsewhere(&io::Error::from(
             io::ErrorKind::NotFound
         )));
@@ -232,31 +250,131 @@ mod tests {
         assert!(!super::read_held_elsewhere(&absent));
     }
 
-    /// Le scénario lui-même, sous Windows : un autre tient `meta.json` ouvert sans partager sa
-    /// suppression, et le relâche un peu plus tard.
+    /// Ouvre `path` comme tantivy l'ouvre pour le relire — une ouverture ordinaire, qui partage
+    /// tout —, ou sans rien partager. L'ouverture peut elle-même tomber sur un porteur passager :
+    /// elle a la même patience que ce qu'elle met à l'épreuve.
+    #[cfg(windows)]
+    fn hold(path: &std::path::Path, exclusive: bool) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        super::patiently(
+            &super::WAITS,
+            || {
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                if exclusive {
+                    options.share_mode(0);
+                }
+                options.open(path)
+            },
+            super::held_elsewhere,
+        )
+        .unwrap()
+    }
+
+    /// Le refus et sa reprise, **sans course** : le fichier est tenu pendant tout le premier
+    /// essai, et relâché seulement quand cet essai a été refusé. Si une ouverture ordinaire ne
+    /// faisait pas refuser le remplacement, le premier essai passerait et le compte le dirait.
     #[cfg(windows)]
     #[test]
-    fn a_replacement_waits_for_a_file_held_elsewhere() {
-        use std::os::windows::fs::OpenOptionsExt;
+    fn a_refused_replacement_is_tried_again_once_the_file_is_released() {
         use tantivy::directory::Directory;
 
-        /// `FILE_SHARE_READ` seul : ni écriture ni suppression partagées.
-        const SHARE_READ: u32 = 0x1;
+        let dir = tempfile::tempdir().unwrap();
+        let inner = tantivy::directory::MmapDirectory::open(dir.path()).unwrap();
+        let meta = std::path::Path::new("meta.json");
+        super::patiently(
+            &super::WAITS,
+            || inner.atomic_write(meta, b"un"),
+            super::held_elsewhere,
+        )
+        .unwrap();
+
+        let held = std::cell::RefCell::new(Some(hold(&dir.path().join(meta), false)));
+        let tries = Cell::new(0);
+        super::patiently(
+            &super::WAITS,
+            || {
+                tries.set(tries.get() + 1);
+                let outcome = inner.atomic_write(meta, b"deux");
+                if let Err(error) = &outcome {
+                    if tries.get() == 1 {
+                        // L'erreur même que la suite rencontrait, et pas une autre.
+                        assert_eq!(error.raw_os_error(), Some(5), "{error}");
+                    }
+                    held.borrow_mut().take();
+                }
+                outcome
+            },
+            super::held_elsewhere,
+        )
+        .unwrap();
+        assert!(
+            tries.get() >= 2,
+            "le premier essai devait être refusé : {} essai",
+            tries.get()
+        );
+        assert_eq!(std::fs::read(dir.path().join(meta)).unwrap(), b"deux");
+    }
+
+    /// La lecture, de même : un porteur qui ne partage rien fait échouer l'ouverture elle-même,
+    /// par une violation de partage, et la lecture reprend quand il relâche.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_read_is_tried_again_once_the_file_is_released() {
+        use tantivy::directory::Directory;
+
+        let dir = tempfile::tempdir().unwrap();
+        let inner = tantivy::directory::MmapDirectory::open(dir.path()).unwrap();
+        let meta = std::path::Path::new("meta.json");
+        super::patiently(
+            &super::WAITS,
+            || inner.atomic_write(meta, b"un"),
+            super::held_elsewhere,
+        )
+        .unwrap();
+
+        let held = std::cell::RefCell::new(Some(hold(&dir.path().join(meta), true)));
+        let tries = Cell::new(0);
+        let read = super::patiently(
+            &super::WAITS,
+            || {
+                tries.set(tries.get() + 1);
+                let outcome = inner.atomic_read(meta);
+                if let Err(error) = &outcome {
+                    if tries.get() == 1 {
+                        assert!(super::read_held_elsewhere(error), "{error}");
+                    }
+                    held.borrow_mut().take();
+                }
+                outcome
+            },
+            super::read_held_elsewhere,
+        )
+        .unwrap();
+        assert!(
+            tries.get() >= 2,
+            "le premier essai devait être refusé : {} essai",
+            tries.get()
+        );
+        assert_eq!(read, b"un");
+    }
+
+    /// Le câblage : c'est bien `Patient` qui attend, en écriture. Un autre fil relâche le fichier
+    /// au bout de 300 ms ; le test ne pourrait passer à tort que si le premier essai durait plus
+    /// longtemps que ça — la reprise elle-même est établie sans course ci-dessus.
+    #[cfg(windows)]
+    #[test]
+    fn the_index_directory_waits_to_replace_a_file_held_elsewhere() {
+        use tantivy::directory::Directory;
 
         let dir = tempfile::tempdir().unwrap();
         let patient = super::Patient::open(dir.path()).unwrap();
         let meta = std::path::Path::new("meta.json");
         patient.atomic_write(meta, b"un").unwrap();
 
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(SHARE_READ)
-            .open(dir.path().join(meta))
-            .unwrap();
-
-        // Le contrôle négatif d'abord : sans patience, le remplacement échoue, et par l'erreur
-        // même que la suite de tests rencontrait. Sans lui, ce test pourrait passer pour une
-        // autre raison que celle qu'il vérifie.
+        let held = hold(&dir.path().join(meta), false);
+        // Le contrôle négatif : le répertoire de tantivy, sans patience, refuse.
         let refused = tantivy::directory::MmapDirectory::open(dir.path())
             .unwrap()
             .atomic_write(meta, b"refus")
@@ -264,7 +382,7 @@ mod tests {
         assert_eq!(refused.raw_os_error(), Some(5), "{refused}");
 
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(300));
             drop(held);
         });
         patient.atomic_write(meta, b"deux").unwrap();
@@ -272,12 +390,10 @@ mod tests {
         assert_eq!(patient.atomic_read(meta).unwrap(), b"deux");
     }
 
-    /// La lecture : un autre qui ne partage rien du tout — pas même la lecture — fait échouer
-    /// l'ouverture elle-même, par une violation de partage.
+    /// Le câblage, en lecture.
     #[cfg(windows)]
     #[test]
-    fn a_read_waits_for_a_file_held_elsewhere() {
-        use std::os::windows::fs::OpenOptionsExt;
+    fn the_index_directory_waits_to_read_a_file_held_elsewhere() {
         use tantivy::directory::Directory;
 
         let dir = tempfile::tempdir().unwrap();
@@ -285,11 +401,7 @@ mod tests {
         let meta = std::path::Path::new("meta.json");
         patient.atomic_write(meta, b"un").unwrap();
 
-        let held = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(dir.path().join(meta))
-            .unwrap();
+        let held = hold(&dir.path().join(meta), true);
         let refused = tantivy::directory::MmapDirectory::open(dir.path())
             .unwrap()
             .atomic_read(meta)
@@ -297,7 +409,7 @@ mod tests {
         assert!(super::read_held_elsewhere(&refused), "{refused}");
 
         let releaser = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(300));
             drop(held);
         });
         assert_eq!(patient.atomic_read(meta).unwrap(), b"un");

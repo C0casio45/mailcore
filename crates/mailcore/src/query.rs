@@ -1474,6 +1474,95 @@ mod tests {
         assert!(index.searchable_segment_ids().unwrap().len() < 8);
     }
 
+    #[test]
+    fn the_lock_files_tantivy_leaves_behind_do_not_lock_the_next_pass() {
+        // Le verrou de tantivy laisse ses fichiers sur le disque, et le verrou par défaut de son
+        // trait prend un fichier présent pour un verrou tenu : sans la délégation de
+        // `directory::Patient`, tout store dont l'index a déjà servi refuserait chaque écrivain.
+        // Les autres tests partent d'un répertoire neuf, où les deux verrous se confondent —
+        // celui-ci part d'un index qui a servi.
+        let (_dir, mailbox) = mailbox();
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let search = mailbox.store().search_dir();
+        for lock in [".tantivy-writer.lock", ".tantivy-meta.lock"] {
+            assert!(search.join(lock).is_file(), "{lock} : la précondition");
+        }
+
+        add_numbered_message(mailbox.store(), 0);
+        let stats = crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        assert_eq!(stats.indexed, 1);
+        let reopened = Mailbox::open(mailbox.store().root()).unwrap();
+        assert!(reopened.search_available());
+        assert_eq!(reopened.search("chantier", 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_index_is_not_erased_by_opening_and_a_rebuild_repairs_it() {
+        let (_dir, mailbox) = mailbox();
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let root = mailbox.store().root().to_owned();
+        // La boîte relâche ses fichiers : sous Windows, un fichier mappé ne s'efface pas.
+        drop(mailbox);
+        let store = Store::open(&root).unwrap();
+        let meta = store.search_dir().join("meta.json");
+        std::fs::write(&meta, b"{ abime").unwrap();
+        let files = |store: &Store| {
+            let mut names: Vec<String> = std::fs::read_dir(store.search_dir())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = files(&store);
+
+        // L'ouverture refuse, et n'efface rien : elle sert des chemins de lecture, et l'index
+        // n'était peut-être illisible que cette fois-ci.
+        assert!(crate::index::open_or_create(&store).is_err());
+        assert_eq!(std::fs::read(&meta).unwrap(), b"{ abime");
+        assert_eq!(files(&store), before);
+
+        // La reconstruction, elle, repart d'un répertoire vide : c'est ce qu'on lui demande, et
+        // c'est ce que la coquille propose quand la recherche manque.
+        let stats = crate::index::rebuild(&store, &crate::Progress::new()).unwrap();
+        assert_eq!(stats.indexed, 2);
+        drop(store);
+        let reopened = Mailbox::open(&root).unwrap();
+        assert!(reopened.search_available());
+        assert_eq!(reopened.search("facture", 50).unwrap().len(), 2);
+    }
+
+    /// Le câblage du produit : l'index d'une passe passe bien par `directory::Patient`. Le
+    /// `meta.json` est tenu comme le tient le veilleur de tantivy — une ouverture ordinaire — et
+    /// relâché au bout de 300 ms par un autre fil ; la passe doit attendre au lieu d'échouer.
+    #[cfg(windows)]
+    #[test]
+    fn an_index_pass_waits_for_a_meta_json_held_elsewhere() {
+        use tantivy::directory::Directory;
+
+        let (_dir, mailbox) = mailbox();
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        add_numbered_message(mailbox.store(), 0);
+        let search = mailbox.store().search_dir();
+        let held = std::fs::File::open(search.join("meta.json")).unwrap();
+
+        // Le contrôle négatif : le répertoire de tantivy, nu, refuse le remplacement.
+        let current = std::fs::read(search.join("meta.json")).unwrap();
+        let refused = tantivy::directory::MmapDirectory::open(search.as_std_path())
+            .unwrap()
+            .atomic_write(std::path::Path::new("meta.json"), &current)
+            .unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(5), "{refused}");
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let stats = crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        releaser.join().unwrap();
+        assert_eq!(stats.indexed, 1);
+    }
+
     /// Ajoute un message distinct par `n` — même dossier, contenu différent, donc un blob neuf.
     fn add_numbered_message(store: &Store, n: u32) {
         let raw = format!(
