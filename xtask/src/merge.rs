@@ -3,18 +3,21 @@
 //! ## La question
 //!
 //! Jusqu'au 2026-10-18, les segments de l'index ne fusionnaient jamais : l'écrivain était lâché
-//! sitôt validé, et tantivy abandonne alors ses fusions. Chaque passe qui indexait laissait un
-//! segment de plus, et une recherche les parcourt tous — 149 dans le store du quotidien après une
-//! semaine d'usage. La correction attend les fusions à la fin de chaque passe : elle a un **prix**,
-//! payé dans un job de fond, et un **gain**, dans chaque recherche. Ce banc chiffre les deux sur
-//! une réplique d'un store réel :
+//! sitôt validé, et tantivy abandonne alors ses fusions. Chaque paquet indexé laissait un segment
+//! de plus, et une recherche les parcourt tous — 149 dans le store du quotidien, d'une seule
+//! réindexation. La correction attend les fusions à la fin de chaque passe : elle a un **prix**,
+//! payé dans un job de fond, et un **gain**, à chaque ouverture de l'index et dans chaque
+//! recherche. Ce banc chiffre les deux sur une réplique d'un store réel :
 //!
 //! 1. **la première arrivée** après la correction, qui fusionne tout ce qui s'est accumulé — sa
 //!    durée, et ce qu'elle ajoute à la mémoire du processus ;
 //! 2. **les arrivées suivantes**, une par passe, comme une moisson les apporte ;
-//! 3. **la recherche plein texte**, sur l'index d'avant et sur celui d'après, requête par requête
+//! 3. **l'ouverture de l'index**, avant et après : `Mailbox::open` la paie à chaque démarrage, et
+//!    `reload_search` après chaque passe d'index — un `Searcher` ouvre chacun des segments ;
+//! 4. **la recherche plein texte**, sur l'index d'avant et sur celui d'après, requête par requête
 //!    et en alternant l'ordre — avec, pour chaque requête, le même nombre de résultats des deux
-//!    côtés : une fusion qui perdrait des documents se verrait là.
+//!    côtés : une fusion qui perdrait des documents se verrait là. Deux jeux : des mots tirés des
+//!    sujets, le cas le moins cher, et les phrases du critère 1, ce qu'on tape vraiment.
 //!
 //! ## Deux répliques, jamais le store
 //!
@@ -33,7 +36,7 @@ use mailcore::{Progress, Store};
 
 use crate::measure::{RssSampler, build_queries, run_once};
 use crate::model::{current_rss, mib};
-use crate::semantic::{percentile, release_only};
+use crate::semantic::{percentile, query_texts, release_only};
 use crate::vectors::{copy_index, copy_tree, link_blobs, work_dir_in};
 
 /// Ce qu'un index dit de ses segments : leur nombre, et combien sont petits.
@@ -45,6 +48,9 @@ struct Segments {
 
 /// En dessous, un segment est « petit » : c'est la taille d'un paquet de l'indexation.
 const SMALL: u32 = 2_000;
+
+/// Combien d'ouvertures de l'index par tour et par côté.
+const OPENS: usize = 20;
 
 /// Copie `index.sqlite` et l'index plein texte de `store` dans `dir`, et rend sa racine. Les
 /// blobs se lient ensuite, **avant** `Store::open` — voir `link_blobs`.
@@ -68,12 +74,36 @@ fn segments(store: &Store) -> Result<Segments> {
     })
 }
 
+/// Combien de fichiers porte le répertoire de l'index : chaque segment en a plusieurs, et chacun
+/// s'ouvre quand un `Searcher` se monte.
+fn files(root: &Utf8PathBuf) -> Result<usize> {
+    Ok(std::fs::read_dir(root.join("search").as_std_path())
+        .context("répertoire de l'index")?
+        .count())
+}
+
+/// Ce que `Mailbox::open` et `Mailbox::reload_search` font de l'index, et rien d'autre.
+fn open_searcher(store: &Store) -> Result<Duration> {
+    let at = Instant::now();
+    let (index, _) = mailcore::index::open_or_create(store).context("ouverture de l'index")?;
+    let searcher = mailcore::index::Searcher::open(&index).context("ouverture du chercheur")?;
+    let elapsed = at.elapsed();
+    drop(searcher);
+    Ok(elapsed)
+}
+
 /// Point d'entrée de `measure-merge`.
 ///
 /// # Errors
 ///
-/// Si le store est introuvable, si une réplique ne peut pas être faite, ou si une passe échoue.
-pub fn measure(store: &Utf8PathBuf, arrivals: usize, repeats: usize) -> Result<()> {
+/// Si le store est introuvable, si une réplique ne peut pas être faite, si une passe échoue, ou si
+/// le jeu de phrases est illisible.
+pub fn measure(
+    store: &Utf8PathBuf,
+    arrivals: usize,
+    repeats: usize,
+    phrases: Option<&Utf8PathBuf>,
+) -> Result<()> {
     release_only("measure-merge")?;
     // Tantivy dit ses fusions ratées par `log`, pas par une erreur rendue : sans abonné, une
     // fusion jetée ne laisse aucune trace. `RUST_LOG=tantivy=info` montre aussi celles qui
@@ -171,10 +201,18 @@ pub fn measure(store: &Utf8PathBuf, arrivals: usize, repeats: usize) -> Result<(
         merged.documents
     );
 
-    // --- 2. Les arrivées suivantes. ---
+    // --- 2. Les arrivées suivantes, chacune avec les segments qu'elle laisse : une arrivée lente
+    // qui en laisse moins que la précédente est celle qui a fusionné. ---
     let mut following = Vec::with_capacity(arrivals - 1);
+    let mut detail = Vec::with_capacity(arrivals - 1);
     for id in &ids[1..] {
-        following.push(arrive(*id)?);
+        let elapsed = arrive(*id)?;
+        following.push(elapsed);
+        detail.push(format!(
+            "{:.1} ms → {}",
+            ms(elapsed),
+            segments(&after)?.count
+        ));
     }
     let settled = segments(&after)?;
     println!(
@@ -184,85 +222,156 @@ pub fn measure(store: &Utf8PathBuf, arrivals: usize, repeats: usize) -> Result<(
         ms(percentile(&following, 1.0)),
         settled.count
     );
+    println!("  une à une       {}", detail.join(", "));
 
-    // --- 3. La recherche, avant et après, requêtes alternées. ---
+    // --- 3. L'ouverture de l'index, avant et après, en alternant. ---
+    let stores = [&before, &after];
+    let mut opens: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
+    for round in 0..repeats {
+        for turn in 0..OPENS {
+            let order = if (turn + round) % 2 == 0 {
+                [0, 1]
+            } else {
+                [1, 0]
+            };
+            for side in order {
+                let elapsed = open_searcher(stores[side])?;
+                if round > 0 {
+                    opens[side].push(elapsed);
+                }
+            }
+        }
+    }
+    println!(
+        "\nOuverture de l'index  {OPENS} × {repeats} tours, le premier jeté, l'ordre alterné \
+         — ce que paient un démarrage et chaque fin de passe d'index"
+    );
+    println!(
+        "                  avant ({} fichiers)   après ({})",
+        files(&before_root)?,
+        files(&after_root)?
+    );
+    for (label, q) in [("p50", 0.5), ("p95", 0.95), ("max", 1.0)] {
+        println!(
+            "  {label}             {:>8.2} ms          {:>8.2} ms",
+            ms(percentile(&opens[0], q)),
+            ms(percentile(&opens[1], q))
+        );
+    }
+
+    // --- 4. La recherche, avant et après, requêtes alternées : des mots, puis des phrases. ---
     let (before_index, _) = mailcore::index::open_or_create(&before).context("index d'avant")?;
     let (after_index, _) = mailcore::index::open_or_create(&after).context("index d'après")?;
     let searchers = [
         mailcore::index::Searcher::open(&before_index).context("chercheur d'avant")?,
         mailcore::index::Searcher::open(&after_index).context("chercheur d'après")?,
     ];
-    let stores = [&before, &after];
-    let queries = build_queries(&before)?;
-    println!(
-        "\nRecherche         {} requêtes × {repeats} tours, le premier jeté, l'ordre alterné",
-        queries.len()
-    );
-
-    // Le même nombre de résultats des deux côtés, compté **sans plafond** : la page du banc en
-    // rend cinquante, et une requête fréquente y serait égale des deux côtés quoi que la fusion
-    // ait perdu. Hors chronomètre.
-    let all = usize::try_from(found.documents)?.saturating_add(arrivals);
-    let mut differing = Vec::new();
-    let mut refused = 0usize;
-    for query in &queries {
-        let counts = searchers
-            .each_ref()
-            .map(|searcher| searcher.search(query, all).map(|hits| hits.len()).ok());
-        match counts {
-            [None, None] => refused += 1,
-            [before, after] if before != after => {
-                differing.push(format!("{query} : {before:?} avant, {after:?} après"));
-            }
-            _ => {}
-        }
+    let compared = Compared {
+        stores,
+        searchers: &searchers,
+        repeats,
+        all: usize::try_from(found.documents)?.saturating_add(arrivals),
+        segments: [found.count, settled.count],
+    };
+    compared.run("mots tirés des sujets", &build_queries(&before)?);
+    // Les mots seuls sont le cas le moins cher : un terme, une liste de postings. Ce qu'on tape
+    // dans la barre depuis que le sens y répond, ce sont des phrases — huit mots, dont « le » et
+    // « de », qui ont chacun une liste de dizaines de milliers de documents.
+    if let Some(phrases) = phrases {
+        compared.run("phrases du critère 1", &query_texts(phrases)?);
     }
+    Ok(())
+}
 
-    let mut latencies: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
-    for round in 0..repeats {
-        for (index, query) in queries.iter().enumerate() {
-            let order = if (index + round) % 2 == 0 {
-                [0, 1]
-            } else {
-                [1, 0]
-            };
-            for side in order {
-                let at = Instant::now();
-                // Une requête refusée l'est des deux côtés — comptée plus haut — et n'entre pas
-                // dans les latences, comme dans `measure-search`.
-                let answered = run_once(stores[side], &searchers[side], query).is_ok();
-                if answered && round > 0 {
-                    latencies[side].push(at.elapsed());
+/// Deux index ouverts côte à côte, et de quoi comparer une recherche sur l'un et sur l'autre.
+struct Compared<'a> {
+    stores: [&'a Store; 2],
+    searchers: &'a [mailcore::index::Searcher; 2],
+    repeats: usize,
+    /// Assez pour qu'aucune requête ne soit coupée.
+    all: usize,
+    segments: [usize; 2],
+}
+
+impl Compared<'_> {
+    fn run(&self, label: &str, queries: &[String]) {
+        let Self {
+            stores,
+            searchers,
+            repeats,
+            all,
+            segments,
+        } = self;
+        println!(
+            "\nRecherche, {label}  {} requêtes × {repeats} tours, le premier jeté, l'ordre alterné",
+            queries.len()
+        );
+
+        // Le même nombre de résultats des deux côtés, compté **sans plafond** : la page du banc en
+        // rend cinquante, et une requête fréquente y serait égale des deux côtés quoi que la
+        // fusion ait perdu. Hors chronomètre.
+        let mut differing = Vec::new();
+        let mut refused = 0usize;
+        for query in queries {
+            let counts = searchers
+                .each_ref()
+                .map(|searcher| searcher.search(query, *all).map(|hits| hits.len()).ok());
+            match counts {
+                [None, None] => refused += 1,
+                [before, after] if before != after => {
+                    differing.push(format!("{query} : {before:?} avant, {after:?} après"));
+                }
+                _ => {}
+            }
+        }
+
+        let mut latencies: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
+        for round in 0..*repeats {
+            for (index, query) in queries.iter().enumerate() {
+                let order = if (index + round) % 2 == 0 {
+                    [0, 1]
+                } else {
+                    [1, 0]
+                };
+                for side in order {
+                    let at = Instant::now();
+                    // Une requête refusée l'est des deux côtés — comptée plus haut — et n'entre
+                    // pas dans les latences, comme dans `measure-search`.
+                    let answered = run_once(stores[side], &searchers[side], query).is_ok();
+                    if answered && round > 0 {
+                        latencies[side].push(at.elapsed());
+                    }
                 }
             }
         }
-    }
-    println!(
-        "                  avant ({} segments)   après ({})",
-        found.count, settled.count
-    );
-    for (label, q) in [("p50", 0.5), ("p95", 0.95), ("max", 1.0)] {
         println!(
-            "  {label}             {:>8.2} ms          {:>8.2} ms",
-            ms(percentile(&latencies[0], q)),
-            ms(percentile(&latencies[1], q))
+            "                  avant ({} segments)   après ({})",
+            segments[0], segments[1]
         );
-    }
-    if refused > 0 {
-        println!("  {refused} requêtes refusées des deux côtés — leur syntaxe, pas l'index");
-    }
-    if differing.is_empty() {
-        println!("  mêmes nombres de résultats des deux côtés, sans plafond, pour chaque requête");
-    } else {
-        println!(
-            "  {} requêtes rendent un autre nombre de résultats :",
-            differing.len()
-        );
-        for line in &differing {
-            println!("    {line}");
+        for (label, q) in [("p50", 0.5), ("p95", 0.95), ("max", 1.0)] {
+            println!(
+                "  {label}             {:>8.2} ms          {:>8.2} ms",
+                ms(percentile(&latencies[0], q)),
+                ms(percentile(&latencies[1], q))
+            );
+        }
+        if refused > 0 {
+            println!("  {refused} requêtes refusées des deux côtés — leur syntaxe, pas l'index");
+        }
+        if differing.is_empty() {
+            println!(
+                "  mêmes nombres de résultats des deux côtés, sans plafond, pour chaque requête"
+            );
+        } else {
+            println!(
+                "  {} requêtes rendent un autre nombre de résultats :",
+                differing.len()
+            );
+            for line in &differing {
+                println!("    {line}");
+            }
         }
     }
-    Ok(())
 }
 
 fn ms(duration: Duration) -> f64 {

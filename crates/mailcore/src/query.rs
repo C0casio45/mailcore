@@ -1411,7 +1411,7 @@ mod tests {
         // Chaque passe qui apporte du courrier valide un segment, et une recherche les parcourt
         // tous. Treize passes, au moins treize segments — quatorze au contrôle négatif : c'est ce
         // que faisait un écrivain lâché sitôt validé, qui abandonne ses fusions — 149 segments
-        // dans le store du quotidien après une semaine, le 2026-10-18. La politique de tantivy
+        // dans le store du quotidien, le 2026-10-18. La politique de tantivy
         // fusionne huit segments de même taille ; il en reste donc moins de huit, sinon les
         // fusions n'aboutissent pas.
         let (_dir, mailbox) = mailbox();

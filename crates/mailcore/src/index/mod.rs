@@ -7,6 +7,7 @@
 //! Phase 4 : un index vectoriel à côté, un embedding par message.
 
 pub mod coverage;
+mod directory;
 pub mod schema;
 pub mod searcher;
 pub mod writer;

@@ -15,9 +15,10 @@ use crate::progress::Progress;
 
 use mail_parser::MessageParser;
 use tantivy::merge_policy::NoMergePolicy;
-use tantivy::{Index, IndexWriter, doc};
+use tantivy::{Index, IndexSettings, IndexWriter, doc};
 
 use crate::error::Result;
+use crate::index::directory::Patient;
 use crate::index::schema::{self, Fields};
 use crate::model::MessageId;
 use crate::store::Store;
@@ -143,10 +144,12 @@ pub fn update(store: &Store, progress: &Progress) -> Result<IndexStats> {
 /// résultat** : `Drop` marque l'écrivain mort, la fusion en cours va pourtant au bout — elle
 /// écrit son segment — puis tantivy la jette, faute de qui l'enregistre. La première version
 /// ouvrait un écrivain par paquet et le lâchait sitôt validé ; aucune fusion n'était donc jamais
-/// gardée, et chaque moisson qui apportait du courrier laissait un segment de plus, pour toujours.
-/// Trouvé le 2026-10-18 : **149 segments** dans le store du quotidien après une semaine d'usage,
-/// dont 141 de moins de 2 000 documents, et 115 dans le corpus de mesure — sur lequel les
-/// latences de la recherche ont toutes été relevées.
+/// gardée : chaque paquet validé laissait un segment de plus, pour toujours. Trouvé le
+/// 2026-10-18 : **149 segments** dans le store du quotidien, tous écrits par une seule
+/// réindexation, dont 141 de moins de 2 000 documents, et 115 dans le corpus de mesure — sur
+/// lequel les latences de la recherche ont toutes été relevées. Mesuré au repos, ils coûtaient
+/// peu à une requête et beaucoup à l'**ouverture** : 37 ms pour monter un `Searcher`, contre
+/// 1,3 après la fusion — `cargo xtask measure-merge`.
 ///
 /// L'écrivain vit donc le temps de la passe — les fusions avancent pendant qu'on indexe — et on
 /// attend la fin des siennes avant de le rendre, **annulation comprise** : une fusion qu'on
@@ -253,16 +256,26 @@ pub fn open_or_create(store: &Store) -> Result<(Index, Fields)> {
         source,
     })?;
 
-    match Index::open_in_dir(dir.as_std_path()) {
+    // Le répertoire mappé de tantivy, qui attend qu'un fichier tenu ailleurs se libère au lieu
+    // de faire échouer le `commit` : voir `directory`.
+    let directory = Patient::open(dir.as_std_path()).map_err(tantivy::TantivyError::from)?;
+    match Index::open(directory.clone()) {
         Ok(index) => {
             let fields = schema::resolve(&index.schema())?;
             Ok((index, fields))
         }
-        Err(_) => {
+        Err(error) => {
             // Index absent ou illisible : on le recrée. Il est reconstructible depuis les
-            // blobs, donc l'écraser ne perd rien — au pire quelques minutes de calcul.
+            // blobs, donc l'écraser ne perd rien — au pire quelques minutes de calcul. Mais
+            // **jamais par-dessus un `meta.json` présent** : `Index::create` effacerait un index
+            // qu'on n'a simplement pas pu ouvrir cette fois-ci. C'est le refus que faisait
+            // `Index::create_in_dir` ; l'erreur rendue est maintenant celle de l'ouverture, qui
+            // dit pourquoi.
+            if Index::exists(&directory).map_err(tantivy::TantivyError::from)? {
+                return Err(error.into());
+            }
             let (schema, fields) = schema::build();
-            let index = Index::create_in_dir(dir.as_std_path(), schema)?;
+            let index = Index::create(directory, schema, IndexSettings::default())?;
             Ok((index, fields))
         }
     }

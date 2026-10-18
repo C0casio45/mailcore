@@ -198,6 +198,23 @@ struct Query {
     text: String,
 }
 
+/// Les textes d'un jeu de requêtes du critère 1, dans l'ordre du fichier — les cibles ne sont pas
+/// lues : qui chronomètre n'a pas à les connaître.
+///
+/// # Errors
+///
+/// Si le fichier est illisible, mal formé, ou ne contient aucune requête.
+pub(crate) fn query_texts(queries: &Utf8PathBuf) -> Result<Vec<String>> {
+    let raw = std::fs::read_to_string(queries)
+        .with_context(|| format!("lecture du jeu de requêtes {queries}"))?;
+    let ground: Ground = toml::from_str(&raw).with_context(|| format!("analyse de {queries}"))?;
+    anyhow::ensure!(
+        !ground.query.is_empty(),
+        "{queries} ne contient aucune requête"
+    );
+    Ok(ground.query.into_iter().map(|query| query.text).collect())
+}
+
 /// Chronomètre `search.query` de bout en bout : la requête écrite, servie, et la réponse relue.
 async fn timed(
     api: &maild::api::jsonrpc::Api,
@@ -235,13 +252,7 @@ pub fn measure_search(sources: &Sources, queries: &Utf8PathBuf, rounds: usize) -
         rounds >= 2,
         "au moins deux tours : le premier est jeté, toujours"
     );
-    let raw = std::fs::read_to_string(queries)
-        .with_context(|| format!("lecture du jeu de requêtes {queries}"))?;
-    let ground: Ground = toml::from_str(&raw).with_context(|| format!("analyse de {queries}"))?;
-    anyhow::ensure!(
-        !ground.query.is_empty(),
-        "{queries} ne contient aucune requête"
-    );
+    let texts = query_texts(queries)?;
 
     let program = program(sources)?;
     let replica = Replica::build(sources, "target/measure-semantic-search", true)?;
@@ -275,12 +286,12 @@ pub fn measure_search(sources: &Sources, queries: &Utf8PathBuf, rounds: usize) -
     println!("Vecteurs          {}", sources.vectors);
     println!(
         "Requêtes          {} × {rounds} tours, le premier jeté\n",
-        ground.query.len()
+        texts.len()
     );
 
     // **À froid** : la première recherche lance l'enfant **à côté** et répond par les mots seuls ;
     // ce qui se mesure est ce qu'elle a coûté, puis le temps que l'enfant met à être prêt.
-    let (cold, first) = runtime.block_on(timed(&hybrid, &ground.query[0].text))?;
+    let (cold, first) = runtime.block_on(timed(&hybrid, &texts[0]))?;
     let state = first.semantic.map(|it| it.state);
     anyhow::ensure!(
         state == Some(mailapi::dto::SemanticState::Starting),
@@ -302,22 +313,21 @@ pub fn measure_search(sources: &Sources, queries: &Utf8PathBuf, rounds: usize) -
     let mut words_rounds: Vec<Vec<Duration>> = Vec::with_capacity(rounds);
     let mut by_meaning = 0usize;
     for _ in 0..rounds {
-        let mut h = Vec::with_capacity(ground.query.len());
-        let mut w = Vec::with_capacity(ground.query.len());
-        for (index, query) in ground.query.iter().enumerate() {
+        let mut h = Vec::with_capacity(texts.len());
+        let mut w = Vec::with_capacity(texts.len());
+        for (index, query) in texts.iter().enumerate() {
             // L'ordre des deux bras alterne : le second trouve l'index plein texte chaud, et
             // toujours le même second ferait paraître un bras plus rapide qu'il n'est.
             if index % 2 == 1 {
-                w.push(runtime.block_on(timed(&words, &query.text))?.0);
+                w.push(runtime.block_on(timed(&words, query))?.0);
             }
-            let (elapsed, results) = runtime.block_on(timed(&hybrid, &query.text))?;
+            let (elapsed, results) = runtime.block_on(timed(&hybrid, query))?;
             // **Chaque** réponse doit venir du sens : un enfant mort en cours de relevé ferait
             // entrer des réponses des mots seuls dans le p95, et le chiffre serait flatteur.
             let state = results.semantic.as_ref().map(|it| it.state);
             anyhow::ensure!(
                 state == Some(mailapi::dto::SemanticState::Ready),
-                "« {} » n'a pas été servie par le sens : {state:?}",
-                query.text
+                "« {query} » n'a pas été servie par le sens : {state:?}"
             );
             h.push(elapsed);
             by_meaning += results
@@ -326,7 +336,7 @@ pub fn measure_search(sources: &Sources, queries: &Utf8PathBuf, rounds: usize) -
                 .filter(|row| row.found_by == Some(mailapi::dto::FoundBy::Meaning))
                 .count();
             if index % 2 == 0 {
-                w.push(runtime.block_on(timed(&words, &query.text))?.0);
+                w.push(runtime.block_on(timed(&words, query))?.0);
             }
         }
         hybrid_rounds.push(h);
@@ -346,7 +356,7 @@ pub fn measure_search(sources: &Sources, queries: &Utf8PathBuf, rounds: usize) -
     }
     println!(
         "Trouvés par le sens seul  {by_meaning} lignes sur {} réponses — le sens a bien répondu",
-        rounds * ground.query.len()
+        rounds * texts.len()
     );
 
     // **La dispersion avant la médiane** : un tour qui s'écarte des autres n'est pas du bruit.

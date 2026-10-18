@@ -134,6 +134,10 @@ enum Command {
         /// Tours du jeu de requêtes ; le premier est jeté.
         #[arg(long, default_value_t = 4)]
         repeats: usize,
+        /// Un jeu de requêtes du critère 1 de la phase 4, dont seuls les textes sont lus : des
+        /// phrases, à comparer aux mots seuls. Absent, le banc ne compare que les mots.
+        #[arg(long)]
+        phrases: Option<Utf8PathBuf>,
     },
 
     /// Mesure la latence de recherche et rend le p95 (critère 4).
@@ -910,7 +914,8 @@ fn main() -> Result<()> {
             store,
             arrivals,
             repeats,
-        } => merge::measure(&store, arrivals, repeats),
+            phrases,
+        } => merge::measure(&store, arrivals, repeats, phrases.as_ref()),
         Command::MeasureSemanticSearch {
             store,
             vectors,
