@@ -386,7 +386,10 @@ enum Command {
     /// constante. Voir `mailvec::trim`.
     ModelTrimBert {
         /// Le modèle d'origine : `config.json`, `tokenizer.json`, `model.safetensors`.
-        #[arg(long, default_value = "measurements/models/multilingual-e5-small")]
+        #[arg(
+            long,
+            default_value = "measurements/models/granite-embedding-107m-multilingual"
+        )]
         model: Utf8PathBuf,
         /// Où écrire le modèle taillé. Refusé s'il y a déjà un modèle.
         #[arg(long)]
@@ -400,7 +403,10 @@ enum Command {
         #[arg(long, default_value = "measurements/store")]
         store: Utf8PathBuf,
         /// Le modèle d'origine.
-        #[arg(long, default_value = "measurements/models/multilingual-e5-small")]
+        #[arg(
+            long,
+            default_value = "measurements/models/granite-embedding-107m-multilingual"
+        )]
         model: Utf8PathBuf,
         /// Le modèle taillé.
         #[arg(long)]
@@ -518,13 +524,10 @@ enum Command {
         #[arg(long, default_value = "measurements/store")]
         store: Utf8PathBuf,
         /// Le magasin de vecteurs à servir, tel que `measure-vectors --keep` l'a gardé.
-        #[arg(long, default_value = "measurements/vectors-e5-latin.bin")]
+        #[arg(long, default_value = "measurements/vectors-granite-latin.bin")]
         vectors: Utf8PathBuf,
         /// Le modèle qui l'a écrit.
-        #[arg(
-            long,
-            default_value = "measurements/models/multilingual-e5-small-latin"
-        )]
+        #[arg(long, default_value = "measurements/models/granite-latin")]
         model: Utf8PathBuf,
         /// Le jeu de requêtes du critère 1 : seuls les textes sont lus.
         #[arg(long, default_value = "measurements/phase4-queries.toml")]
@@ -545,13 +548,10 @@ enum Command {
         #[arg(long, default_value = "measurements/store")]
         store: Utf8PathBuf,
         /// Le magasin de vecteurs, tel que `measure-vectors --keep` l'a gardé.
-        #[arg(long, default_value = "measurements/vectors-e5-latin.bin")]
+        #[arg(long, default_value = "measurements/vectors-granite-latin.bin")]
         vectors: Utf8PathBuf,
         /// Le modèle qui l'a écrit.
-        #[arg(
-            long,
-            default_value = "measurements/models/multilingual-e5-small-latin"
-        )]
+        #[arg(long, default_value = "measurements/models/granite-latin")]
         model: Utf8PathBuf,
         /// Exécutions par configuration ; la première est le démarrage à froid.
         #[arg(long, default_value_t = 5)]
@@ -565,13 +565,10 @@ enum Command {
         #[arg(long, default_value = "measurements/store")]
         store: Utf8PathBuf,
         /// Le magasin de vecteurs du corpus, tel que `measure-vectors --keep` l'a gardé.
-        #[arg(long, default_value = "measurements/vectors-e5-latin.bin")]
+        #[arg(long, default_value = "measurements/vectors-granite-latin.bin")]
         vectors: Utf8PathBuf,
         /// Le modèle qui l'a écrit.
-        #[arg(
-            long,
-            default_value = "measurements/models/multilingual-e5-small-latin"
-        )]
+        #[arg(long, default_value = "measurements/models/granite-latin")]
         model: Utf8PathBuf,
         /// L'exécutable `maild` à relancer. Par défaut, celui de `target/release`.
         #[arg(long)]
