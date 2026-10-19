@@ -491,14 +491,20 @@ async fn a_backlog_is_not_handed_to_the_warm_child_and_waits_for_it_to_go() {
     let pending = store.unvectorised_total().unwrap();
     assert!(pending > 64, "{pending} : pas un arriéré");
     vectoriser.nudge();
-    std::thread::sleep(Duration::from_secs(2));
+    // L'état le dit, hors de toute recherche — c'est ce que `semantic.status` relaie —, et il ne
+    // prétend pas tourner : l'arriéré attend.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while vectoriser.status() != (maild::vectors::Status::Deferred { pending }) {
+        assert!(
+            Instant::now() < deadline,
+            "l'arriéré n'a jamais été dit en attente : état {:?}",
+            vectoriser.status()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(vectoriser.delegated(), 0, "l'arriéré a été confié");
+    assert_eq!(vectoriser.launched(), 0, "un second modèle a été lancé");
     assert_eq!(store.unvectorised_total().unwrap(), pending);
-    // L'état le dit, hors de toute recherche : c'est ce que `semantic.status` relaie.
-    assert_eq!(
-        vectoriser.status(),
-        maild::vectors::Status::Working { pending }
-    );
 
     // L'enfant de la recherche s'éteint : sa mort réveille la passe, qui rattrape tout.
     drop(api);

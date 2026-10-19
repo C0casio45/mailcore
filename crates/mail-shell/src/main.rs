@@ -194,12 +194,28 @@ fn main() -> Result<()> {
     // toute fenêtre. Voir `maild::vectors`.
     let launch = maild::vectors::Launch::dispatch();
 
+    // Les arguments avant le journal : `--help`, `--purge-cache` et les bancs n'ouvrent pas de
+    // fichier. Chacun en aurait laissé un, et poussé dehors par le nettoyage un journal de vrai
+    // lancement — un banc en lance des dizaines.
+    let parsed = Cli::try_parse();
+    let bench = Bench::from_env();
+    let to_file = bench == Bench::None
+        && match &parsed {
+            Ok(cli) => !cli.purge_cache,
+            // Un refus va au journal, l'aide non.
+            Err(refused) => refused.use_stderr(),
+        };
+
     // Deux sorties. La sortie d'erreur suit `RUST_LOG` : c'est l'outil de qui développe, et le
     // canal que lisent les bancs. Le fichier, lui, ne descend jamais sous `info` — voir
     // `journal`, qui dit aussi pourquoi il existe.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(journal::FILTER));
-    let journal = journal::directory().and_then(|dir| journal::Journal::open(&dir).ok());
+    let journal = to_file.then(journal::directory).flatten().and_then(|dir| {
+        journal::Journal::open(&dir)
+            .ok()
+            .map(|(journal, _)| (journal, dir))
+    });
     let file_layer = journal.as_ref().map(|(journal, _)| {
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
@@ -215,13 +231,17 @@ fn main() -> Result<()> {
         .with(file_layer)
         .init();
     maild::panics::install();
-    let journal = journal.map(|(_, path)| path);
+    // Le répertoire, pas le fichier : le fichier change à chaque mégaoctet, et la page de
+    // paramètres montrerait un chemin effacé.
+    let journal = journal.map(|(_, dir)| dir);
 
     // Un refus d'arguments part aussi au journal : sans console, c'est le seul endroit où il se
-    // lit. `--help` et `--version` ne sont pas des refus, et ne s'y écrivent pas.
-    let cli = Cli::try_parse().unwrap_or_else(|refused| {
+    // lit. **Son genre, pas son texte** : clap cite la valeur refusée, et ce qu'on donne à un
+    // exécutable — un fichier glissé dessus, un lien `mailto:` le jour où il en recevra — peut
+    // porter un nom de fichier ou une adresse.
+    let cli = parsed.unwrap_or_else(|refused| {
         if refused.use_stderr() {
-            tracing::error!("arguments refusés : {refused}");
+            tracing::error!(genre = ?refused.kind(), "arguments refusés");
         }
         refused.exit()
     });
@@ -237,8 +257,6 @@ fn main() -> Result<()> {
         tracing::info!(fichier = %path, "cache de lecture effacé");
         return Ok(());
     }
-
-    let bench = Bench::from_env();
 
     // **Le cache de lecture, avant la fenêtre.** En mode distant, c'est ce qui permet au
     // premier écran d'exister sans attendre le réseau — la note du critère 1. C'est une lecture

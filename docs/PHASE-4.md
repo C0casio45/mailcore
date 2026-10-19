@@ -3885,3 +3885,37 @@ compte les enfants lancés.
 **Ce que ce soir ne mesure pas.** Le passage de mille messages n'a pas été chronométré sur le store
 du quotidien : il était à jour au 2026-10-13, et rien ne se mesure sur une machine qui vient de
 compiler. La prochaine moisson le fera tourner pour de vrai ; le journal dira combien.
+
+**La relecture du soir, et ce qu'elle a corrigé.** Une relecture indépendante des deux commits a
+trouvé quatre défauts et trois risques réels :
+
+- **l'échec de la passe de fond n'arrivait pas au fichier** : l'enfant était relayé en `debug`,
+  et le parent ne disait rien de son échec. « Le modèle installé ne se charge pas ; le journal
+  du démon dit pourquoi » renvoyait à un journal muet — la panne même qui avait motivé le
+  journal. Relayé en `info`, et le parent écrit le code de l'échec ;
+- **le nettoyage effaçait le fichier d'une coquille restée ouverte**, puis chacun de ses
+  fichiers suivants, nommés d'après le lancement et donc toujours « les plus vieux ». Chaque
+  fichier porte maintenant l'heure de sa création, et un fichier effacé sous une coquille qui
+  écrit est remplacé à la ligne suivante ; `--help`, `--purge-cache` et les bancs n'ouvrent plus
+  de fichier ;
+- **un job écrivait `Paused` par-dessus un refus durable**, et la nouvelle phrase en faisait « la
+  passe s'en charge dès que le démon est libre » — sur un modèle qui ne se charge pas — avec une
+  coquille qui relevait l'état toutes les 500 ms pour toujours. Le refus et le recul passent
+  maintenant avant le job ;
+- **un démon plus ancien** laissait la coquille relever un état « en cours » toute la session ;
+- **`semantic.status` attendait le verrou de l'enfant de la recherche**, tenu pendant tout un lot
+  ou toute une requête, sur le fil sériel de la coquille : il ne l'attend plus ;
+- **un arriéré qui attend l'extinction de l'enfant de la recherche se disait « rattrapé »** alors
+  que rien ne tournait. Il a son état, `Deferred`, et sa phrase dit quand il sera fait ;
+- **un passage de messages illisibles ne comptait pas comme un progrès**, et le reste attendait
+  dix minutes sous un état « rien à faire ».
+
+Et deux promesses ramenées à ce qui est tenu : un refus d'arguments n'est plus noté que par son
+genre — la valeur refusée pouvait être un nom de fichier —, et la page de paramètres ne dit plus
+que le journal ne contient « aucune adresse » : une réponse de serveur citée telle quelle peut
+nommer un identifiant. Elle demande de le relire avant de le joindre.
+
+Un choix assumé, signalé par la même relecture : au-delà de 64 messages, un arriéré arrivé pendant
+qu'on cherche attend cinq minutes après la dernière recherche, là où il était confié en quelques
+secondes. C'est le prix de ne pas tourner en priorité normale à côté des recherches ; quelqu'un
+qui chercherait sans arrêt pendant des heures repousserait d'autant le rattrapage.

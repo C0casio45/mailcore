@@ -165,6 +165,12 @@ pub enum Status {
         /// Combien attendaient au lancement.
         pending: u64,
     },
+    /// Un arriéré attend que l'enfant de la recherche s'éteigne — cinq minutes après la dernière
+    /// recherche — pour être fait en priorité minimale plutôt qu'à côté des recherches.
+    Deferred {
+        /// Combien de messages attendent.
+        pending: u64,
+    },
     /// Une autre passe — `mail vectors` — tient le magasin.
     Busy,
     /// La passe de fond refuse ; une passe explicite est nécessaire.
@@ -295,9 +301,11 @@ impl Outcome {
 pub(crate) fn outcome_of(followed: mailvec::Result<mailvec::pass::Followed>) -> Outcome {
     use mailvec::pass::Followed;
     match followed {
+        // Un blob absent est marqué comme un illisible : pour le parent, les deux sont du
+        // progrès sans vecteur, et un passage qui n'a fait que ça a quand même avancé.
         Ok(Followed::Done(stats)) => Outcome::Done {
             vectorised: stats.vectorised,
-            unreadable: stats.unreadable,
+            unreadable: stats.unreadable + stats.missing_blobs,
         },
         Ok(Followed::Explicit { reason, pending }) => Outcome::Explicit { reason, pending },
         Ok(Followed::Busy) => Outcome::Busy,
@@ -681,15 +689,21 @@ fn round(
     //
     // Un **job**, pas l'enfant de la recherche : lui a déjà le modèle, et c'est à lui que la passe
     // est confiée plus bas.
-    if activity.jobs() > 0 {
-        shared.set(Status::Paused);
+    //
+    // **Le refus durable et le recul passent avant le job**, depuis le 2026-10-19 : dans l'ordre
+    // inverse, un job écrivait `Paused` par-dessus l'état qui disait pourquoi la passe ne tourne
+    // pas, et il y restait jusqu'à ce que l'empreinte change. Un modèle qui ne se charge pas
+    // devenait « la passe s'en charge dès que le démon est libre » — une promesse fausse, et une
+    // coquille qui relevait l'état toutes les 500 ms pour toujours.
+    let fingerprint = Fingerprint::of(root);
+    if refused.as_ref() == Some(&fingerprint) {
         return false;
     }
     if retry_at.is_some_and(|at| Instant::now() < at) {
         return false;
     }
-    let fingerprint = Fingerprint::of(root);
-    if refused.as_ref() == Some(&fingerprint) {
+    if activity.jobs() > 0 {
+        shared.set(Status::Paused);
         return false;
     }
     *refused = None;
@@ -731,16 +745,17 @@ fn round(
         }
     };
 
+    // **Un arriéré attend la mort de l'enfant de la recherche**, pour ne pas tourner en priorité
+    // normale pendant qu'on cherche — voir `DELEGATED_AT_MOST`. Et l'état le dit tel quel : rien
+    // ne tourne, et `Working` aurait annoncé un rattrapage en cours.
+    if activity.held() > 0 && pending > DELEGATED_AT_MOST {
+        shared.set(Status::Deferred { pending });
+        return false;
+    }
     shared.set(Status::Working { pending });
     // **L'enfant de la recherche vit : c'est lui qui fait la passe**, un lot à la fois. Jamais un
     // second enfant à côté — deux copies du modèle. S'il ne peut pas — il démarre encore, ou il n'a
     // pas répondu —, on attend : sa mise en route ou sa mort réveillent ce fil.
-    //
-    // Sauf un arriéré : il attend la mort de l'enfant de la recherche, pour ne pas tourner en
-    // priorité normale pendant qu'on cherche — voir `DELEGATED_AT_MOST`.
-    if activity.held() > 0 && pending > DELEGATED_AT_MOST {
-        return false;
-    }
     if activity.held() > 0 {
         let engine = shared
             .delegate
@@ -787,13 +802,24 @@ fn settle(
             *backoff = BACKOFF_MIN;
             *retry_at = None;
             if unreadable > 0 {
-                tracing::warn!(unreadable, "messages illisibles marqués sans vecteur");
+                tracing::warn!(
+                    unreadable,
+                    "messages illisibles ou absents marqués sans vecteur"
+                );
             }
             tracing::info!(vectorised, "passe de fond des vecteurs");
-            shared.set(Status::Idle);
             // Repasser tout de suite si elle a avancé : ce qui est arrivé pendant reste à faire.
             // Jamais après un passage sans progrès — c'est la boucle qui ne finit jamais.
-            vectorised > 0
+            // **Avancé veut dire marqué**, vecteur ou non : un passage de messages illisibles
+            // a réduit l'attente autant qu'un autre, et s'arrêter là laissait le reste dix
+            // minutes sous un état « rien à faire ».
+            let advanced = vectorised + unreadable > 0;
+            // Et l'état reste `Working` entre deux passages : `Idle` le temps d'un relevé
+            // suffisait à arrêter celui de la coquille.
+            if !advanced {
+                shared.set(Status::Idle);
+            }
+            advanced
         }
         Outcome::Nothing => {
             shared.set(Status::Idle);
@@ -815,6 +841,9 @@ fn settle(
         Outcome::Failed(Failure::Model) => {
             // Un modèle qui ne se charge pas ne se chargera pas mieux dans trente secondes :
             // attendre qu'un de ses fichiers change.
+            tracing::warn!(
+                "modèle illisible : la passe de fond attend qu'un de ses fichiers change"
+            );
             shared.set(Status::Failed(Failure::Model));
             *refused = Some(fingerprint);
             false
@@ -828,6 +857,13 @@ fn settle(
 
 /// Un échec passager : le dire, et reculer.
 fn fail(shared: &Shared, failure: Failure, backoff: &mut Duration, retry_at: &mut Option<Instant>) {
+    // Le code, dans le journal du parent : l'enfant a dit pourquoi, mais il peut être mort
+    // avant d'avoir écrit quoi que ce soit — un lancement refusé, une ligne illisible.
+    tracing::warn!(
+        echec = failure.code(),
+        attente = backoff.as_secs(),
+        "passe de fond en échec"
+    );
     shared.set(Status::Failed(failure));
     *retry_at = Some(Instant::now() + *backoff);
     *backoff = (*backoff * 2).min(BACKOFF_MAX);
@@ -861,13 +897,16 @@ fn spawn_and_wait(
     };
     shared.launched.fetch_add(1, Ordering::SeqCst);
 
-    // Le journal de l'enfant, recopié dans celui du démon, ligne par ligne.
+    // Le journal de l'enfant, recopié dans celui du démon, ligne par ligne — **en `info`**,
+    // depuis le 2026-10-19. En `debug`, le fichier de la coquille ne le gardait pas, et un modèle
+    // qui ne se charge pas faisait dire à l'écran « le journal du démon dit pourquoi » sur un
+    // journal muet. L'enfant plafonne lui-même à `info` : voir `semantic::child::journal`.
     if let Some(stderr) = child.stderr.take() {
         let _ = std::thread::Builder::new()
             .name("mailcore-vecteurs-journal".to_owned())
             .spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    tracing::debug!(enfant = %line, "passe de fond");
+                    tracing::info!(enfant = %line, "passe de fond");
                 }
             });
     }
@@ -959,6 +998,65 @@ fn command(program: &std::path::Path, root: &Utf8Path) -> Command {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{Explicit, Failure, Fingerprint, Outcome};
+
+    fn shared() -> super::Shared {
+        super::Shared {
+            stop: std::sync::atomic::AtomicBool::new(false),
+            wake: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            status: std::sync::Mutex::new(super::Status::Waiting),
+            child: std::sync::Mutex::new(None),
+            delegate: std::sync::Mutex::new(None),
+            delegated: std::sync::atomic::AtomicU64::new(0),
+            launched: std::sync::atomic::AtomicU64::new(0),
+            round: mailvec::pass::ROUND,
+        }
+    }
+
+    #[test]
+    fn a_job_does_not_write_paused_over_a_lasting_refusal() {
+        // Dans l'ordre d'avant le 2026-10-19, un job écrivait `Paused` par-dessus un modèle qui ne
+        // se charge pas, et l'écran promettait que la passe s'en chargerait.
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let shared = shared();
+        let activity = crate::jobs::Activity::default();
+        activity.begin();
+        let program = std::path::Path::new("aucun-programme");
+        let mut backoff = super::BACKOFF_MIN;
+
+        shared.set(super::Status::Failed(Failure::Model));
+        let mut refused = Some(Fingerprint::of(&root));
+        let again = super::round(
+            &root,
+            program,
+            &activity,
+            &shared,
+            &mut None,
+            &mut backoff,
+            &mut None,
+            &mut refused,
+        );
+        assert!(!again);
+        assert_eq!(
+            *shared.status.lock().unwrap(),
+            super::Status::Failed(Failure::Model)
+        );
+
+        // Le contrôle inverse : sans refus, le même job met bien la passe en pause.
+        let again = super::round(
+            &root,
+            program,
+            &activity,
+            &shared,
+            &mut None,
+            &mut backoff,
+            &mut None,
+            &mut None,
+        );
+        assert!(!again);
+        assert_eq!(*shared.status.lock().unwrap(), super::Status::Paused);
+        activity.end();
+    }
 
     #[test]
     fn a_settings_file_lifts_a_refusal() {

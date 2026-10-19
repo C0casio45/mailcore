@@ -317,8 +317,17 @@ tantivy écrit en `info` à chaque validation (`tantivy=warn`).
 
 Ce qui y reste, **écrit pour ne pas le croire absent** : les **noms des serveurs** de courrier,
 et les **réponses des serveurs** citées telles quelles — un refus de `SELECT` peut nommer le
-dossier. Ce sont les deux indications sans lesquelles une panne de serveur ne se diagnostique
-pas ; la page de paramètres le dit à côté du chemin du journal.
+dossier, un refus d'authentification l'identifiant. Ce sont les deux indications sans lesquelles
+une panne de serveur ne se diagnostique pas ; la page de paramètres le dit à côté du chemin du
+journal, et demande de le relire avant de le joindre. Et la barrière du répertoire personnel ne
+voit pas son nom court 8.3 (`C:\Users\CAMILL~1`), qu'aucun appelant connu n'écrit.
+
+Ce que la relecture du même soir a corrigé dans la première version : un refus d'arguments
+recopiait la valeur refusée — un fichier glissé sur l'exécutable donnait son nom — et n'est plus
+noté que par son genre ; et le nettoyage des vieux fichiers, qui jugeait l'âge à la date du
+**lancement**, effaçait le fichier en cours d'une coquille restée ouverte, puis chacun de ses
+fichiers suivants. Chaque fichier est maintenant daté de sa création, et un fichier effacé sous
+une coquille qui écrit est remplacé à la ligne suivante.
 
 ## Test de non-régression obligatoire
 

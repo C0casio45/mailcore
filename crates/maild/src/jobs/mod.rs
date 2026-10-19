@@ -327,11 +327,11 @@ impl Activity {
         Held(self.clone())
     }
 
-    fn begin(&self) {
+    pub(crate) fn begin(&self) {
         self.inner.active.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn end(&self) {
+    pub(crate) fn end(&self) {
         // Jamais sous zéro : un décompte de trop serait un défaut, pas une raison de paniquer.
         let _ = self
             .inner

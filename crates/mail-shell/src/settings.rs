@@ -237,7 +237,7 @@ pub struct Page {
     pub failed: bool,
     /// Vrai quand le service est distant : la page ne peut alors rien écrire.
     pub remote: bool,
-    /// Le fichier du journal de ce lancement, quand il a pu s'ouvrir — `crate::journal`.
+    /// Le répertoire du journal, quand ce lancement a pu y ouvrir son fichier — `crate::journal`.
     ///
     /// Sur cette page parce que c'est là qu'on vient quand quelque chose ne marche pas : un
     /// journal dont personne ne sait où il est ne sert pas plus qu'aucun journal.
@@ -305,12 +305,15 @@ impl Page {
             );
             return;
         };
+        // Ce que le journal contient, sans promettre plus que ce qui est tenu : une réponse de
+        // serveur citée telle quelle peut nommer un identifiant ou un dossier.
         ui.label(
-            "Ce lancement écrit son journal dans le fichier ci-dessous ; les trois précédents \
-             sont à côté. Il est fait pour être joint à un rapport : il ne recopie ni le contenu \
-             des messages ni les adresses, et le répertoire personnel y est remplacé par « ~ ». \
-             Il nomme en revanche les serveurs de courrier, et cite leurs réponses telles \
-             quelles.",
+            "Le journal est dans le dossier ci-dessous, un fichier par lancement ; le plus \
+             récent est celui de ce lancement. Il est fait pour être joint à un rapport : il ne \
+             recopie pas le contenu des messages, et le répertoire personnel y est remplacé par \
+             « ~ ». Il nomme en revanche les serveurs de courrier et cite leurs réponses telles \
+             quelles — un refus peut y nommer un identifiant ou un dossier. Relisez-le avant de \
+             le joindre.",
         );
         // Les phrases d'échec du service disent « voir le journal du démon » : il faut savoir
         // lequel c'est.
@@ -916,11 +919,11 @@ mod tests {
             },
             // Le journal ouvert, en embarqué et en distant : deux phrases différentes.
             Page {
-                journal: Some("~/journal/mail-shell-2026-10-19_20-00-00_1_001.log".into()),
+                journal: Some("~/AppData/Local/mailcore/journal".into()),
                 ..Page::default()
             },
             Page {
-                journal: Some("~/journal/mail-shell-2026-10-19_20-00-00_1_001.log".into()),
+                journal: Some("~/AppData/Local/mailcore/journal".into()),
                 remote: true,
                 ..Page::default()
             },

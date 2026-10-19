@@ -250,7 +250,7 @@ pub struct Shell {
     /// Le store et l.outil de cette machine, en mode embarqué : ce qui rend exécutable un geste
     /// proposé par le service. Voir [`crate::gesture`].
     local: Option<crate::gesture::Local>,
-    /// Le fichier où ce lancement écrit son journal, quand il a pu l'ouvrir. Voir
+    /// Le répertoire du journal, quand ce lancement a pu y ouvrir son fichier. Voir
     /// [`crate::journal`].
     journal: Option<camino::Utf8PathBuf>,
     /// Dernière écriture du cache. Sert à ne pas réécrire à chaque page.
@@ -459,7 +459,7 @@ pub struct Setup {
     pub seed: Option<crate::cache::Snapshot>,
     /// Le store de cette machine, en mode embarqué — voir [`crate::gesture`].
     pub local: Option<crate::gesture::Local>,
-    /// Le fichier du journal de ce lancement — voir [`crate::journal`].
+    /// Le répertoire du journal de ce lancement — voir [`crate::journal`].
     pub journal: Option<camino::Utf8PathBuf>,
 }
 
@@ -1247,9 +1247,13 @@ impl Shell {
     /// Vrai pendant que la passe de fond rattrape du courrier : la relève continue jusqu'à ce
     /// qu'elle ait fini, sans quoi le compte affiché resterait celui du démarrage.
     fn catching_up(&self) -> bool {
-        self.background
-            .as_ref()
-            .is_some_and(|said| said.state == dto::SemanticState::Working)
+        // Un démon qui ne sait pas répondre ne dira jamais que c'est fini : l'état de `hello`
+        // resterait « en cours » toute la session, relevé toutes les 500 ms.
+        !self.background_unsupported
+            && self
+                .background
+                .as_ref()
+                .is_some_and(|said| said.state == dto::SemanticState::Working)
     }
 }
 

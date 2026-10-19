@@ -281,6 +281,12 @@ pub fn describe(facts: &Facts) -> mailapi::dto::Semantic {
             messages(pending),
             if pending > 1 { "s" } else { "" }
         )),
+        // Rien ne tourne : la phrase dit quand ça tournera, pas que ça tourne.
+        Some(Status::Deferred { pending }) => Some(format!(
+            "{} sans vecteur : la passe de fond s'en chargera cinq minutes après la dernière \
+             recherche, quand la recherche par le sens aura rendu sa mémoire.",
+            messages(pending)
+        )),
         Some(Status::Busy) => Some(
             "Une passe de vectorisation est en cours : le courrier le plus récent n'est pas encore \
              cherchable par le sens."
@@ -290,6 +296,9 @@ pub fn describe(facts: &Facts) -> mailapi::dto::Semantic {
     };
     if facts.failure == Some(Unavailable::Empty) || !facts.vectors_present {
         return match (working, facts.status) {
+            (Some(sentence), Some(Status::Deferred { .. })) => {
+                said(State::Working, format!("{sentence} {WORDS_ONLY}"), None)
+            }
             (Some(_), _) => said(
                 State::Working,
                 format!("Le courrier est en cours de vectorisation. {WORDS_ONLY}"),
@@ -414,12 +423,15 @@ pub(crate) mod child {
     /// de quel niveau elle était, et la coquille l'écrit sur disque : un enfant lancé en `debug`
     /// mettrait dans le fichier ce que le filtre du parent en tient dehors. Sans couleurs, pour
     /// la même raison — une séquence d'échappement n'a rien à faire dans un fichier. Et une
-    /// panique n'y laisse que son emplacement (`crate::panics`).
+    /// panique n'y laisse que son emplacement (`crate::panics`). Les mêmes bruits retirés que
+    /// chez le parent : `html5ever` avertit à chaque tableau mal formé, `tantivy` écrit des chemins.
     pub(crate) fn journal() {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_ansi(false)
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "info,html5ever=error,tantivy=warn",
+            ))
             .try_init();
         crate::panics::install();
     }
@@ -727,10 +739,16 @@ impl Engine {
     }
 
     /// Ce qu'on sait sans rien demander : l'enfant démarre, ou un refus encore valable.
-    /// Pour `server.hello`, qui décrit l'état sans chercher.
+    /// Pour `server.hello` et `semantic.status`, qui décrivent l'état sans chercher.
+    ///
+    /// **N'attend jamais le verrou.** Il est tenu pendant toute une requête et tout un lot de la
+    /// passe de fond, et `semantic.status` est relevé toutes les 500 ms par une coquille dont le
+    /// fil de service est sériel : attendre ici ferait patienter l'ouverture d'un message derrière
+    /// un encodage. Un verrou tenu veut dire qu'une requête ou un lot tourne, donc que l'enfant
+    /// est prêt — rien à signaler.
     #[must_use]
     pub fn standing(&self) -> Option<Unavailable> {
-        let inner = self.inner.lock().ok()?;
+        let inner = self.inner.try_lock().ok()?;
         match &inner.slot {
             Slot::Starting => Some(Unavailable::Starting),
             Slot::Refused { why, seen, at } if self.still_refused(*why, seen, *at) => Some(*why),
@@ -1253,6 +1271,25 @@ mod tests {
         });
         assert!(first.sentence.contains("mots seuls"), "{}", first.sentence);
         assert_eq!(first.gesture, None);
+        // Un arriéré qui attend l'extinction de l'enfant de la recherche ne dit pas qu'il
+        // rattrape : rien ne tourne. Il dit quand ça tournera.
+        let deferred = super::describe(&super::Facts {
+            status: Some(Status::Deferred { pending: 4_000 }),
+            ..ready()
+        });
+        assert!(
+            !deferred.sentence.contains("rattrape"),
+            "{}",
+            deferred.sentence
+        );
+        assert!(
+            deferred
+                .sentence
+                .contains("cinq minutes après la dernière recherche"),
+            "{}",
+            deferred.sentence
+        );
+        assert_eq!(deferred.gesture, None);
         // Un refus, lui, reste un refus : celui-là effacerait, et demande un geste.
         let refused = super::describe(&super::Facts {
             failure: Some(Unavailable::Empty),

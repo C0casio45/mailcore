@@ -15,10 +15,16 @@
 //! - **une panique n'y laisse que son emplacement** (`maild::panics`), et les enfants du démon
 //!   tiennent la même règle, puisque leurs lignes passent par ici ;
 //! - **dans `%LOCALAPPDATA%`**, jamais dans le profil itinérant — la règle du cache de lecture ;
-//! - **un fichier par lancement**, nommé par sa date : celui de la panne se trouve sans lire les
-//!   autres, et deux coquilles ouvertes en même temps n'écrivent jamais le même fichier ;
-//! - **borné** : [`LIMIT`] par fichier, un nouveau au-delà, et seuls les [`KEEP`] plus récents
-//!   restent. Quatre mégaoctets au plus, sans rien à faire pour personne ;
+//! - **un fichier par lancement**, et un de plus à chaque [`LIMIT`] : celui de la panne se
+//!   trouve sans lire les autres, et deux coquilles ouvertes en même temps n'écrivent jamais le
+//!   même fichier ;
+//! - **borné** : seuls les [`KEEP`] fichiers les plus récents restent, quatre mégaoctets au plus,
+//!   sans rien à faire pour personne. Chaque fichier est **nommé par l'heure de sa création**,
+//!   pas par celle du lancement : une coquille restée ouverte une semaine ouvre son fichier
+//!   suivant avec la date du jour, et le nettoyage ne le prend pas pour un vieux. Et un fichier
+//!   effacé sous une coquille qui écrit encore — quatre lancements plus récents l'ont poussé
+//!   dehors — est remplacé à la ligne suivante, au lieu de recevoir des lignes que plus personne
+//!   ne lira ;
 //! - **le répertoire personnel y devient `~`**, au point d'écriture. Un chemin de store, de
 //!   modèle ou de pièce jointe porte le nom du compte Windows, qui est souvent celui de la
 //!   personne ; trier les appelants un par un en oublierait un, une barrière ne l'oublie pas.
@@ -71,12 +77,14 @@ pub struct Journal {
 
 struct Inner {
     dir: Utf8PathBuf,
-    /// La date du lancement et le numéro du processus, communs à tous les fichiers de ce
-    /// lancement.
-    stem: String,
-    /// Le rang du fichier en cours dans ce lancement, à partir de 1.
+    /// L'heure, telle qu'elle commence le nom d'un fichier — une horloge à part pour les tests.
+    clock: Box<dyn Fn() -> String + Send>,
+    /// Le rang du fichier en cours dans ce lancement, à partir de 1. Il départage deux fichiers
+    /// ouverts dans la même seconde.
     part: u32,
+    /// Le fichier en cours, et son chemin — pour voir qu'on l'a effacé.
     file: Option<File>,
+    path: Option<Utf8PathBuf>,
     written: u64,
     limit: u64,
     keep: usize,
@@ -85,19 +93,28 @@ struct Inner {
 }
 
 /// Les façons dont un chemin sous le répertoire personnel arrive dans une ligne : tel quel
-/// (`%chemin`), avec des barres obliques (`camino`, un chemin écrit à la main), et échappé
-/// (`?chemin`, où `Debug` double chaque barre inverse). La plus longue d'abord, pour qu'une
-/// graphie ne soit pas remplacée à moitié par une autre qu'elle contient.
+/// (`%chemin`), avec des barres obliques (`camino`, un chemin écrit à la main), échappé une ou
+/// deux fois (`?chemin`, où `Debug` double chaque barre inverse), et en URL. La plus longue
+/// d'abord, pour qu'une graphie ne soit pas remplacée à moitié par une autre qu'elle contient.
+///
+/// **Ce qu'elle ne voit pas**, écrit pour ne pas le croire couvert : le nom court 8.3 de
+/// Windows (`C:\Users\CAMILL~1`, la forme de certains `%TEMP%`), et une différence de casse hors
+/// de l'ASCII. Aucun appelant connu n'écrit ni l'un ni l'autre.
 fn spellings(home: &str) -> Vec<String> {
     // Un répertoire personnel de un ou deux caractères — `/`, `C:` — remplacerait n'importe
     // quoi : rien ne vaut mieux qu'un journal illisible.
     if home.trim_end_matches(['/', '\\']).len() < 3 {
         return Vec::new();
     }
+    let slashed = home.replace('\\', "/");
     let mut all = vec![
         home.to_owned(),
-        home.replace('\\', "/"),
+        // Échappé deux fois : le `Debug` d'un texte qui contenait déjà un `Debug`.
+        home.replace('\\', "\\\\\\\\"),
         home.replace('\\', "\\\\"),
+        // Dans une URL `file:` — l'espace encodé, le reste tel quel.
+        slashed.replace(' ', "%20"),
+        slashed,
     ];
     all.sort_by_key(|spelling| std::cmp::Reverse(spelling.len()));
     all.dedup();
@@ -112,15 +129,20 @@ impl Journal {
     /// Si le répertoire ne se crée pas ou si le fichier ne s'ouvre pas : la coquille démarre
     /// alors sans journal sur disque, ce qui vaut mieux que ne pas démarrer.
     pub fn open(dir: &Utf8Path) -> std::io::Result<(Self, Utf8PathBuf)> {
-        let stamp = jiff::Zoned::now().strftime("%Y-%m-%d_%H-%M-%S").to_string();
         let home = directories::BaseDirs::new()
             .and_then(|dirs| dirs.home_dir().to_str().map(str::to_owned));
-        Self::open_with(dir, &stamp, LIMIT, KEEP, home.as_deref())
+        Self::open_with(
+            dir,
+            Box::new(|| jiff::Zoned::now().strftime("%Y-%m-%d_%H-%M-%S").to_string()),
+            LIMIT,
+            KEEP,
+            home.as_deref(),
+        )
     }
 
     fn open_with(
         dir: &Utf8Path,
-        stamp: &str,
+        clock: Box<dyn Fn() -> String + Send>,
         limit: u64,
         keep: usize,
         home: Option<&str>,
@@ -128,9 +150,10 @@ impl Journal {
         std::fs::create_dir_all(dir)?;
         let mut inner = Inner {
             dir: dir.to_owned(),
-            stem: format!("{PREFIX}{stamp}_{}", std::process::id()),
+            clock,
             part: 0,
             file: None,
+            path: None,
             written: 0,
             limit,
             keep: keep.max(1),
@@ -150,13 +173,19 @@ impl Inner {
     /// Ferme le fichier en cours, ouvre le suivant, et efface les plus anciens.
     fn next_file(&mut self) -> std::io::Result<Utf8PathBuf> {
         self.file = None;
+        self.path = None;
         self.part += 1;
-        // Le rang sur trois chiffres : l'ordre alphabétique reste l'ordre d'écriture.
-        let path = self
-            .dir
-            .join(format!("{}_{:03}{SUFFIX}", self.stem, self.part));
+        // L'heure d'abord, pour que l'ordre alphabétique soit l'ordre de création ; le rang sur
+        // trois chiffres départage la même seconde dans un même processus.
+        let path = self.dir.join(format!(
+            "{PREFIX}{}_{}_{:03}{SUFFIX}",
+            (self.clock)(),
+            std::process::id(),
+            self.part
+        ));
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         self.file = Some(file);
+        self.path = Some(path.clone());
         self.written = 0;
         prune(&self.dir, self.keep);
         Ok(path)
@@ -165,7 +194,10 @@ impl Inner {
     fn write_line(&mut self, bytes: &[u8]) {
         let redacted = self.redact(bytes);
         let bytes = redacted.as_slice();
-        if self.written > 0 && self.written + bytes.len() as u64 > self.limit {
+        // Effacé par un lancement plus récent : écrire dans un fichier délié ne laisserait rien
+        // à lire. Un `stat` par ligne, et une coquille journalise quelques lignes par minute.
+        let gone = self.path.as_ref().is_some_and(|path| !path.exists());
+        if gone || (self.written > 0 && self.written + bytes.len() as u64 > self.limit) {
             // Un échec ici laisse `file` à `None` : les lignes suivantes sont perdues, la
             // coquille continue. Rien d'un journal ne doit pouvoir l'arrêter.
             let _ = self.next_file();
@@ -214,9 +246,10 @@ fn replace_ignoring_ascii_case(haystack: &str, needle: &str, with: &str) -> Stri
 
 /// Efface les fichiers du journal au-delà des `keep` plus récents.
 ///
-/// Le plus récent se juge **au nom**, qui commence par la date du lancement, et non à la date
-/// de modification : une coquille restée ouverte une semaine écrit encore dans un fichier daté
-/// d'il y a une semaine, et c'est un fichier en cours, pas un vieux.
+/// Le plus récent se juge **au nom**, qui commence par l'heure de création du fichier : la date
+/// de modification d'un fichier change tant qu'on y écrit, et un fichier qu'une autre coquille
+/// vient de remplir passerait devant celui qu'on vient d'ouvrir. Le fichier qu'on vient
+/// d'ouvrir porte l'heure courante, donc il est toujours parmi les plus récents.
 fn prune(dir: &Utf8Path, keep: usize) {
     let Ok(entries) = dir.read_dir_utf8() else {
         return;
@@ -298,12 +331,69 @@ mod tests {
         writer.write_all(text.as_bytes()).unwrap();
     }
 
+    /// Une horloge arrêtée.
+    fn at(stamp: &str) -> Box<dyn Fn() -> String + Send> {
+        let stamp = stamp.to_owned();
+        Box::new(move || stamp.clone())
+    }
+
+    /// Une horloge qu'un test avance.
+    fn clock(start: &str) -> (Arc<Mutex<String>>, Box<dyn Fn() -> String + Send>) {
+        let now = Arc::new(Mutex::new(start.to_owned()));
+        let read = Arc::clone(&now);
+        (now, Box::new(move || read.lock().unwrap().clone()))
+    }
+
+    #[test]
+    fn a_long_running_launch_is_not_pruned_out_of_its_own_journal() {
+        // Une coquille ouverte le 1er, quatre lancements plus récents ensuite : son premier
+        // fichier part, c'est la règle. Ce qu'elle écrit après ne doit pas partir avec lui.
+        let dir = tempfile::tempdir().unwrap();
+        let dir = Utf8Path::from_path(dir.path()).unwrap();
+        let (now, ticking) = clock("2026-10-01_08-00-00");
+        let (old, first) = Journal::open_with(dir, ticking, 20, 4, None).unwrap();
+        for day in ["02", "03", "04", "05"] {
+            let (other, _) =
+                Journal::open_with(dir, at(&format!("2026-10-{day}_08-00-00")), 20, 4, None)
+                    .unwrap();
+            line(&other, "x\n");
+        }
+        assert!(!first.exists(), "la règle des quatre plus récents");
+
+        // Le fichier effacé est remplacé à la ligne suivante, daté du jour.
+        *now.lock().unwrap() = "2026-10-06_08-00-00".to_owned();
+        line(&old, "toujours là\n");
+        let names = files(dir);
+        let current = names
+            .iter()
+            .find(|name| name.starts_with("mail-shell-2026-10-06"))
+            .unwrap_or_else(|| panic!("aucun fichier du jour : {names:?}"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(current)).unwrap(),
+            "toujours là\n"
+        );
+
+        // Et son fichier suivant, à la limite, n'est pas effacé par son propre nettoyage :
+        // daté du lancement, il passait derrière les quatre autres.
+        *now.lock().unwrap() = "2026-10-07_08-00-00".to_owned();
+        line(&old, "encore une ligne\n");
+        line(&old, "et une autre\n");
+        let names = files(dir);
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("mail-shell-2026-10-07")),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 4, "{names:?}");
+    }
+
     #[test]
     fn a_launch_writes_its_own_dated_file() {
         let dir = tempfile::tempdir().unwrap();
         let dir = Utf8Path::from_path(dir.path()).unwrap();
         let (journal, path) =
-            Journal::open_with(dir, "2026-10-19_20-00-00", 1024, 4, None).unwrap();
+            Journal::open_with(dir, at("2026-10-19_20-00-00"), 1024, 4, None).unwrap();
         line(&journal, "une ligne\n");
         assert!(
             path.file_name()
@@ -317,7 +407,8 @@ mod tests {
     fn a_file_past_the_limit_gives_way_to_the_next_without_cutting_a_line() {
         let dir = tempfile::tempdir().unwrap();
         let dir = Utf8Path::from_path(dir.path()).unwrap();
-        let (journal, first) = Journal::open_with(dir, "2026-10-19_20-00-00", 20, 4, None).unwrap();
+        let (journal, first) =
+            Journal::open_with(dir, at("2026-10-19_20-00-00"), 20, 4, None).unwrap();
         line(&journal, "0123456789\n");
         line(&journal, "abcdefghij\n");
         let names = files(dir);
@@ -335,7 +426,8 @@ mod tests {
         // fichier vide à chaque fois, et ne serait jamais écrite nulle part.
         let dir = tempfile::tempdir().unwrap();
         let dir = Utf8Path::from_path(dir.path()).unwrap();
-        let (journal, first) = Journal::open_with(dir, "2026-10-19_20-00-00", 4, 4, None).unwrap();
+        let (journal, first) =
+            Journal::open_with(dir, at("2026-10-19_20-00-00"), 4, 4, None).unwrap();
         line(&journal, "bien plus long que la limite\n");
         assert_eq!(
             std::fs::read_to_string(&first).unwrap(),
@@ -354,7 +446,7 @@ mod tests {
             "2026-10-02_08-00-00",
             "2026-10-03_08-00-00",
         ] {
-            let (journal, _) = Journal::open_with(dir, stamp, 1024, 2, None).unwrap();
+            let (journal, _) = Journal::open_with(dir, at(stamp), 1024, 2, None).unwrap();
             line(&journal, "x\n");
         }
         let names = files(dir);
@@ -372,7 +464,7 @@ mod tests {
         // nettoyage effacerait le fichier en cours.
         let dir = tempfile::tempdir().unwrap();
         let dir = Utf8Path::from_path(dir.path()).unwrap();
-        let (journal, _) = Journal::open_with(dir, "2026-10-01_08-00-00", 2, 3, None).unwrap();
+        let (journal, _) = Journal::open_with(dir, at("2026-10-01_08-00-00"), 2, 3, None).unwrap();
         for _ in 0..12 {
             line(&journal, "xx\n");
         }
@@ -386,7 +478,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dir = Utf8Path::from_path(dir.path()).unwrap();
         let (journal, path) =
-            Journal::open_with(dir, "2026-10-19_20-00-00", 1024, 4, Some(home)).unwrap();
+            Journal::open_with(dir, at("2026-10-19_20-00-00"), 1024, 4, Some(home)).unwrap();
         line(&journal, text);
         std::fs::read_to_string(path).unwrap()
     }
@@ -400,12 +492,15 @@ mod tests {
             "store=C:\\Users\\Camille Durand\\AppData\\Local\\mailcore \
              modèle=C:/Users/Camille Durand/m \
              erreur=\"C:\\\\Users\\\\Camille Durand\\\\x\" \
+             deux=\"C:\\\\\\\\Users\\\\\\\\Camille Durand\\\\\\\\z\" \
+             url=file:///C:/Users/Camille%20Durand/u \
              autre=c:\\users\\camille durand\\y\n",
         );
         assert!(!written.to_lowercase().contains("camille"), "{written}");
         assert_eq!(
             written,
-            "store=~\\AppData\\Local\\mailcore modèle=~/m erreur=\"~\\\\x\" autre=~\\y\n"
+            "store=~\\AppData\\Local\\mailcore modèle=~/m erreur=\"~\\\\x\" \
+             deux=\"~\\\\\\\\z\" url=file:///~/u autre=~\\y\n"
         );
     }
 
