@@ -210,6 +210,13 @@ fn deliver(store: &Store, accounts: &[Account], job: &Outgoing, now: i64) -> boo
             job = job.id.0,
             "compte introuvable : message laissé en file"
         );
+        hold(
+            store,
+            job,
+            now,
+            "Le compte de ce message est illisible dans le store : le message attend. \
+             `mail doctor` dit ce qui ne va pas.",
+        );
         return false;
     };
     let (Some(reading), Some(submission)) = (&account.server, &account.submission) else {
@@ -217,6 +224,13 @@ fn deliver(store: &Store, accounts: &[Account], job: &Outgoing, now: i64) -> boo
             job = job.id.0,
             compte = account.id.0,
             "compte sans serveur d'envoi : message laissé en file"
+        );
+        hold(
+            store,
+            job,
+            now,
+            "Ce compte n'a plus de serveur d'envoi : Paramètres → Serveur d'envoi, et le message \
+             repartira de lui-même. Ou annulez-le.",
         );
         return false;
     };
@@ -232,6 +246,7 @@ fn deliver(store: &Store, accounts: &[Account], job: &Outgoing, now: i64) -> boo
         Ok(secret) => secret,
         Err(source) => {
             tracing::warn!(job = job.id.0, %source, "secret indisponible");
+            hold(store, job, now, unauthenticated(&source));
             return false;
         }
     };
@@ -264,6 +279,53 @@ fn deliver(store: &Store, accounts: &[Account], job: &Outgoing, now: i64) -> boo
         Err(source) => {
             tracing::warn!(job = job.id.0, %source, "remise impossible");
             false
+        }
+    }
+}
+
+/// Combien de temps une ligne qui ne peut pas être tentée reste de côté, en secondes.
+///
+/// Cinq minutes : assez pour sortir la ligne des lots — les lignes saines passent devant — et
+/// pour ne pas redemander un jeton mort au fournisseur toutes les trente secondes ; assez court
+/// pour qu'un compte réparé ne laisse pas son message attendre longtemps.
+const HELD_BACK: i64 = 5 * 60;
+
+/// Écrit sur la ligne pourquoi elle ne part pas, et la met de côté. Voir `Store::hold_queued`.
+///
+/// Jusqu'au 2026-10-19, ces cas n'étaient dits qu'au journal du démon : la coquille affichait
+/// « EN ATTENTE » pour toujours, sans phrase ni bouton, après avoir promis un départ dans dix
+/// secondes — et dix lignes ainsi bloquées empêchaient tout envoi, de tous les comptes.
+fn hold(store: &Store, job: &Outgoing, now: i64, note: &str) {
+    if let Err(source) = store.hold_queued(job.id, note, now.saturating_add(HELD_BACK)) {
+        tracing::warn!(job = job.id.0, %source, "la raison de l'attente n'a pas pu être écrite");
+    }
+}
+
+/// La phrase d'une remise qui n'a pas pu s'authentifier, **après** avoir su pourquoi.
+///
+/// Chaque phrase dit quoi faire, et elle ne promet un départ que là où il viendra sans
+/// l'utilisateur : un refus passager du réseau, pas un jeton retiré.
+fn unauthenticated(error: &mailauth::Error) -> &'static str {
+    match error {
+        mailauth::Error::Consent { .. } => {
+            "Le jeton de ce compte a expiré ou a été retiré : Paramètres → « Refaire le \
+             consentement… », et le message repartira de lui-même. Ou annulez-le."
+        }
+        mailauth::Error::NotFound { .. } | mailauth::Error::Empty => {
+            "Aucun secret n'est enregistré pour ce compte : redéclarez-le dans Paramètres, et \
+             le message repartira de lui-même. Ou annulez-le."
+        }
+        mailauth::Error::Network(_) | mailauth::Error::Tls { .. } => {
+            "Le fournisseur n'a pas pu être joint pour renouveler le jeton : le message \
+             réessaiera de lui-même dans quelques minutes."
+        }
+        mailauth::Error::Unavailable(_) => {
+            "Le trousseau du système n'est pas lisible : le message réessaiera dans quelques \
+             minutes. Si ça dure, le journal du démon dit pourquoi."
+        }
+        _ => {
+            "Le compte n'a pas pu s'authentifier auprès du fournisseur : le message attend. \
+             Paramètres permet de redéclarer le compte, ou annulez le message."
         }
     }
 }
@@ -381,6 +443,98 @@ mod tests {
             "F:/ce-chemin-n-existe-pas/mailcore-test",
         ));
         postman.stop();
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_tried_says_why_and_lets_the_others_pass() {
+        // **La file qui se taisait.** Un compte sans serveur d'envoi — ou un jeton mort, que ce
+        // test ne peut pas fabriquer sans trousseau : la branche est la même. Le facteur ne le
+        // disait qu'à son journal ; la ligne restait « EN ATTENTE » sans phrase, et dix lignes
+        // ainsi suffisaient à remplir chaque lot : plus rien ne partait, d'aucun compte.
+        let dir = tempfile::tempdir().unwrap();
+        let root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let store = mailcore::Store::open(&root).unwrap();
+        // Un vrai compte de lecture, sans serveur d'envoi : un compte sans serveur du tout est
+        // tenu pour incohérent et écarté avant, ce qui exercerait une autre branche.
+        let account = {
+            let writer = store.writer().unwrap();
+            let id = writer
+                .upsert_imap_account(
+                    "marie@exemple.fr",
+                    &mailcore::Server {
+                        host: "imap.exemple.invalid".to_owned(),
+                        port: 993,
+                        username: "marie@exemple.fr".to_owned(),
+                        auth: mailcore::AuthKind::Password,
+                        security: mailcore::Security::Tls,
+                    },
+                )
+                .unwrap();
+            writer.commit().unwrap();
+            id
+        };
+        let blob = store
+            .blobs()
+            .put(b"From: marie@exemple.fr\r\n\r\nbonjour\r\n")
+            .unwrap()
+            .hash;
+        let start = super::now();
+        let ids: Vec<mailcore::OutboxId> = (0..11)
+            .map(|_| {
+                store
+                    .enqueue(
+                        account,
+                        blob,
+                        "marie@exemple.fr",
+                        &["jean@ailleurs.fr".to_owned()],
+                        42,
+                        start,
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect();
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        assert_eq!(super::round(&store, &stop), 0);
+
+        for id in &ids[..10] {
+            let line = store.outgoing(*id).unwrap().unwrap();
+            assert_eq!(line.state, mailcore::SendState::Queued);
+            assert_eq!(line.attempts, 0, "une tentative comptée sans avoir eu lieu");
+            let note = line.last_error.unwrap_or_default();
+            assert!(
+                note.contains("serveur d'envoi") && note.contains("annulez"),
+                "la phrase ne dit pas quoi faire : {note}"
+            );
+            assert!(
+                line.retry_after.is_some_and(|at| at > start),
+                "la ligne n'a pas été mise de côté"
+            );
+        }
+        // Le onzième, resté hors du lot, passe en tête : les lignes bloquées ne l'affament plus.
+        let next: Vec<mailcore::OutboxId> = store
+            .deliverable(super::now(), 10)
+            .unwrap()
+            .iter()
+            .map(|it| it.id)
+            .collect();
+        assert_eq!(next, vec![ids[10]]);
+    }
+
+    #[test]
+    fn the_sentence_after_an_authentication_failure_names_the_gesture() {
+        // Un jeton mort se répare dans Paramètres, pas en attendant : la phrase ne doit pas
+        // promettre un départ qui ne viendra pas. Un refus du réseau, si.
+        let consent = super::unauthenticated(&mailauth::Error::Consent {
+            reason: "invalid_grant".to_owned(),
+        });
+        assert!(consent.contains("Refaire le consentement"), "{consent}");
+        let network = super::unauthenticated(&mailauth::Error::Network(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        )));
+        assert!(network.contains("réessaiera"), "{network}");
+        assert!(!network.contains("Paramètres"), "{network}");
     }
 
     #[test]

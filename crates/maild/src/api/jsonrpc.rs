@@ -890,6 +890,18 @@ impl Api {
                 })?;
                 // Refusé **avant** de composer : un message mis en file pour un compte qui ne
                 // peut pas l'envoyer resterait en file pour toujours.
+                //
+                // Un compte en pause d'abord — « Oublier… » l'y met, secret retiré. Il gardait
+                // son serveur d'envoi, donc passait `can_send` : le message attendait sans
+                // pouvoir partir, et partait seul le jour où un consentement rendait un jeton,
+                // d'un compte que l'utilisateur croyait oublié. Relevé le 2026-10-19.
+                if !account.enabled {
+                    return Err(Error::invalid_params(format!(
+                        "le compte #{} est en pause : redéclarez-le dans Paramètres pour envoyer \
+                         avec lui",
+                        params.account
+                    )));
+                }
                 if !account.can_send() {
                     return Err(Error::invalid_params(format!(
                         "le compte #{} n'a pas de serveur d'envoi",
@@ -1621,6 +1633,28 @@ mod tests {
 
         // **Rien n'a été écrit.** Une ligne mise en file pour un message qui ne peut pas partir
         // resterait en file pour toujours, et un blob écrit pour rien est de la place perdue.
+        let store = Store::open(&root).unwrap();
+        assert!(store.outbox().unwrap().is_empty(), "une ligne a été écrite");
+    }
+
+    #[tokio::test]
+    async fn a_paused_account_is_refused_rather_than_queued() {
+        let (_dir, api, root) = api_that_can_send();
+        {
+            let store = Store::open(&root).unwrap();
+            let writer = store.writer().unwrap();
+            writer
+                .set_account_enabled(mailcore::AccountId(1), false)
+                .unwrap();
+            writer.commit().unwrap();
+        }
+        let message = refusal(
+            &api,
+            "outbox.send",
+            json!({"account": 1, "to": ["jean@ailleurs.fr"], "text": "bonjour"}),
+        )
+        .await;
+        assert!(message.contains("pause"), "{message}");
         let store = Store::open(&root).unwrap();
         assert!(store.outbox().unwrap().is_empty(), "une ligne a été écrite");
     }

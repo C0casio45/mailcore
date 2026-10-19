@@ -3682,3 +3682,33 @@ quotidien : un binaire au schéma 15 refuse un store au schéma 16.
 - moins graves, et pour un démon sur une machine dédiée : le jeton du démon hérité par ses
   processus enfants, l'absence d'arrêt propre sur `SIGTERM`, le trousseau Linux dont l'échec reste
   en cache pour la vie du processus, et `/mcp` qui refuse tout hôte autre que la boucle locale.
+
+### 2026-10-19 (suite) — la file qui se taisait
+
+**En clair d'abord.** Quand le facteur ne pouvait même pas tenter un envoi — compte sans serveur
+d'envoi, secret absent, jeton OAuth2 expiré —, il le disait à son journal et à personne d'autre.
+La coquille avait promis « il partira dans 10 s », puis affichait « EN ATTENTE » pour toujours,
+sans phrase ni bouton. Et la file se lisant par lots de dix, dix lignes ainsi bloquées suffisaient
+à ce que plus rien ne parte, d'aucun compte. C'est le deuxième des sept défauts vérifiés.
+
+**Ce qui a changé.**
+
+- **La raison rejoint la ligne** (`Store::hold_queued`) : une phrase composée après la décision,
+  qui nomme le geste — « Paramètres → Serveur d'envoi », « Refaire le consentement… », ou « le
+  message réessaiera » quand c'est vrai, sur un refus du réseau seulement. La ligne est mise de
+  côté cinq minutes : les lignes saines passent devant, et un jeton mort n'est plus redemandé au
+  fournisseur toutes les trente secondes. Ni l'état ni le compteur de tentatives ne bougent —
+  rien n'a été tenté —, et seule une ligne `queued` est touchée, la condition dans le `WHERE` ;
+- **un compte en pause ne prend plus de message.** « Oublier… » retire le secret et met le compte
+  en pause, mais lui laisse son serveur d'envoi : il passait `can_send`, le message attendait, et
+  partait seul le jour où un consentement rendait un jeton — d'un compte que l'utilisateur croyait
+  oublié. `outbox.send` le refuse, et la liste « De » le grise avec sa raison ;
+- **une ligne en attente s'annule depuis le panneau de la file**, et plus seulement depuis le
+  bandeau qui suit l'envoi et disparaît au message suivant.
+
+**Les tests.** Onze lignes d'un compte sans serveur d'envoi : après un passage du facteur, les
+dix du lot portent leur phrase, sont mises de côté sans tentative comptée, et la onzième passe en
+tête — l'affamement, vérifié comme corrigé. Le contrôle inverse : une ligne prise, `committing`
+surtout, ne reçoit ni phrase ni recul. La phrase d'un jeton mort nomme le consentement ; celle
+d'un refus du réseau promet la reprise et ne renvoie pas aux paramètres. Un compte en pause est
+refusé par `outbox.send` sans rien écrire.

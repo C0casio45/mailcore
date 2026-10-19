@@ -2229,18 +2229,26 @@ impl Shell {
                         .show_ui(ui, |ui| {
                             for account in &self.accounts {
                                 let label = account.address.as_deref().unwrap_or(&account.name);
-                                if account.can_send {
+                                if account.can_send && account.enabled {
                                     ui.selectable_value(&mut draft.account, account.id, label);
                                 } else {
                                     // Grisé, et jamais sélectionnable : le choisir mettrait en
                                     // file un message que personne ne peut remettre, et le
-                                    // démon le refuserait de toute façon.
-                                    ui.add_enabled(false, egui::Button::selectable(false, label))
-                                        .on_disabled_hover_text(format!(
+                                    // démon le refuserait de toute façon. Un compte en pause
+                                    // — « Oublier… » — passait : il garde son serveur d'envoi.
+                                    let why = if account.enabled {
+                                        format!(
                                             "Pas de serveur d'envoi. Pour en poser un :\n\
-                                         mail account submission --account {}",
+                                             mail account submission --account {}",
                                             account.id
-                                        ));
+                                        )
+                                    } else {
+                                        "Compte en pause : redéclarez-le dans Paramètres pour \
+                                         envoyer avec lui."
+                                            .to_owned()
+                                    };
+                                    ui.add_enabled(false, egui::Button::selectable(false, label))
+                                        .on_disabled_hover_text(why);
                                 }
                             }
                         });
@@ -2553,6 +2561,7 @@ impl Shell {
 
         let mut decision: Option<(i64, &'static str)> = None;
         let mut resend: Option<i64> = None;
+        let mut cancel: Option<i64> = None;
         // **Le bouton qui rend la promesse vérifiable.** C'est ici, et pas dans le lecteur, que
         // « rien n'est ajouté au message en secret » se contrôle : le lecteur montre ce que les
         // autres nous écrivent, la file montre ce que nous écrivons. Voir `outbox.source`.
@@ -2595,6 +2604,26 @@ impl Shell {
                 ui.horizontal_wrapped(|ui| {
                     ui.add_space(12.0);
                     ui.label(error);
+                });
+            }
+
+            // **Une ligne en attente s'annule ici aussi**, pas seulement dans le bandeau qui suit
+            // l'envoi et disparaît au message suivant. Une ligne qui attend un compte réparé —
+            // « annulez-le », dit sa phrase — n'avait sinon aucun geste à portée de clic. Le
+            // store tranche : une ligne prise entre-temps n'est pas retirée.
+            if line.state == "queued" && !line.doubtful {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add_space(12.0);
+                    if ui
+                        .small_button("Annuler l'envoi")
+                        .on_hover_text(
+                            "Retire le message de la file. Sans effet si le facteur l'a pris \
+                             entre-temps.",
+                        )
+                        .clicked()
+                    {
+                        cancel = Some(line.id);
+                    }
                 });
             }
 
@@ -2699,6 +2728,10 @@ impl Shell {
         }
         if let Some(id) = resend {
             self.worker.ask(Request::Retry { id });
+            self.worker.ask(Request::Outbox);
+        }
+        if let Some(id) = cancel {
+            self.worker.ask(Request::Cancel { id });
             self.worker.ask(Request::Outbox);
         }
         if let Some((id, title)) = show_source {

@@ -410,6 +410,41 @@ impl Store {
         Ok(removed)
     }
 
+    /// Dit pourquoi une ligne **en attente** ne part pas, et la met de côté jusqu'à `retry_after`.
+    ///
+    /// ## Pourquoi, depuis le 2026-10-19
+    ///
+    /// Quand le facteur ne pouvait même pas tenter la remise — compte sans serveur d'envoi,
+    /// secret absent, jeton OAuth2 mort —, il le disait à son journal et à personne d'autre. La
+    /// ligne restait `queued`, sans phrase, et la coquille affichait « EN ATTENTE » pour
+    /// toujours, après avoir promis « il partira dans 10 s ». Et comme la file se lit par lots de
+    /// dix, dix lignes ainsi bloquées suffisaient à ce que plus rien ne parte, d'aucun compte.
+    ///
+    /// La phrase rejoint donc la ligne, et `retry_after` la sort des lots pour un temps : les
+    /// lignes saines passent devant, et un jeton mort n'est pas redemandé au fournisseur toutes
+    /// les trente secondes.
+    ///
+    /// ## Ce qu'elle ne touche pas
+    ///
+    /// Ni `state`, ni `attempts` : rien n'a été tenté, donc rien n'est compté. Et seulement une
+    /// ligne `queued`, la condition dans le `WHERE` — la règle de [`Store::cancel_outgoing`].
+    /// Une ligne prise entre-temps, `committing` surtout, n'est pas touchée.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`]. Rend `false` — sans rien écrire — si la ligne n'existe pas ou
+    /// n'est plus en attente.
+    pub fn hold_queued(&self, id: OutboxId, note: &str, retry_after: i64) -> Result<bool> {
+        self.durably(|conn| {
+            let changed = conn.execute(
+                "UPDATE outbox SET last_error = ?2, retry_after = ?3
+                  WHERE id = ?1 AND state = ?4",
+                params![id.0, note, retry_after, SendState::Queued.as_str()],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
     /// Les messages que la boucle de remise peut prendre, du plus ancien au plus récent.
     ///
     /// ## `committing` n'en fait jamais partie
@@ -917,6 +952,63 @@ mod tests {
         let gone = queued(&store, account);
         assert!(store.cancel_outgoing(gone).unwrap());
         assert!(!store.claim_outgoing(gone, SendState::Queued).unwrap());
+    }
+
+    #[test]
+    fn a_waiting_line_says_why_and_steps_aside() {
+        let (_dir, store, account) = store();
+        let stuck = queued(&store, account);
+        let healthy = queued(&store, account);
+
+        assert!(
+            store
+                .hold_queued(stuck, "jeton expiré : refaire le consentement", 1_300)
+                .unwrap()
+        );
+        let line = store.outgoing(stuck).unwrap().unwrap();
+        assert_eq!(line.state, SendState::Queued, "l'état a bougé");
+        assert_eq!(
+            line.attempts, 0,
+            "une tentative a été comptée sans avoir eu lieu"
+        );
+        assert_eq!(
+            line.last_error.as_deref(),
+            Some("jeton expiré : refaire le consentement")
+        );
+        // Mise de côté : la ligne saine passe devant, la bloquée revient à son heure.
+        let ready: Vec<OutboxId> = store
+            .deliverable(1_200, 10)
+            .unwrap()
+            .iter()
+            .map(|it| it.id)
+            .collect();
+        assert_eq!(ready, vec![healthy]);
+        assert_eq!(store.deliverable(1_300, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn only_a_waiting_line_can_be_set_aside() {
+        // Le contrôle inverse : une ligne prise — surtout douteuse — n'est jamais touchée. Une
+        // phrase « attend » sur un message peut-être parti mentirait, et un `retry_after` n'y a
+        // aucun sens.
+        for state in [
+            SendState::Sending,
+            SendState::Committing,
+            SendState::Sent,
+            SendState::Failed,
+        ] {
+            let (_dir, store, account) = store();
+            let id = queued(&store, account);
+            store.commit_outgoing(id, state).unwrap();
+            assert!(
+                !store.hold_queued(id, "attente", 9_999).unwrap(),
+                "{state:?}"
+            );
+            let line = store.outgoing(id).unwrap().unwrap();
+            assert_eq!(line.state, state);
+            assert!(line.last_error.is_none(), "{state:?} a reçu une phrase");
+            assert!(line.retry_after.is_none(), "{state:?} a reçu un recul");
+        }
     }
 
     #[test]
