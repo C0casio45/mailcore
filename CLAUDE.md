@@ -81,7 +81,13 @@ recul, abandon — reste dans `mailsmtp::queue::deliver_one`, qui est aussi ce q
   autre état local devient poussable, il faut passer par là ;
 - **une poussée a un sens depuis le 2026-10-09** (`SCHEMA_V15`, marquer non lu) : une seule ligne
   par copie, que le dernier geste **remplace**, et `forget_pending_seen` n'oublie une ligne que si
-  elle porte encore le sens poussé — sinon un clic arrivé pendant la poussée serait perdu.
+  elle porte encore le sens poussé — sinon un clic arrivé pendant la poussée serait perdu ;
+- **une poussée ne part que sous l'`UIDVALIDITY` connue** — depuis le 2026-10-19. Une marque
+  désigne une copie par son UID, et un dossier renuméroté donne ce numéro à un autre message :
+  la poussée partait avant la vérification, et marquait lu chez le serveur un message que
+  personne n'avait ouvert. `push_seen` compare la validité que son `SELECT` rend à celle du
+  store ; à la renumérotation, les marques sont relues **par message** avant l'effacement
+  (`pending_seen_by_message`), effacées avec les copies, et reposées sur les nouveaux UID.
 
 Et la moisson ouvre en `EXAMINE`, en lecture seule. Un dossier n'est rouvert en `SELECT` que
 s'il a une poussée en attente : le droit d'écrire est demandé au dernier moment et pour un

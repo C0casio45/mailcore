@@ -2559,3 +2559,70 @@ fn a_message_marked_unread_stays_unread_after_the_harvest() {
         "l'étoile a disparu avec le drapeau lu"
     );
 }
+
+#[test]
+fn a_pending_mark_never_lands_on_another_message_after_a_renumbering() {
+    // **La marque de lecture sur le mauvais message.** Une poussée en attente désigne une copie
+    // par son UID. Le serveur renumérote le dossier — supprimé puis recréé dans un autre client,
+    // index reconstruit — et l'UID désigne maintenant un autre message. La poussée partait
+    // avant que la moisson ne vérifie l'`UIDVALIDITY` : `UID STORE` marquait lu un message que
+    // personne n'avait ouvert, chez le serveur donc partout. Trouvé par une relecture le
+    // 2026-10-18, vérifié par deux contradicteurs.
+    let facture = Message::simple(1, "facture");
+    let devis = Message::simple(2, "devis");
+    let (_dir, store, folder) = store();
+    let subject_of = |store: &Store, subject: &str| {
+        store
+            .page(folder, None, 10)
+            .unwrap()
+            .into_iter()
+            .find(|it| it.subject == subject)
+            .unwrap_or_else(|| panic!("« {subject} » doit être dans la boîte"))
+    };
+
+    // Première numérotation : la facture en 1, le devis en 2. On ouvre le devis.
+    {
+        let config = Config::without_condstore().with_mailboxes(vec![Mailbox::new(
+            "INBOX",
+            1_000,
+            vec![facture.clone(), devis.clone()],
+        )]);
+        let server = Server::start(config).unwrap();
+        let mut client = connect(&server);
+        harvest(&mut client, &store, folder, b"INBOX").unwrap();
+    }
+    let opened = subject_of(&store, "devis");
+    assert_eq!(store.mark_seen(opened.id, folder, 1_000).unwrap(), 1);
+    assert_eq!(store.pending_seen(folder).unwrap()[0].uid, 2);
+
+    // Le serveur renumérote : la facture porte maintenant l'UID 2, celui de la marque.
+    let renumbered = vec![Message { uid: 1, ..devis }, Message { uid: 2, ..facture }];
+    let config =
+        Config::without_condstore().with_mailboxes(vec![Mailbox::new("INBOX", 4_242, renumbered)]);
+    let server = Server::start(config).unwrap();
+    let mut client = connect(&server);
+    let report = harvest(&mut client, &store, folder, b"INBOX").unwrap();
+    assert!(report.full, "la renumérotation n'a pas été vue");
+    // Le geste a été reposé sur la nouvelle numérotation, par message.
+    let pending = store.pending_seen(folder).unwrap();
+    assert_eq!(pending.len(), 1, "la marque de l'utilisateur a été perdue");
+    assert_eq!(pending[0].uid, 1, "la marque n'a pas suivi son message");
+
+    // Elle part au passage suivant ; le troisième relit ce que le serveur sait.
+    harvest(&mut client, &store, folder, b"INBOX").unwrap();
+    assert!(store.pending_seen(folder).unwrap().is_empty());
+    harvest(&mut client, &store, folder, b"INBOX").unwrap();
+
+    assert!(
+        !subject_of(&store, "facture")
+            .flags
+            .contains(MessageFlags::SEEN),
+        "la marque est tombée sur la facture, que personne n'a ouverte"
+    );
+    assert!(
+        subject_of(&store, "devis")
+            .flags
+            .contains(MessageFlags::SEEN),
+        "le devis ouvert a perdu sa marque dans la renumérotation"
+    );
+}

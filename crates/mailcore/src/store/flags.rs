@@ -202,6 +202,34 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Les poussées en attente d'un dossier, **par message** et non par UID : le dernier geste de
+    /// chaque message, lu ou non lu.
+    ///
+    /// Pour une renumérotation du dossier : les UID en attente ne valent plus rien, mais tant que
+    /// `remote_uids` porte encore l'ancienne numérotation, on sait quel message chacun désignait.
+    /// À lire **avant** `Writer::forget_copies`, qui efface les deux. Voir
+    /// `mailsync::sync::harvest_watched`.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn pending_seen_by_message(&self, folder: FolderId) -> Result<Vec<(MessageId, bool)>> {
+        // Le geste le plus récent l'emporte : SQLite rend, pour une colonne nue d'un `GROUP BY`
+        // avec `max()`, la valeur de la ligne qui porte le maximum.
+        let mut statement = self.connection().prepare_cached(
+            "SELECT u.message_id, p.seen, max(p.marked_at)
+               FROM flag_pushes p
+               JOIN remote_uids u ON u.folder_id = p.folder_id AND u.uid = p.uid
+              WHERE p.folder_id = ?1
+              GROUP BY u.message_id
+              ORDER BY u.message_id",
+        )?;
+        let rows = statement.query_map(params![folder.0], |row| {
+            Ok((MessageId(row.get(0)?), row.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Toutes les poussées en attente, tous dossiers confondus. Pour `mail doctor`.
     ///
     /// # Errors

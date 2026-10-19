@@ -834,11 +834,34 @@ pub fn push_seen<S: Read + Write>(
 
     // Le dossier est rouvert en écriture. Un refus ici — `\Noselect`, boîte partagée — laisse
     // la poussée en attente et rend la main.
-    if let Err(source) = client.select(mailbox) {
+    let selected = match client.select(mailbox) {
+        Ok(selected) => selected,
+        Err(source) => {
+            tracing::warn!(
+                folder = folder.0,
+                %source,
+                "dossier non ouvrable en écriture : les marques restent en attente"
+            );
+            return Ok(0);
+        }
+    };
+
+    // **Une marque désigne une copie par son UID, et un UID ne vaut que sous sa validité.** Si
+    // le serveur a renuméroté le dossier — supprimé puis recréé, reconstruit, migré —, l'UID
+    // en attente désigne maintenant un **autre message**, et `UID STORE` y écrirait. Jusqu'au
+    // 2026-10-19, cette vérification venait après la poussée : une marque de lecture pouvait
+    // atterrir sur le mauvais message. Sans validité connue des deux côtés, rien ne part non
+    // plus — un serveur qui n'en annonce pas ne promet aucun UID stable. Les marques attendent ;
+    // la moisson qui suit voit la renumérotation et les reporte sur les nouveaux UID, par
+    // message — voir `harvest_watched`.
+    let known = store.sync_state(folder)?.uidvalidity;
+    if known.is_none() || selected.uidvalidity != known {
         tracing::warn!(
             folder = folder.0,
-            %source,
-            "dossier non ouvrable en écriture : les marques restent en attente"
+            ?known,
+            announced = ?selected.uidvalidity,
+            pending = pending.len(),
+            "validité des UID changée ou inconnue : les marques attendent la nouvelle numérotation"
         );
         return Ok(0);
     }
@@ -958,12 +981,22 @@ pub fn harvest_watched<S: Read + Write>(
     // Mesuré le 2026-09-08 : après une coupure de Gmail sur deux dossiers, la passe suivante a
     // retéléchargé 25 028 corps pour trouver 2 messages nouveaux. Correct — la dédup n'a rien
     // stocké deux fois — mais la bande passante était repayée en entier.
-    if matches!(
+    //
+    // **Les marques en attente survivent à l'effacement, par message.** Elles désignent des
+    // copies par leurs UID d'avant, qui ne valent plus rien : les garder telles quelles les
+    // ferait pousser sur d'autres messages, les jeter perdrait le geste de l'utilisateur. Elles
+    // sont donc relues **par message** tant que l'ancienne numérotation est encore connue,
+    // effacées avec elle, et reposées sur les nouveaux UID une fois le dossier remoissonné.
+    let carried = if matches!(
         reason,
         Some(FullReason::UidvalidityChanged | FullReason::NoUidvalidity)
     ) {
+        let carried = store.pending_seen_by_message(folder)?;
         forget_folder(store, folder)?;
-    }
+        carried
+    } else {
+        Vec::new()
+    };
 
     // **Le témoin de reprise.** Écrit *avant* de télécharger quoi que ce soit, il laisse une
     // trace de la validité contre laquelle les copies de ce passage sont enregistrées. Sans
@@ -1064,6 +1097,7 @@ pub fn harvest_watched<S: Read + Write>(
                 // **On sort sans écrire l'état de synchronisation.** C'est ce qui fait qu'un
                 // passage interrompu se reprend au lieu de se croire fini : le témoin n'a pas
                 // avancé, donc la prochaine moisson redemandera ce qui manque.
+                remark(store, folder, &carried);
                 return Ok(report);
             }
             report = fetch_bodies(client, store, folder, &chunk, report)?;
@@ -1200,9 +1234,43 @@ pub fn harvest_watched<S: Read + Write>(
     let writer = store.writer()?;
     writer.set_sync_state(folder, &state)?;
     writer.commit()?;
+    remark(store, folder, &carried);
 
     tracing::info!(folder = folder.0, ?report, "moisson terminée");
     Ok(report)
+}
+
+/// Repose sur la nouvelle numérotation les marques relues avant une renumérotation.
+///
+/// Par les fonctions du geste lui-même : elles retrouvent les copies du message dans
+/// `remote_uids` — remoissonné, donc aux nouveaux UID —, mettent la référence à jour et notent
+/// la poussée. Un message dont la copie n'est pas encore revenue — moisson interrompue — garde
+/// la marque localement, sans poussée : la relecture suivante des drapeaux du serveur la
+/// remplacera, ce qui perd un geste plutôt que d'en écrire un au hasard.
+fn remark(store: &Store, folder: FolderId, carried: &[(mailcore::MessageId, bool)]) {
+    let now = now();
+    for (message, seen) in carried {
+        let marked = if *seen {
+            store.mark_seen(*message, folder, now)
+        } else {
+            store.mark_unseen(*message, folder, now)
+        };
+        if let Err(source) = marked {
+            tracing::warn!(
+                folder = folder.0,
+                message = message.0,
+                %source,
+                "marque d'avant la renumérotation non reposée"
+            );
+        }
+    }
+    if !carried.is_empty() {
+        tracing::info!(
+            folder = folder.0,
+            marques = carried.len(),
+            "marques reposées sur la nouvelle numérotation"
+        );
+    }
 }
 
 /// Télécharge et écrit les corps d'un lot d'UID.

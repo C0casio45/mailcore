@@ -464,12 +464,21 @@ impl<'a> Writer<'a> {
     /// restent — ils sont adressés par contenu et partagés avec d'autres dossiers — et les
     /// références restent aussi, parce que la moisson complète qui suit va les reposer.
     ///
+    /// **Les poussées en attente partent avec les copies**, dans la même transaction : elles
+    /// désignent des copies par ces mêmes UID, et une marque restée là serait poussée sur
+    /// l'autre message qui porte maintenant le numéro — ce qui arrivait jusqu'au 2026-10-19.
+    /// Celui qui veut garder les gestes les relit d'abord par message
+    /// (`Store::pending_seen_by_message`) et les repose après la moisson.
+    ///
     /// Rend le nombre de copies oubliées.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Sqlite`].
     pub fn forget_copies(&self, folder: FolderId) -> Result<usize> {
+        self.tx
+            .prepare_cached("DELETE FROM flag_pushes WHERE folder_id = ?1")?
+            .execute(params![folder.0])?;
         Ok(self
             .tx
             .prepare_cached("DELETE FROM remote_uids WHERE folder_id = ?1")?

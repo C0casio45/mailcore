@@ -3712,3 +3712,27 @@ tête — l'affamement, vérifié comme corrigé. Le contrôle inverse : une lig
 surtout, ne reçoit ni phrase ni recul. La phrase d'un jeton mort nomme le consentement ; celle
 d'un refus du réseau promet la reprise et ne renvoie pas aux paramètres. Un compte en pause est
 refusé par `outbox.send` sans rien écrire.
+
+### 2026-10-19 (suite) — une marque de lecture sur le mauvais message
+
+**En clair d'abord.** Le troisième des sept défauts vérifiés, et le seul qui écrive chez le
+serveur. Une marque « lu » ou « non lu » en attente désigne une copie par son numéro, son UID.
+Quand le serveur renumérote un dossier — supprimé puis recréé dans Thunderbird, index reconstruit
+chez l'hébergeur, boîte migrée —, ce numéro passe à un autre message. La poussée partait **avant**
+que la moisson ne vérifie la validité des numéros, l'`UIDVALIDITY` : elle marquait lu, chez le
+serveur et donc partout, un message que personne n'avait ouvert, et le geste de l'utilisateur
+était perdu au passage.
+
+**Ce qui a changé.** `push_seen` garde la réponse de son `SELECT` et compare l'`UIDVALIDITY`
+annoncée à celle du store : différente ou inconnue, rien ne part. À la renumérotation, la moisson
+relit les marques en attente **par message**, tant que l'ancienne numérotation est encore connue
+(`Store::pending_seen_by_message`) ; `Writer::forget_copies` les efface avec les copies, dans la
+même transaction ; et une fois le dossier remoissonné, elles sont reposées sur les nouveaux UID
+par les fonctions du geste lui-même. Un serveur qui n'annonce aucune `UIDVALIDITY` ne promet
+aucun numéro stable : on n'y pousse plus rien.
+
+**Le test, et ses trois contrôles négatifs.** La facture en 1, le devis en 2 ; on ouvre le devis ;
+le serveur renumérote, la facture prend le 2. Après les passages suivants, la facture doit rester
+non lue et le devis être lu. Il tombe sans la garde — la facture est marquée et le geste perdu —,
+sans le report par message — le geste est perdu —, et si l'effacement des copies garde les
+anciennes marques — l'ancienne partirait au passage suivant, sur la facture.
