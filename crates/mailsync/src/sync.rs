@@ -500,7 +500,10 @@ pub fn sync_account_over<S: Read + Write>(
                 report.vanished += one.vanished;
             }
             Err(source) => {
-                tracing::warn!(dossier = %folder.path, %source, "dossier en échec");
+                // Le numéro du dossier, pas son nom : un nom de dossier est écrit par
+                // l'utilisateur, et ce journal va sur disque — `docs/PRIVACY.md` §8. Le nom
+                // reste dans le rapport, que l'écran affiche.
+                tracing::warn!(dossier = folder.folder.0, %source, "dossier en échec");
                 report.failures.push(format!("{} : {source}", folder.path));
             }
         }

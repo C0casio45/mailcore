@@ -894,7 +894,8 @@ fn sync(store: &Store, only: Option<i64>, progress: &Progress) -> Result<String,
         ) {
             Ok(secret) => secret,
             Err(source) => {
-                // L'hôte et l'identifiant sont dans le journal du démon, pas dans la réponse.
+                // L'hôte est dans le journal du démon, pas dans la réponse ; l'identifiant n'est
+                // nulle part — `mailauth::Error::NotFound` ne le nomme pas.
                 // Un consentement mort n'est pas réessayable : le dire distingue « à relancer
                 // plus tard » de « l'utilisateur doit rouvrir son navigateur ».
                 tracing::warn!(
@@ -919,9 +920,14 @@ fn sync(store: &Store, only: Option<i64>, progress: &Progress) -> Result<String,
                 total.vanished += report.vanished;
                 cancelled |= report.cancelled;
                 if !report.failures.is_empty() {
-                    for failure in &report.failures {
-                        tracing::warn!(compte = account.id.0, %failure, "dossier en échec");
-                    }
+                    // Un compte, pas les phrases : chacune commence par le nom du dossier, écrit
+                    // par l'utilisateur. La moisson a déjà journalisé chaque échec sous le
+                    // numéro du dossier — `docs/PRIVACY.md` §8.
+                    tracing::warn!(
+                        compte = account.id.0,
+                        dossiers = report.failures.len(),
+                        "dossiers en échec"
+                    );
                     total.failures.extend(report.failures);
                 }
                 tracing::info!(

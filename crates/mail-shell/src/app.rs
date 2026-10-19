@@ -243,6 +243,9 @@ pub struct Shell {
     /// Le store et l.outil de cette machine, en mode embarqué : ce qui rend exécutable un geste
     /// proposé par le service. Voir [`crate::gesture`].
     local: Option<crate::gesture::Local>,
+    /// Le fichier où ce lancement écrit son journal, quand il a pu l'ouvrir. Voir
+    /// [`crate::journal`].
+    journal: Option<camino::Utf8PathBuf>,
     /// Dernière écriture du cache. Sert à ne pas réécrire à chaque page.
     cache_saved: Option<Instant>,
     /// Vrai après une purge : **plus rien n'est écrit jusqu'au prochain lancement**.
@@ -449,6 +452,8 @@ pub struct Setup {
     pub seed: Option<crate::cache::Snapshot>,
     /// Le store de cette machine, en mode embarqué — voir [`crate::gesture`].
     pub local: Option<crate::gesture::Local>,
+    /// Le fichier du journal de ce lancement — voir [`crate::journal`].
+    pub journal: Option<camino::Utf8PathBuf>,
 }
 
 impl Shell {
@@ -461,6 +466,7 @@ impl Shell {
             cache_host,
             seed,
             local,
+            journal,
         } = setup;
 
         // Le fuseau se lit pendant que la fenêtre se crée : les premières lignes en ont besoin.
@@ -480,6 +486,7 @@ impl Shell {
             bench,
             cache_host,
             local,
+            journal,
             cache_saved: None,
             cache_disabled: false,
             announced: false,
@@ -1974,6 +1981,7 @@ impl Shell {
             // proposer « Déclarer un compte » à un client distant serait promettre un geste
             // impossible, ce que le critère 8 interdit ailleurs pour la même raison.
             remote: self.worker.is_remote(),
+            journal: self.journal.clone(),
             ..crate::settings::Page::default()
         });
         self.worker.ask(Request::AccountsDetail);

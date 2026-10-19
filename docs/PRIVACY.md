@@ -289,6 +289,37 @@ Ce que ça ajoute comme obligations :
   à déboguer ; un `tracing::debug!` qui recopie un en-tête crée un deuxième exemplaire
   du mail, en clair, dans un fichier que personne ne surveille.
 
+### Le journal de la coquille va sur disque — 2026-10-19
+
+Jusque-là, la coquille livrée n'avait pas de journal du tout : sans console, sa sortie d'erreur
+n'allait nulle part, et une panne se reconstituait depuis le store. Elle écrit maintenant dans
+`%LOCALAPPDATA%\mailcore\journal` (`mail-shell::journal`). Un journal est fait pour être joint
+à un rapport, donc pour **sortir de la machine** : la règle ci-dessus devient concrète, et voici
+ce qui la tient.
+
+- **`info` au plus bas, quoi que dise `RUST_LOG`.** La sortie d'erreur suit la variable ; le
+  fichier non. Les enfants du démon — passe de fond, recherche par le sens — tiennent le même
+  plafond, parce que leurs lignes sont recopiées par le parent sans leur niveau.
+- **Une panique n'y laisse que son emplacement** (`maild::panics`). Un message écrit dans le
+  source est gardé ; un message formaté à l'exécution est remplacé par sa longueur, parce qu'il
+  peut citer la donnée en cause.
+- **Le répertoire personnel y devient `~`**, au point d'écriture et dans ses trois graphies.
+  C'est une barrière, pas une liste d'appelants vigilants : un chemin de store, de modèle ou de
+  profil Thunderbird porte le nom du compte Windows.
+- **Hors du profil itinérant**, comme le cache de lecture ; **borné** — un fichier par
+  lancement, un mégaoctet chacun, quatre gardés.
+
+Ce que le relevé du même jour a retiré des journaux — tous les crates, au niveau `info` et
+au-dessus : **l'adresse du compte**, que `mailauth::Error::NotFound` citait à chaque moisson
+et chaque remise sans secret ; **les noms de dossiers**, IMAP et Thunderbird, dans les
+avertissements de moisson et d'import, remplacés par leur numéro ; **le chemin de l'index**, que
+tantivy écrit en `info` à chaque validation (`tantivy=warn`).
+
+Ce qui y reste, **écrit pour ne pas le croire absent** : les **noms des serveurs** de courrier,
+et les **réponses des serveurs** citées telles quelles — un refus de `SELECT` peut nommer le
+dossier. Ce sont les deux indications sans lesquelles une panne de serveur ne se diagnostique
+pas ; la page de paramètres le dit à côté du chemin du journal.
+
 ## Test de non-régression obligatoire
 
 Un test d'intégration qui rend un message HTML contenant un pixel espion, une image

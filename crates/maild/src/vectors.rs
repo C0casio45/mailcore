@@ -292,14 +292,9 @@ mod child {
 
     /// Fait un passage et rend le code de sortie du processus.
     pub(super) fn run(root: &Utf8Path) -> i32 {
-        // Un journal sur la sortie d'erreur, que le parent recopie dans le sien.
-        let _ = tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .try_init();
+        // Un journal sur la sortie d'erreur, que le parent recopie dans le sien — donc, depuis la
+        // coquille, dans un fichier : voir `crate::semantic::child::journal`.
+        crate::semantic::child::journal();
 
         // **Le parent mort, l'enfant sort.** Il tient l'entrée standard ouverte sans rien y
         // écrire : la fin de fichier ne vient que de sa disparition.

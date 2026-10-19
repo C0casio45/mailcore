@@ -17,9 +17,9 @@
 //! (clap sort avant, et `--purge-cache` est lancé par un banc sans personne pour fermer une
 //! fenêtre), une panique, et un pilote OpenGL absent — la fenêtre d'erreur passe par le même
 //! `glow` que la fenêtre principale, donc elle échouerait de la même façon. Les trois restent
-//! muets depuis le menu Démarrer ; les couvrir demande un canal qui ne dépende ni d'OpenGL ni
-//! d'une console, et un journal sur disque doit d'abord régler `docs/PRIVACY.md` — un message de
-//! panique cite jusqu'à 256 caractères de la chaîne en cause, donc du courrier.
+//! sans fenêtre depuis le menu Démarrer, mais plus muets depuis le 2026-10-19 : ils s'écrivent
+//! dans le journal sur disque (`crate::journal`) — la panique par son seul emplacement, son
+//! message pouvant citer du courrier (`maild::panics`). La page de paramètres dit où il est.
 
 /// Ce que la fenêtre affiche. Calculé une fois, hors du dessin : c'est la partie qui se teste.
 #[derive(Debug, Clone, PartialEq, Eq)]

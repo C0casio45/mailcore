@@ -207,7 +207,9 @@ pub fn import_profile(
         let handle = match std::fs::File::open(&file.path) {
             Ok(handle) => handle,
             Err(source) => {
-                tracing::warn!(folder = %file.folder, %source, "dossier illisible, ignoré");
+                // Ni le nom du dossier ni son chemin : le premier est écrit par l'utilisateur,
+                // le second est sous son répertoire personnel — `docs/PRIVACY.md` §8.
+                tracing::warn!(%source, "dossier illisible, ignoré");
                 stats.unreadable_files += 1;
                 continue;
             }
@@ -230,7 +232,7 @@ pub fn import_profile(
                 Ok(None) => break,
                 Err(source) => {
                     tracing::warn!(
-                        folder = %file.folder,
+                        dossier = folder.0,
                         %source,
                         "lecture interrompue, le reste du dossier est ignoré"
                     );
@@ -303,7 +305,7 @@ pub fn import_profile(
 
         writer.commit()?;
         tracing::debug!(
-            folder = %file.folder,
+            dossier = folder.0,
             messages = stats.messages_read,
             "dossier importé"
         );

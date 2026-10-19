@@ -51,6 +51,7 @@ pub mod api;
 pub mod config;
 pub mod jobs;
 pub mod outbox;
+pub mod panics;
 pub mod semantic;
 pub mod vectors;
 pub mod watch;

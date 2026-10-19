@@ -116,7 +116,11 @@ impl Searcher {
                 let Some(plain) = without_apostrophes(query) else {
                     return Err(refused.into());
                 };
-                tracing::debug!(%query, "requête relue sans ses apostrophes");
+                // Sa longueur, pas son texte : ce qu'on cherche dit ce qu'on a reçu.
+                tracing::debug!(
+                    caracteres = query.chars().count(),
+                    "requête relue sans ses apostrophes"
+                );
                 self.parser.parse_query(&plain)?
             }
         };

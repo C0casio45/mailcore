@@ -56,6 +56,7 @@ mod cache;
 mod clock;
 mod failure;
 mod gesture;
+mod journal;
 mod settings;
 mod signature;
 mod theme;
@@ -64,6 +65,7 @@ mod worker;
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::Parser;
+use tracing_subscriber::prelude::*;
 
 /// Les arguments de la coquille.
 ///
@@ -175,7 +177,7 @@ fn open_backend(
 
     let store = store_root(cli.store.clone())?;
     let profiles = maild::config::discover_profiles();
-    tracing::info!(store = %store, profils = profiles.len(), "mode embarqué");
+    tracing::info!(profils = profiles.len(), "mode embarqué");
 
     let service = maild::Service::open(&store, profiles, launch)?;
     tracing::info!(
@@ -192,16 +194,37 @@ fn main() -> Result<()> {
     // toute fenêtre. Voir `maild::vectors`.
     let launch = maild::vectors::Launch::dispatch();
 
+    // Deux sorties. La sortie d'erreur suit `RUST_LOG` : c'est l'outil de qui développe, et le
+    // canal que lisent les bancs. Le fichier, lui, ne descend jamais sous `info` — voir
+    // `journal`, qui dit aussi pourquoi il existe.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        // Même raison que dans le démon : `html5ever` avertit à chaque tableau mal formé, ce
-        // qui est le cas normal du courrier réel.
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,html5ever=error"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(journal::FILTER));
+    let journal = journal::directory().and_then(|dir| journal::Journal::open(&dir).ok());
+    let file_layer = journal.as_ref().map(|(journal, _)| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(journal.clone())
+            .with_filter(tracing_subscriber::EnvFilter::new(journal::FILTER))
+    });
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(filter),
+        )
+        .with(file_layer)
         .init();
+    maild::panics::install();
+    let journal = journal.map(|(_, path)| path);
 
-    let cli = Cli::parse();
+    // Un refus d'arguments part aussi au journal : sans console, c'est le seul endroit où il se
+    // lit. `--help` et `--version` ne sont pas des refus, et ne s'y écrivent pas.
+    let cli = Cli::try_parse().unwrap_or_else(|refused| {
+        if refused.use_stderr() {
+            tracing::error!("arguments refusés : {refused}");
+        }
+        refused.exit()
+    });
 
     // La purge se fait avant tout le reste : elle n'ouvre ni store, ni fenêtre, ni connexion.
     // Rien à monter pour effacer un fichier.
@@ -339,10 +362,16 @@ fn main() -> Result<()> {
                 cache_host,
                 seed,
                 local,
+                journal,
             })))
         }),
     )
-    .map_err(|error| anyhow::anyhow!("eframe : {error}"))
+    .map_err(|error| {
+        // Un pilote OpenGL absent finit ici, avant toute fenêtre : la fenêtre d'erreur passerait
+        // par le même `glow` et échouerait pareil. Le journal est le seul témoin.
+        tracing::error!(%error, "la fenêtre ne s'ouvre pas");
+        anyhow::anyhow!("eframe : {error}")
+    })
 }
 
 /// La position demandée par `MAILCORE_UI_POSITION`, au format `x,y`.

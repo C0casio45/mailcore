@@ -54,7 +54,12 @@ const PREFIX: &str = "imap";
 #[non_exhaustive]
 pub enum Error {
     /// Aucun secret enregistré pour ce compte.
-    #[error("aucun secret enregistré pour {username} sur {host} — utiliser `mail account add`")]
+    ///
+    /// **Le message ne nomme pas l'identifiant**, qui est d'ordinaire l'adresse : il finit dans
+    /// le journal du démon à chaque moisson, chaque remise, chaque reconnexion de la veille, et
+    /// ce journal va sur disque depuis la coquille — `docs/PRIVACY.md` §8. L'identifiant reste
+    /// dans le champ, pour qui en a besoin ; l'appelant sait de quel compte il parlait.
+    #[error("aucun secret enregistré pour ce compte sur {host} — utiliser `mail account add`")]
     NotFound {
         /// L'hôte cherché.
         host: String,
@@ -521,6 +526,18 @@ mod tests {
                 "un secret apparaît dans un message : {message}"
             );
         }
+    }
+
+    #[test]
+    fn a_missing_secret_does_not_name_the_address_it_was_looked_up_for() {
+        // L'identifiant est d'ordinaire l'adresse, et ce message finit dans un journal.
+        let message = Error::NotFound {
+            host: "imap.exemple.invalid".to_owned(),
+            username: "marie@exemple.invalid".to_owned(),
+        }
+        .to_string();
+        assert!(!message.contains("marie"), "{message}");
+        assert!(message.contains("imap.exemple.invalid"), "{message}");
     }
 
     #[test]

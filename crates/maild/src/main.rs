@@ -144,11 +144,18 @@ fn main() -> Result<()> {
         // du courrier réel c'est le cas **normal**, pas l'exception : mesuré, ça produit
         // plusieurs avertissements par message ouvert. Un journal qui déborde à chaque
         // lecture est un journal que personne ne lit, donc plus de journal du tout.
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,html5ever=error"));
+        //
+        // `tantivy=warn` : tantivy écrit en `info` le chemin de son index à chaque validation,
+        // donc à chaque moisson — `docs/PRIVACY.md` §8. Ses avertissements restent.
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("info,html5ever=error,tantivy=warn")
+        });
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+    // Une panique n'y laisse que son emplacement : voir `maild::panics`.
+    maild::panics::install();
 
     match cli.command {
         Command::Token => {

@@ -237,6 +237,11 @@ pub struct Page {
     pub failed: bool,
     /// Vrai quand le service est distant : la page ne peut alors rien écrire.
     pub remote: bool,
+    /// Le fichier du journal de ce lancement, quand il a pu s'ouvrir — `crate::journal`.
+    ///
+    /// Sur cette page parce que c'est là qu'on vient quand quelque chose ne marche pas : un
+    /// journal dont personne ne sait où il est ne sert pas plus qu'aucun journal.
+    pub journal: Option<camino::Utf8PathBuf>,
 }
 
 /// L'hôte de soumission le plus probable pour un hôte de lecture.
@@ -282,7 +287,45 @@ impl Page {
         self.declaration(ui, &mut outcome);
         self.submission(ui, &mut outcome);
         self.consent(ui, &mut outcome);
+        ui.separator();
+        self.journal(ui);
         outcome
+    }
+
+    /// Où est le journal, et ce qu'il contient.
+    ///
+    /// Copier le chemin se fait ici et pas dans un `Outcome` : c'est le presse-papiers, pas une
+    /// demande au service, et une page que personne n'a cliquée ne copie rien.
+    fn journal(&self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Journal").strong());
+        let Some(path) = &self.journal else {
+            ui.label(
+                "Ce lancement n'a pas pu ouvrir de journal sur disque : son répertoire ne se \
+                 crée pas, ou le fichier ne s'ouvre pas.",
+            );
+            return;
+        };
+        ui.label(
+            "Ce lancement écrit son journal dans le fichier ci-dessous ; les trois précédents \
+             sont à côté. Il est fait pour être joint à un rapport : il ne recopie ni le contenu \
+             des messages ni les adresses, et le répertoire personnel y est remplacé par « ~ ». \
+             Il nomme en revanche les serveurs de courrier, et cite leurs réponses telles \
+             quelles.",
+        );
+        // Les phrases d'échec du service disent « voir le journal du démon » : il faut savoir
+        // lequel c'est.
+        ui.label(if self.remote {
+            "Le journal du démon, lui, est sur la machine du démon."
+        } else {
+            "Le démon tourne dans cette fenêtre : quand un message dit « voir le journal du \
+             démon », c'est celui-ci."
+        });
+        ui.horizontal(|ui| {
+            ui.monospace(path.as_str());
+            if ui.button("Copier le chemin").clicked() {
+                ui.ctx().copy_text(path.to_string());
+            }
+        });
     }
 
     /// Le formulaire de consentement OAuth2, et l'attente du navigateur.
@@ -869,6 +912,16 @@ mod tests {
             },
             Page {
                 consent_url: Some("https://accounts.example/auth?x=1".to_owned()),
+                ..Page::default()
+            },
+            // Le journal ouvert, en embarqué et en distant : deux phrases différentes.
+            Page {
+                journal: Some("~/journal/mail-shell-2026-10-19_20-00-00_1_001.log".into()),
+                ..Page::default()
+            },
+            Page {
+                journal: Some("~/journal/mail-shell-2026-10-19_20-00-00_1_001.log".into()),
+                remote: true,
                 ..Page::default()
             },
         ];

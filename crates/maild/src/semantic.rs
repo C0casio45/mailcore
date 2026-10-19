@@ -413,16 +413,26 @@ pub(crate) mod child {
         0
     }
 
-    /// Sert jusqu'à la fin de l'entrée standard, et rend le code de sortie.
-    pub(crate) fn run(root: &Utf8Path) -> i32 {
+    /// Le journal d'un enfant — celui-ci et celui de la passe de fond : sur la sortie d'erreur,
+    /// que le parent recopie dans le sien, ligne par ligne.
+    ///
+    /// **Au niveau `info`, quoi que dise `RUST_LOG`.** Le parent recopie une ligne sans savoir
+    /// de quel niveau elle était, et la coquille l'écrit sur disque : un enfant lancé en `debug`
+    /// mettrait dans le fichier ce que le filtre du parent en tient dehors. Sans couleurs, pour
+    /// la même raison — une séquence d'échappement n'a rien à faire dans un fichier. Et une
+    /// panique n'y laisse que son emplacement (`crate::panics`).
+    pub(crate) fn journal() {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_ansi(false)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
             .try_init();
+        crate::panics::install();
+    }
+
+    /// Sert jusqu'à la fin de l'entrée standard, et rend le code de sortie.
+    pub(crate) fn run(root: &Utf8Path) -> i32 {
+        journal();
 
         let store = match mailcore::Store::open(root) {
             Ok(store) => store,
