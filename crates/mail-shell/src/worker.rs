@@ -180,6 +180,8 @@ pub enum Request {
     DeleteDraft { id: i64 },
     /// Les tâches de fond en cours et récentes.
     Jobs,
+    /// Où en est la recherche par le sens, hors de toute recherche — `semantic.status`.
+    SemanticStatus,
     /// La source d'un message : les octets tels qu'ils sont.
     ///
     /// Demandée **à l'ouverture de la fenêtre**, jamais avec le message : elle pèse la taille du
@@ -372,6 +374,8 @@ pub enum Reply {
     Search(Box<dto::Results>),
     Sources(Vec<dto::Source>),
     Jobs(Vec<dto::Job>),
+    /// `None` : le service ne propose pas la recherche par le sens.
+    SemanticStatus(Option<Box<dto::Semantic>>),
     Accounts(Vec<dto::Account>),
     /// Un fichier est rangé dans le magasin, prêt à être joint.
     Attached(Box<dto::Attached>),
@@ -1601,6 +1605,7 @@ fn describe(request: &Request) -> (&'static str, &'static str, Value) {
             json!({"kind": "sync", "account": account}),
         ),
         Request::Jobs => ("tâches", m::JOBS_LIST, Value::Null),
+        Request::SemanticStatus => ("sens", m::SEMANTIC_STATUS, Value::Null),
         Request::Accounts => ("comptes", m::ACCOUNTS_LIST, Value::Null),
         Request::MarkRead { id, folder } => (
             "marquage lu",
@@ -1768,6 +1773,7 @@ fn decode(request: Request, result: Value) -> Result<Reply, String> {
             Reply::Started
         }
         Request::Jobs => Reply::Jobs(from(result)?),
+        Request::SemanticStatus => Reply::SemanticStatus(from(result)?),
         Request::Accounts => Reply::Accounts(from(result)?),
         // Servie par `Link::stage`, jamais par un appel : elle ne passe pas ici.
         Request::Attach { .. } => {

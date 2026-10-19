@@ -246,7 +246,7 @@ pub fn describe(facts: &Facts) -> mailapi::dto::Semantic {
     }
     // Une passe explicite demandée : la recherche par le sens répond peut-être, mais sur une
     // partie du courrier seulement — ou pas du tout.
-    if let Some(Status::NeedsExplicitPass { reason, pending }) = facts.status {
+    if let Some(Status::NeedsExplicitPass { reason, .. }) = facts.status {
         let tail = if facts.asked && facts.failure.is_none() {
             "En attendant, le sens ne voit qu'une partie du courrier."
         } else if facts.vectors_present && facts.failure.is_none() {
@@ -255,14 +255,6 @@ pub fn describe(facts: &Facts) -> mailapi::dto::Semantic {
             WORDS_ONLY
         };
         let (sentence, gesture) = match reason {
-            Explicit::Backlog => (
-                format!(
-                    "{} sans vecteur — trop pour la passe de fond, qui ne suit que le courrier \
-                     qui arrive.",
-                    messages_waiting(pending)
-                ),
-                Some("mail vectors --bert"),
-            ),
             Explicit::Stale | Explicit::Diverged => (
                 "Les vecteurs ne correspondent plus au courrier : une passe complète les refait."
                     .to_owned(),
@@ -297,13 +289,24 @@ pub fn describe(facts: &Facts) -> mailapi::dto::Semantic {
         _ => None,
     };
     if facts.failure == Some(Unavailable::Empty) || !facts.vectors_present {
-        return match working {
-            Some(_) => said(
+        return match (working, facts.status) {
+            (Some(_), _) => said(
                 State::Working,
                 format!("Le courrier est en cours de vectorisation. {WORDS_ONLY}"),
                 None,
             ),
-            None => said(
+            // Depuis le 2026-10-19, la passe de fond fait aussi la première passe : le délai du
+            // démarrage ou un job en cours la retardent, rien ne la remplace. Proposer
+            // `mail vectors` ici ferait croire qu'il faut un geste.
+            (None, Some(Status::Waiting | Status::Paused)) => said(
+                State::Working,
+                format!(
+                    "Le courrier n'a pas encore été vectorisé ; la passe de fond s'en charge dès que \
+                     le démon est libre. {WORDS_ONLY}"
+                ),
+                None,
+            ),
+            (None, _) => said(
                 State::NeedsPass,
                 format!("Le courrier n'a pas encore été vectorisé. {WORDS_ONLY}"),
                 Some("mail vectors --bert"),
@@ -350,15 +353,6 @@ fn messages(count: u64) -> String {
         format!("{count} messages")
     } else {
         format!("{count} message")
-    }
-}
-
-/// « 1 message attend », « 3 messages attendent ».
-fn messages_waiting(count: u64) -> String {
-    if count > 1 {
-        format!("{count} messages attendent")
-    } else {
-        format!("{count} message attend")
     }
 }
 
@@ -1079,7 +1073,7 @@ mod tests {
             (
                 super::Facts {
                     status: Some(Status::NeedsExplicitPass {
-                        reason: Explicit::Backlog,
+                        reason: Explicit::Stale,
                         pending: 4_000,
                     }),
                     ..ready()
@@ -1107,9 +1101,30 @@ mod tests {
                 None,
             ),
             (
+                // La passe de fond fera la première passe : pas de geste à proposer.
                 super::Facts {
                     vectors_present: false,
                     status: Some(Status::Waiting),
+                    ..ready()
+                },
+                State::Working,
+                None,
+            ),
+            (
+                super::Facts {
+                    vectors_present: false,
+                    status: Some(Status::Paused),
+                    ..ready()
+                },
+                State::Working,
+                None,
+            ),
+            (
+                // Le contrôle inverse : un démon qui ne sait pas lancer sa passe de fond laisse
+                // la première passe à un geste, et le dit.
+                super::Facts {
+                    vectors_present: false,
+                    status: Some(Status::Disabled),
                     ..ready()
                 },
                 State::NeedsPass,
@@ -1182,7 +1197,7 @@ mod tests {
                 operators: true,
                 asked: false,
                 status: Some(Status::NeedsExplicitPass {
-                    reason: Explicit::Backlog,
+                    reason: Explicit::Stale,
                     pending: 4_000,
                 }),
                 ..ready()
@@ -1209,37 +1224,41 @@ mod tests {
     }
 
     #[test]
-    fn a_backlog_says_how_many_and_agrees_in_number() {
+    fn a_backlog_being_caught_up_says_how_many_and_asks_for_nothing() {
         use crate::vectors::Status;
         use mailvec::pass::Explicit;
-        let backlog = |pending| {
+        // Un arriéré ne demande plus de geste depuis le 2026-10-19 : la passe de fond le
+        // rattrape, et la phrase dit combien il en reste, sans commande à taper.
+        let catching_up = |pending| {
             super::describe(&super::Facts {
-                status: Some(Status::NeedsExplicitPass {
-                    reason: Explicit::Backlog,
-                    pending,
-                }),
+                status: Some(Status::Working { pending }),
                 ..ready()
             })
-            .sentence
         };
+        let many = catching_up(4_000);
+        assert_eq!(many.state, mailapi::dto::SemanticState::Working);
+        assert_eq!(many.gesture, None);
         assert!(
-            backlog(4_000).starts_with("4000 messages attendent"),
+            many.sentence.contains("rattrape 4000 messages arrivés"),
             "{}",
-            backlog(4_000)
+            many.sentence
         );
-        assert!(
-            backlog(1).starts_with("1 message attend "),
-            "{}",
-            backlog(1)
-        );
-        // Des vecteurs existent : le sens répond, sur une partie. Sans, les mots seuls — la phrase
-        // ne doit pas promettre une réponse qui n'a pas eu lieu.
-        assert!(backlog(4_000).contains("une partie"));
+        let one = catching_up(1).sentence;
+        assert!(one.contains("rattrape 1 message arrivé."), "{one}");
+        // Sans aucun vecteur encore, le sens ne répond pas : la phrase ne promet rien.
+        let first = super::describe(&super::Facts {
+            vectors_present: false,
+            status: Some(Status::Working { pending: 4_000 }),
+            ..ready()
+        });
+        assert!(first.sentence.contains("mots seuls"), "{}", first.sentence);
+        assert_eq!(first.gesture, None);
+        // Un refus, lui, reste un refus : celui-là effacerait, et demande un geste.
         let refused = super::describe(&super::Facts {
             failure: Some(Unavailable::Empty),
             vectors_present: false,
             status: Some(Status::NeedsExplicitPass {
-                reason: Explicit::Backlog,
+                reason: Explicit::Stale,
                 pending: 4_000,
             }),
             ..ready()

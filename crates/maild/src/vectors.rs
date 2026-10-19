@@ -20,10 +20,18 @@
 //!
 //! ## Ce que la passe de fond ne fait jamais
 //!
-//! **Effacer ou remettre à zéro.** Un magasin périmé, divergent, d'un autre modèle, ou un arriéré
-//! de plus de [`mailvec::pass::FOLLOW_LIMIT`] messages demandent une passe explicite —
-//! `mail vectors` —, et l'état le dit : [`Status::NeedsExplicitPass`]. La règle vit dans
-//! `mailvec::pass::plan`, que le démon et l'enfant appellent tous deux.
+//! **Effacer ou remettre à zéro.** Un magasin périmé, divergent ou d'un autre modèle demande une
+//! passe explicite — `mail vectors` —, et l'état le dit : [`Status::NeedsExplicitPass`]. La
+//! règle vit dans `mailvec::pass::plan`, que le démon et l'enfant appellent tous deux.
+//!
+//! ## Un arriéré se rattrape tout seul, par passages bornés
+//!
+//! Depuis le 2026-10-19 — avant, au-delà de mille messages, la passe de fond refusait, et trois
+//! semaines sans ouvrir l'application suffisaient. Un arriéré n'efface rien : il ne fait
+//! qu'ajouter. Chaque enfant en fait au plus [`mailvec::pass::ROUND`] et sort, le fil en relance
+//! un aussitôt tant qu'un passage avance : la mémoire est rendue entre deux passages, un job qui
+//! démarre ne fait perdre qu'un passage, et l'état — [`Status::Working`], lisible par
+//! `semantic.status` hors de toute recherche — dit combien il en reste.
 //!
 //! ## Quand
 //!
@@ -81,6 +89,23 @@ const WATCH: Duration = Duration::from_millis(200);
 /// courrier en compte un à quelques-uns ; un arriéré plus long se fait en plusieurs lots, entre
 /// lesquels les recherches passent.
 const DELEGATED_BATCH: u64 = 8;
+
+/// Au-delà de combien de messages en attente le travail n'est **pas** confié à l'enfant de la
+/// recherche, même chaud.
+///
+/// La délégation est faite pour une arrivée : quelques messages, encodés par un modèle déjà
+/// chargé. Mais elle tourne en priorité normale, et chaque lot fait attendre les recherches. Un
+/// arriéré de mille messages en ferait cent vingt-cinq lots, pendant qu'on cherche. Au-delà de
+/// ce seuil, la passe attend que l'enfant de la recherche s'éteigne — cinq minutes après la
+/// dernière recherche, sa mort réveille ce fil — et lance son propre enfant, en priorité
+/// minimale. Soixante-quatre : huit lots, quelques secondes.
+const DELEGATED_AT_MOST: u64 = 64;
+
+/// La variable qui fixe la borne d'un passage de l'enfant, à la place de
+/// [`mailvec::pass::ROUND`] — pour les tests, jamais pour l'utilisateur. Le parent la pose
+/// toujours sur la commande de l'enfant : `Command::env` ne demande pas d'`unsafe`, et un test
+/// passe sa borne à [`Vectoriser::start_with_round`].
+pub const ROUND_ENV: &str = "MAILCORE_VECTORS_ROUND";
 
 /// Pourquoi une passe de fond a échoué. Des codes, jamais une phrase : rien de ce qui sort d'ici
 /// ne porte de chemin — `docs/PRIVACY.md`, §8.
@@ -348,12 +373,19 @@ mod child {
                 return Outcome::Failed(Failure::Model);
             }
         };
-        super::outcome_of(mailvec::pass::follow_locked(
+        // Un passage borné : le parent relance aussitôt tant qu'un passage avance.
+        let at_most = std::env::var(super::ROUND_ENV)
+            .ok()
+            .and_then(|round| round.parse::<u64>().ok())
+            .filter(|round| *round > 0)
+            .unwrap_or(mailvec::pass::ROUND);
+        super::outcome_of(mailvec::pass::follow_some(
             &store,
             &model,
             budget,
             &Progress::new(),
             &lock,
+            at_most,
         ))
     }
 }
@@ -371,6 +403,10 @@ struct Shared {
     delegate: Mutex<Option<std::sync::Weak<crate::semantic::Engine>>>,
     /// Combien de lots lui ont été confiés — pour les tests et le diagnostic.
     delegated: std::sync::atomic::AtomicU64,
+    /// Combien d'enfants de la passe ont été lancés — pour les tests et le diagnostic.
+    launched: std::sync::atomic::AtomicU64,
+    /// La borne d'un passage de l'enfant : [`mailvec::pass::ROUND`], sauf dans un test.
+    round: u64,
 }
 
 impl Shared {
@@ -450,6 +486,19 @@ impl Vectoriser {
         launch: Launch,
         delay: Duration,
     ) -> Self {
+        Self::start_with_round(store, activity, launch, delay, mailvec::pass::ROUND)
+    }
+
+    /// [`Self::start_after`], avec une borne de passage donnée — pour qu'un test voie un arriéré
+    /// rattrapé en plusieurs passages sans fabriquer mille messages.
+    #[must_use]
+    pub fn start_with_round(
+        store: &Utf8Path,
+        activity: Activity,
+        launch: Launch,
+        delay: Duration,
+        round: u64,
+    ) -> Self {
         let initial = if matches!(launch, Launch::Disabled) {
             Status::Disabled
         } else {
@@ -462,6 +511,8 @@ impl Vectoriser {
             child: Mutex::new(None),
             delegate: Mutex::new(None),
             delegated: std::sync::atomic::AtomicU64::new(0),
+            launched: std::sync::atomic::AtomicU64::new(0),
+            round: round.max(1),
         });
         let Launch::Program(program) = launch else {
             return Self {
@@ -520,6 +571,12 @@ impl Vectoriser {
     #[must_use]
     pub fn delegated(&self) -> u64 {
         self.shared.delegated.load(Ordering::SeqCst)
+    }
+
+    /// Combien d'enfants de la passe ont été lancés depuis le démarrage.
+    #[must_use]
+    pub fn launched(&self) -> u64 {
+        self.shared.launched.load(Ordering::SeqCst)
     }
 
     /// Arrête le fil : tue l'enfant en cours, et attend le fil — borné, l'enfant étant mort.
@@ -678,6 +735,12 @@ fn round(
     // **L'enfant de la recherche vit : c'est lui qui fait la passe**, un lot à la fois. Jamais un
     // second enfant à côté — deux copies du modèle. S'il ne peut pas — il démarre encore, ou il n'a
     // pas répondu —, on attend : sa mise en route ou sa mort réveillent ce fil.
+    //
+    // Sauf un arriéré : il attend la mort de l'enfant de la recherche, pour ne pas tourner en
+    // priorité normale pendant qu'on cherche — voir `DELEGATED_AT_MOST`.
+    if activity.held() > 0 && pending > DELEGATED_AT_MOST {
+        return false;
+    }
     if activity.held() > 0 {
         let engine = shared
             .delegate
@@ -783,6 +846,7 @@ fn spawn_and_wait(
     shared: &Shared,
 ) -> Waited {
     let mut command = command(program, root);
+    command.env(ROUND_ENV, shared.round.to_string());
     let mut child = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -795,6 +859,7 @@ fn spawn_and_wait(
             return Waited::Outcome(Outcome::Failed(Failure::Spawn));
         }
     };
+    shared.launched.fetch_add(1, Ordering::SeqCst);
 
     // Le journal de l'enfant, recopié dans celui du démon, ligne par ligne.
     if let Some(stderr) = child.stderr.take() {
@@ -927,7 +992,7 @@ mod tests {
             },
             Outcome::Nothing,
             Outcome::Explicit {
-                reason: Explicit::Backlog,
+                reason: Explicit::Stale,
                 pending: 73_658,
             },
             Outcome::Busy,

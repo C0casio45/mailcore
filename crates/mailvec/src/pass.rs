@@ -345,12 +345,20 @@ fn rebuild_locked(
     advance(store, model, budget, progress, None)
 }
 
-/// Combien de messages une passe de fond accepte de faire d'elle-même.
+/// Combien de messages un passage de la passe de fond fait au plus, avant de rendre la main.
 ///
-/// Mille, soit trois à quatre minutes au débit mesuré de la passe complète. Au-delà, ce n'est
-/// plus suivre la moisson, c'est vectoriser un corpus : une passe de plusieurs heures, qui se
-/// décide — `mail vectors` —, et ne démarre pas parce qu'une fenêtre s'est ouverte.
-pub const FOLLOW_LIMIT: u64 = 1_000;
+/// **Une borne de passage, pas un refus.** Jusqu'au 2026-10-19, c'était un plafond : au-delà
+/// de mille messages en attente, la passe de fond refusait et demandait `mail vectors`. Trois
+/// semaines sans ouvrir l'application suffisaient à le franchir, et la recherche par le sens
+/// cessait alors de suivre le courrier jusqu'à ce que quelqu'un tape une commande. Or un arriéré
+/// était la seule raison de refus qui n'efface rien : il ne fait qu'**ajouter** au magasin. Il se
+/// rattrape donc tout seul, par passages bornés — `maild::vectors` lance un enfant par passage,
+/// qui rend toute sa mémoire en sortant, et repasse aussitôt tant qu'un passage avance.
+///
+/// Mille, soit environ une minute au débit de granite (14 msg/s, 2026-10-13) : ce qu'un job qui
+/// démarre fait perdre au plus, et la longueur sur laquelle la dérive de mémoire d'une passe
+/// (critère 5) peut s'accumuler.
+pub const ROUND: u64 = 1_000;
 
 /// Pourquoi une passe de fond refuse, et demande une passe explicite.
 ///
@@ -360,8 +368,6 @@ pub const FOLLOW_LIMIT: u64 = 1_000;
 /// de calcul au premier démarrage du démon, sans que personne ne le sache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Explicit {
-    /// Plus de [`FOLLOW_LIMIT`] messages à faire — la première passe, un rattrapage.
-    Backlog,
     /// Le magasin a été écrit par une composition de texte plus ancienne, ou un autre budget.
     Stale,
     /// Le magasin a été écrit par une composition **plus récente** que ce binaire : on n'y touche
@@ -380,7 +386,6 @@ impl Explicit {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
-            Self::Backlog => "backlog",
             Self::Stale => "stale",
             Self::Newer => "newer",
             Self::Diverged => "diverged",
@@ -393,7 +398,6 @@ impl Explicit {
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         [
-            Self::Backlog,
             Self::Stale,
             Self::Newer,
             Self::Diverged,
@@ -473,9 +477,6 @@ pub fn plan(
     }
     if pending == 0 {
         return Ok(Plan::Nothing);
-    }
-    if pending > FOLLOW_LIMIT {
-        return explicit(Explicit::Backlog);
     }
     Ok(Plan::Follow { pending })
 }
@@ -1270,23 +1271,32 @@ mod tests {
     }
 
     #[test]
-    fn a_backlog_is_left_to_an_explicit_pass_from_one_message_over_the_limit() {
-        let limit = usize::try_from(FOLLOW_LIMIT).unwrap();
-        let (_dir, store) = corpus(limit);
+    fn a_backlog_past_a_round_is_followed_in_bounded_rounds_never_refused() {
+        // Jusqu'au 2026-10-19, un message de plus que la borne faisait refuser la passe de fond.
+        // Un arriéré n'efface rien : il se suit, un passage borné après l'autre.
+        let round = usize::try_from(ROUND).unwrap();
+        let (_dir, store) = corpus(round + 1);
         assert_eq!(
             plan(&store, budget(), None).unwrap(),
-            Plan::Follow {
-                pending: FOLLOW_LIMIT
-            }
+            Plan::Follow { pending: ROUND + 1 }
         );
-        let (_d2, over) = corpus(limit + 1);
+        let fake = Fake::new(8);
+        let lock = VectorLock::try_acquire(&store.vectors_path()).unwrap();
+        let first = follow_some(&store, &fake, budget(), &Progress::new(), &lock, ROUND).unwrap();
+        assert!(
+            matches!(first, Followed::Done(stats) if stats.vectorised == ROUND),
+            "{first:?}"
+        );
         assert_eq!(
-            plan(&over, budget(), None).unwrap(),
-            Plan::Explicit {
-                reason: Explicit::Backlog,
-                pending: FOLLOW_LIMIT + 1
-            }
+            plan(&store, budget(), None).unwrap(),
+            Plan::Follow { pending: 1 }
         );
+        let second = follow_some(&store, &fake, budget(), &Progress::new(), &lock, ROUND).unwrap();
+        assert!(
+            matches!(second, Followed::Done(stats) if stats.vectorised == 1),
+            "{second:?}"
+        );
+        assert_eq!(plan(&store, budget(), None).unwrap(), Plan::Nothing);
     }
 
     #[test]

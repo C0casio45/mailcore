@@ -3828,3 +3828,60 @@ huit suites complètes sur huit passent ensuite. Le produit n'a pas ce cas — l
 n'efface qu'un index illisible, que personne n'a pu ouvrir. La correction du matin traitait la
 moitié de la cause, et la règle du 2026-10-18 l'a rattrapée : *un test qui échoue une fois
 n'échantillonne pas de l'instabilité, il échantillonne un défaut.*
+
+### 2026-10-19 (soir) — un journal qu'on peut lire, et un arriéré qui se rattrape seul
+
+**En clair d'abord.** Deux décisions laissées ouvertes le 2026-10-13, prises le soir du 19 — par
+l'assistant, l'utilisateur ayant demandé qu'il tranche avec les pour et les contre.
+
+**Un journal sur disque.** La phrase « le journal du démon dit pourquoi » désignait un journal qui
+n'existait nulle part : la coquille livrée n'a pas de console. Elle écrit maintenant dans
+`%LOCALAPPDATA%\mailcore\journal`, un fichier par lancement, borné, et la page de paramètres dit
+où. *Pour* : une panne se lit au lieu de se reconstituer ; une panique, un refus d'arguments, une
+fenêtre qui ne s'ouvre pas cessent d'être muets. *Contre* : un journal est fait pour sortir de la
+machine, joint à un rapport, donc tout ce qu'il recopie sort avec lui. D'où les règles de
+`docs/PRIVACY.md` — `info` au plus bas quoi que dise `RUST_LOG`, une panique réduite à son
+emplacement, le répertoire personnel remplacé par `~` au point d'écriture — et un relevé de tous
+les journaux avant d'écrire la première ligne. Il a trouvé l'adresse du compte dans l'erreur
+« aucun secret enregistré », à chaque moisson ; les noms de dossiers dans les avertissements de
+moisson et d'import ; et le chemin de l'index, que tantivy écrit en `info` à chaque validation.
+Les trois sont retirés.
+
+*Le contrôle négatif a d'abord menti.* Le test de la panique coupait une chaîne au milieu d'un
+caractère, parce que la bibliothèque standard citait jusqu'à 256 caractères de la chaîne dans son
+message — ce que `failure.rs` affirmait depuis le 2026-09-23. Le crochet modifié pour tout
+recopier, le test passait encore : Rust 1.96 ne cite plus la chaîne. Le test fabriquait une
+fuite qui n'existait pas, donc ne pouvait pas la voir. Il porte maintenant un `panic!` formaté
+avec la donnée, et tombe quand on retire la règle.
+
+**L'arriéré rendu à la passe de fond.** *Pour* : c'était la seule raison de refus qui n'efface
+rien ; trois semaines sans ouvrir l'application la déclenchaient, et la recherche par le sens
+cessait alors de suivre le courrier jusqu'à une commande que personne ne tape. *Contre* : une
+passe longue, invisible, qui pouvait passer par l'enfant de la recherche en priorité normale.
+Les deux conditions écrites le 2026-10-13 sont tenues :
+
+- **visible hors de la recherche** — `semantic.status`, une méthode qui rend la phrase de
+  `server.hello` sans ses statistiques, relevée par la coquille à chaque changement du store et
+  tant qu'un rattrapage dure ; la vue Activité a une section « Recherche par le sens », et son
+  entrée dans la barre latérale porte « sens » pendant un rattrapage ;
+- **un gros arriéré ne passe pas par la délégation** — au-delà de 64 messages
+  (`DELEGATED_AT_MOST`), la passe attend que l'enfant de la recherche s'éteigne, et lance le sien,
+  en priorité minimale.
+
+Et une troisième, que la longueur appelait : **des passages bornés**. `FOLLOW_LIMIT` devient
+`pass::ROUND`, mille messages par enfant ; l'enfant sort, rend sa mémoire, et le fil en relance un
+tant qu'un passage avance. Un job qui démarre ne fait perdre qu'un passage, et la dérive de
+mémoire du critère 5 — une vingtaine de mébioctets d'un bout à l'autre d'une passe complète — ne
+s'accumule plus que sur mille messages. La première passe après `mail model install` se fait de
+la même façon ; `mail vectors --bert` reste le moyen de tout faire d'un coup, au premier plan.
+Ce qui demande encore un geste : un magasin périmé, divergent, d'un autre modèle ou d'une version
+plus récente — tous ceux où continuer effacerait ou mélangerait.
+
+Contrôles négatifs : la garde de délégation retirée fait tomber
+`a_backlog_is_not_handed_to_the_warm_child_and_waits_for_it_to_go` ; l'enfant qui ignore sa borne
+fait tomber `a_backlog_past_a_round_is_caught_up_by_several_children_without_a_command`, qui
+compte les enfants lancés.
+
+**Ce que ce soir ne mesure pas.** Le passage de mille messages n'a pas été chronométré sur le store
+du quotidien : il était à jour au 2026-10-13, et rien ne se mesure sur une machine qui vient de
+compiler. La prochaine moisson le fera tourner pour de vrai ; le journal dira combien.

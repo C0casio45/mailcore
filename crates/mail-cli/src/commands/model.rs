@@ -74,8 +74,10 @@ pub fn install(store_root: Option<&Utf8PathBuf>, from: Option<&Utf8PathBuf>) -> 
         installed.identity, installed.trim.digest
     );
     println!(
-        "\nLe démon vectorise de lui-même ce qui arrive. Pour le courrier déjà là : \
-         mail vectors --bert"
+        "\nLe démon vectorise de lui-même tout le courrier, celui qui est déjà là compris : \
+         en priorité minimale,\npar passages d'un millier de messages, en cédant la place à \
+         toute synchronisation. La vue Activité\ndit où il en est. Pour tout faire d'un coup, \
+         au premier plan : mail vectors --bert"
     );
     Ok(())
 }

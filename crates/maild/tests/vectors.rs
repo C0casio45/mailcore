@@ -167,3 +167,25 @@ fn a_disabled_launch_starts_nothing() {
     );
     assert_eq!(vectoriser.status(), Status::Disabled);
 }
+
+#[test]
+fn a_backlog_past_a_round_is_caught_up_by_several_children_without_a_command() {
+    // Jusqu'au 2026-10-19, au-delà de mille messages, la passe de fond refusait et demandait
+    // `mail vectors`. Elle rattrape maintenant, un enfant par passage borné, et relance tant
+    // qu'un passage avance. La borne est de deux ici, pour voir plusieurs passages sur cinq
+    // messages.
+    let (_dir, store, root) = store(5, true);
+    let vectoriser =
+        Vectoriser::start_with_round(&root, Activity::default(), program(), Duration::ZERO, 2);
+    eventually("l'arriéré rattrapé", &vectoriser, || {
+        store.unvectorised_total().unwrap() == 0 && vectoriser.status() == Status::Idle
+    });
+    // Le contrôle qui compte : un seul enfant aurait tout fait si la borne n'arrivait pas
+    // jusqu'à lui.
+    assert!(
+        vectoriser.launched() >= 3,
+        "{} enfants pour cinq messages par deux",
+        vectoriser.launched()
+    );
+    vectoriser.stop();
+}

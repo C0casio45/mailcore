@@ -21,7 +21,16 @@ use std::time::{Duration, Instant};
 
 /// Trois messages qui portent le mot cherché, deux qui ne le portent pas.
 fn store(with_model: bool, with_vectors: bool) -> (tempfile::TempDir, Utf8PathBuf) {
-    let messages: Vec<(String, String)> = [
+    store_and(with_model, with_vectors, 0)
+}
+
+/// [`store`], plus `more` messages ordinaires — de quoi faire un arriéré.
+fn store_and(
+    with_model: bool,
+    with_vectors: bool,
+    more: usize,
+) -> (tempfile::TempDir, Utf8PathBuf) {
+    let mut messages: Vec<(String, String)> = [
         ("bonjour", "bon"),
         ("bonjour encore", "bon été"),
         ("bonjour enfin", "été"),
@@ -31,6 +40,7 @@ fn store(with_model: bool, with_vectors: bool) -> (tempfile::TempDir, Utf8PathBu
     .iter()
     .map(|(subject, body)| ((*subject).to_owned(), (*body).to_owned()))
     .collect();
+    messages.extend((0..more).map(|index| ("courrier".to_owned(), format!("été {index}"))));
     let (dir, store) = corpus_with(&messages);
     let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
     mailcore::index::rebuild(&store, &mailcore::Progress::new()).unwrap();
@@ -234,7 +244,17 @@ async fn without_a_model_the_words_answer_and_the_client_is_told_how_to_get_the_
     let hello: Hello =
         serde_json::from_value(call(&api, "server.hello", Value::Null).await["result"].clone())
             .unwrap();
-    assert_eq!(hello.semantic.unwrap().state, SemanticState::ModelAbsent);
+    let said = hello.semantic.unwrap();
+    assert_eq!(said.state, SemanticState::ModelAbsent);
+
+    // Et `semantic.status`, la même phrase, pour un client qui la redemande hors recherche.
+    let status: Option<mailapi::dto::Semantic> =
+        serde_json::from_value(call(&api, "semantic.status", Value::Null).await["result"].clone())
+            .unwrap();
+    let status = status.expect("le démon propose le sens");
+    assert_eq!(status.state, said.state);
+    assert_eq!(status.sentence, said.sentence);
+    assert_eq!(status.gesture, said.gesture);
 }
 
 #[tokio::test]
@@ -455,5 +475,45 @@ async fn without_delegation_a_warm_child_makes_the_pass_wait() {
     assert_eq!(store.unvectorised_total().unwrap(), 5);
     assert_eq!(vectoriser.status(), maild::vectors::Status::Paused);
     assert_eq!(vectoriser.delegated(), 0);
+    vectoriser.stop();
+}
+
+#[tokio::test]
+async fn a_backlog_is_not_handed_to_the_warm_child_and_waits_for_it_to_go() {
+    // Un arriéré confié à l'enfant de la recherche tournerait en priorité normale, un lot de huit
+    // après l'autre, pendant qu'on cherche. Il attend que l'enfant s'éteigne, puis la passe de fond
+    // le fait elle-même, en priorité minimale — sans commande, et sans second modèle.
+    let (_dir, root) = store_and(true, true, 70);
+    let (api, engine, vectoriser) = api_engine_and_pass(&root, true);
+    warmed(&api, &engine, "bonjour").await;
+    let store = mailcore::Store::open(&root).unwrap();
+    store.reset_vectorised().unwrap();
+    let pending = store.unvectorised_total().unwrap();
+    assert!(pending > 64, "{pending} : pas un arriéré");
+    vectoriser.nudge();
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(vectoriser.delegated(), 0, "l'arriéré a été confié");
+    assert_eq!(store.unvectorised_total().unwrap(), pending);
+    // L'état le dit, hors de toute recherche : c'est ce que `semantic.status` relaie.
+    assert_eq!(
+        vectoriser.status(),
+        maild::vectors::Status::Working { pending }
+    );
+
+    // L'enfant de la recherche s'éteint : sa mort réveille la passe, qui rattrape tout.
+    drop(api);
+    drop(engine);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while store.unvectorised_total().unwrap() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "l'arriéré n'a pas été rattrapé : {} restants, état {:?}",
+            store.unvectorised_total().unwrap(),
+            vectoriser.status()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(vectoriser.delegated(), 0);
+    assert!(vectoriser.launched() >= 1);
     vectoriser.stop();
 }

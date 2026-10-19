@@ -211,6 +211,13 @@ pub struct Shell {
     sources: Vec<dto::Source>,
     jobs: Vec<dto::Job>,
     jobs_polled: Option<Instant>,
+    /// Où en est la recherche par le sens, hors de toute recherche : `server.hello` au démarrage,
+    /// puis `semantic.status` relevé avec les tâches. C'est ce qui rend visible un rattrapage de
+    /// la passe de fond, qui ne se voyait qu'au-dessus des résultats d'une recherche.
+    background: Option<dto::Semantic>,
+    /// Vrai quand le service ne connaît pas `semantic.status` — un démon plus ancien : on cesse
+    /// de le demander, et rien ne s'affiche en rouge pour ça.
+    background_unsupported: bool,
     /// Ce que la colonne centrale montre. Voir [`View`].
     view: View,
 
@@ -519,6 +526,8 @@ impl Shell {
             sources: Vec::new(),
             jobs: Vec::new(),
             jobs_polled: None,
+            background: None,
+            background_unsupported: false,
             view: View::Messages,
             status: None,
             cancellable: None,
@@ -757,6 +766,7 @@ impl Shell {
                     // compilation. Le numéro reste vérifié : un binaire de coquille et un
                     // service de versions différentes peuvent se croiser sur le même store.
                     if hello.protocol == mailapi::PROTOCOL {
+                        self.background.clone_from(&hello.semantic);
                         self.hello = Some(hello);
                     } else {
                         self.fatal = Some(format!(
@@ -931,6 +941,7 @@ impl Shell {
                 }
                 Reply::Sources(sources) => self.sources = sources,
                 Reply::Jobs(jobs) => self.jobs = jobs,
+                Reply::SemanticStatus(said) => self.background = said.map(|said| *said),
                 Reply::Accounts(accounts) => self.accounts = accounts,
                 Reply::Attached(attached) => {
                     // Le fichier est rangé : la fenêtre peut le joindre. Elle n'est peut-être
@@ -1065,6 +1076,12 @@ impl Shell {
                     // Et les brouillons : un autre client — la CLI, un modèle — peut en avoir
                     // écrit un, et le compteur doit le dire sans qu'on clique.
                     self.worker.ask(Request::Drafts);
+                    // Et le sens : une moisson apporte du courrier à vectoriser, et la passe de
+                    // fond pose ses drapeaux dans le store. C'est ce qui fait voir un rattrapage
+                    // qui commence ; la relève des tâches le suit ensuite jusqu'au bout.
+                    if !self.background_unsupported {
+                        self.worker.ask(Request::SemanticStatus);
+                    }
                     if let Some(id) = self.current {
                         self.reload_folder(id);
                     }
@@ -1099,6 +1116,13 @@ impl Shell {
                     }
                     if what == "recherche" {
                         self.searching = false;
+                    }
+                    // Un démon plus ancien ne connaît pas `semantic.status` : on cesse de le
+                    // demander, et ce n'est pas une erreur à montrer — la phrase de `hello`
+                    // reste, figée au démarrage.
+                    if what == "sens" && !transport {
+                        self.background_unsupported = true;
+                        continue;
                     }
                     if (what == "compte" || what == "comptes")
                         && let Some(page) = &mut self.settings
@@ -1204,7 +1228,7 @@ impl Shell {
             .jobs
             .iter()
             .any(|job| job.state == "running" || job.state == "queued");
-        if !active && self.view != View::Activity {
+        if !active && !self.catching_up() && self.view != View::Activity {
             return;
         }
         let due = self
@@ -1213,8 +1237,19 @@ impl Shell {
         if due {
             self.jobs_polled = Some(Instant::now());
             self.worker.ask(Request::Jobs);
+            if !self.background_unsupported {
+                self.worker.ask(Request::SemanticStatus);
+            }
         }
         ctx.request_repaint_after(JOBS_POLL);
+    }
+
+    /// Vrai pendant que la passe de fond rattrape du courrier : la relève continue jusqu'à ce
+    /// qu'elle ait fini, sans quoi le compte affiché resterait celui du démarrage.
+    fn catching_up(&self) -> bool {
+        self.background
+            .as_ref()
+            .is_some_and(|said| said.state == dto::SemanticState::Working)
     }
 }
 
@@ -2824,6 +2859,21 @@ impl Shell {
             });
         }
 
+        // La passe de fond n'est pas une tâche — on ne l'annule pas, elle cède d'elle-même à
+        // toute tâche —, mais un rattrapage d'une heure doit se voir ailleurs qu'au-dessus des
+        // résultats d'une recherche.
+        if let Some(said) = &self.background {
+            section(ui, "Recherche par le sens");
+            match said.state {
+                // Le bandeau des résultats tait l'état normal ; ici, une section vide ferait
+                // croire à un oubli.
+                dto::SemanticState::Ready | dto::SemanticState::Disabled => {
+                    ui.weak(&said.sentence);
+                }
+                _ => semantic_banner(ui, said, self.local.as_ref(), self.cache_host.is_some()),
+            }
+        }
+
         section(ui, "Importer");
         if self.sources.is_empty() {
             ui.weak(
@@ -2993,7 +3043,15 @@ impl Shell {
                     (
                         View::Activity,
                         "Activité",
-                        (running > 0).then(|| (format!("{running} en cours"), ui.visuals().weak_text_color())),
+                        if running > 0 {
+                            Some((format!("{running} en cours"), ui.visuals().weak_text_color()))
+                        } else if self.catching_up() {
+                            // Pas une tâche — rien à annuler —, mais du travail de fond qu'on
+                            // doit pouvoir voir sans chercher : la vue dit lequel.
+                            Some(("sens".to_owned(), ui.visuals().weak_text_color()))
+                        } else {
+                            None
+                        },
                     ),
                 ];
                 for (view, name, badge) in entries {

@@ -343,7 +343,20 @@ le cas dérivé qui ne rentrait pas dans le moule des deux autres — trois leç
   dit ; un **refus** se retient avec l'empreinte des fichiers qui l'ont décidé ;
 - **une phrase sur le sens se compose à un seul endroit**, `semantic::describe`, après la décision,
   sans chemin, et elle distingue ce qui a été **demandé** de ce qui **est** : `server.hello` n'a rien
-  cherché et ne parle pas de résultats.
+  cherché et ne parle pas de résultats ;
+- **seul ce qui efface demande un geste** — depuis le 2026-10-19. Un arriéré, si long soit-il, se
+  rattrape par la passe de fond, un enfant par passage de `pass::ROUND` messages, sans passer par
+  l'enfant de la recherche au-delà de `DELEGATED_AT_MOST`, et `semantic.status` le rend visible
+  hors de toute recherche.
+
+**La coquille a un journal sur disque depuis le 2026-10-19** (`mail-shell::journal`), et il est
+fait pour être joint à un rapport : tout ce qu'un `tracing` recopie peut donc sortir de la
+machine. `docs/PRIVACY.md` §8 dit ce qui le tient — `info` au plus bas, une panique réduite à son
+emplacement (`maild::panics`), le répertoire personnel remplacé par `~` au point d'écriture. Un
+nouveau champ de journal se demande : *est-ce que je le collerais dans un ticket public ?* Et une
+leçon de méthode : **un contrôle négatif doit fabriquer la fuite qu'il cherche.** Le premier test
+de la panique s'appuyait sur une citation que Rust 1.96 ne fait plus ; il passait avec la règle
+retirée.
 
 Et une leçon sur les modèles : **la fenêtre du tokeniseur ne dépasse jamais les positions du
 modèle.** Elle était fixée à 256 ; un modèle qui en aurait eu moins échouait sur tout courrier un

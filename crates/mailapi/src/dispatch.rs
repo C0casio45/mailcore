@@ -51,6 +51,11 @@ pub mod method {
     pub const MESSAGES_SOURCE: &str = "messages.source";
     /// Recherche plein texte.
     pub const SEARCH_QUERY: &str = "search.query";
+    /// Où en est la recherche par le sens, hors de toute recherche — la même phrase que
+    /// `server.hello`, sans les statistiques du store qui la rendent trop chère pour être
+    /// redemandée. `null` quand le démon ne la propose pas. Servie par le transport : c'est le
+    /// démon qui le sait, pas la boîte mail.
+    pub const SEMANTIC_STATUS: &str = "semantic.status";
     /// L'état du store.
     pub const STORE_STATS: &str = "store.stats";
     /// La révision courante du store.
@@ -147,6 +152,7 @@ pub mod method {
         MESSAGES_STAGE_PART,
         MESSAGES_SOURCE,
         SEARCH_QUERY,
+        SEMANTIC_STATUS,
         STORE_STATS,
         STORE_REVISION,
         STORE_WAIT,
@@ -177,6 +183,7 @@ pub mod method {
     /// les intercepte avant [`super::call`].
     pub const SERVED_BY_TRANSPORT: &[&str] = &[
         STORE_WAIT,
+        SEMANTIC_STATUS,
         JOBS_SOURCES,
         JOBS_START,
         JOBS_LIST,

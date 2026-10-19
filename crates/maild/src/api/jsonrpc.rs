@@ -221,6 +221,7 @@ impl Api {
 
         match method {
             m::STORE_WAIT => self.wait(params).await,
+            m::SEMANTIC_STATUS => encode(&self.describe_semantic(None, false)),
             m::JOBS_SOURCES => self.job_sources(),
             m::JOBS_START => self.job_start(params),
             m::JOBS_LIST => self.job_list(),
