@@ -3736,3 +3736,95 @@ le serveur renumérote, la facture prend le 2. Après les passages suivants, la 
 non lue et le devis être lu. Il tombe sans la garde — la facture est marquée et le geste perdu —,
 sans le report par message — le geste est perdu —, et si l'effacement des copies garde les
 anciennes marques — l'ancienne partirait au passage suivant, sur la facture.
+
+### 2026-10-19 (suite) — un envoi normal affiché comme incertain
+
+**En clair d'abord.** Le résidu de la relecture du matin. Pour que le critère 2 tienne, une ligne
+passe en `committing` — « peut-être parti » — **avant** que le corps ne parte : une coupure pendant
+le transfert doit laisser un doute, jamais une ligne qu'on remet. Mais pendant tout ce transfert,
+quelques dixièmes de seconde pour un message court, des dizaines de secondes pour une pièce jointe,
+la file affichait donc « ÉTAT INCERTAIN », le badge ⚠ et les deux boutons du doute — « Il n'est
+pas arrivé — renvoyer », « Il est arrivé — clore » — sur un envoi qui se passait normalement. Un
+avertissement qui s'affiche à chaque envoi finit par ne plus être lu, y compris le jour où il
+compte.
+
+**Pourquoi l'état ne pouvait pas porter la différence.** Un remettant qui meurt en plein transfert
+ne réécrit rien, et sa ligne doit **alors** devenir douteuse sans que personne n'y touche. Une
+colonne « en cours » resterait vraie après la mort. Ce qui dit la vie d'un remettant est le verrou
+de remise du matin, que le système rend à la mort du processus.
+
+**Ce qui a changé.** Le détenteur du verrou écrit le numéro de sa ligne dans `outbox.sending`
+(`DeliveryLock::announce`), l'efface en prenant le verrou — ce qu'un mort a laissé — et en le
+lâchant. `Store::in_flight` lit le nom, contrôle que le verrou est tenu, relit le nom : les deux
+lectures doivent s'accorder, sans quoi une remise qui finit pendant que la suivante prend le verrou
+ferait passer sa ligne pour en cours. Ce que la réponse décide : l'affichage — `dto::Outgoing`
+gagne `in_flight`, `doubtful` exclut la ligne en cours, la coquille écrit « ENVOI EN COURS » —, le
+refus de trancher une ligne en cours dans `Store::resolve_doubt`, et `Store::doubtful`, donc
+`mail doctor`. Elle ne décide **jamais** d'une remise : la règle du critère 2 reste sur l'état.
+
+Ce qui reste, écrit dans le code : un remettant tué laisse son nom, que le suivant efface sitôt le
+verrou pris ; entre les deux appels système, une lecture peut voir la ligne du mort en cours, le
+temps d'un rafraîchissement. Et une erreur de lecture penche du côté du doute — le montrer à tort
+coûte un regard, le cacher à tort peut coûter un message.
+
+**Les tests, et huit contrôles négatifs.** Une ligne en transfert est en cours, pas douteuse, et ne
+se tranche pas ; le verrou lâché, la même ligne est douteuse — le critère 2. Un nom sans verrou
+n'est pas en cours ; le verrou tenu pour une autre ligne ne cache pas un vieux doute ; un nouveau
+détenteur efface le nom d'un mort ; la course de la seconde lecture, sur la règle séparée des
+fichiers. Côté remise, un transport qui regarde la file pendant le corps la voit en cours ; côté
+API, `outbox.list` la rend `in_flight` et `outbox.decide` la refuse. Chacune des huit protections
+retirée fait tomber au moins un test — le verrou ignoré, l'identité ignorée, l'effacement à la
+prise, le refus de trancher, l'effacement au lâcher, la seconde lecture, l'annonce du facteur, le
+champ de l'API. Le dessin de la coquille, lui, n'a pas de test : il lit deux booléens que le
+service calcule.
+
+**La relecture contradictoire**, faite avant le commit, n'a trouvé aucun chemin vers un doublon ou
+une perte — la remise elle-même n'a pas bougé. Elle a trouvé une régression, et elle était exacte :
+**une mort n'écrit rien dans SQLite**, donc la révision du store ne bougeait pas, la coquille ne
+relisait pas la file, et une ligne dont le remettant venait de mourir restait affichée « envoi en
+cours » — un doute caché, là où l'ancien affichage le montrait. `Mailbox::revision` porte
+maintenant la ligne en cours ; une mort, comme une fin normale, fait relire. Et le contrôle du
+verrou prenait un verrou **exclusif** : deux lecteurs au même instant se prenaient l'un l'autre
+pour un remettant. Il est partagé, et rendu par `unlock` plutôt que par la fermeture — sous
+Windows, celle-ci le rend « selon les ressources disponibles ». Les deux corrections ont leur test
+et leur contrôle négatif. Elle a aussi vu deux tests qui disaient simuler une mort et faisaient un
+lâcher propre — ils remettent maintenant le nom qu'un mort laisse —, une phrase de `mail outbox
+--decide` qui refusait une ligne en cours en la disant « incertaine », et un commentaire périmé.
+
+**La leçon** : *un signal qui ne vit pas dans la base ne réveille personne.* La révision du store
+était la seule source de rafraîchissement des clients, et elle ne regardait que la base et
+l'index. Tout état nouveau rangé ailleurs — un fichier, un verrou — doit s'y ajouter, ou il ne sera
+vu qu'au prochain clic.
+
+### 2026-10-19 (suite) — une commande à copier qui ne marchait pas, et une adresse dans le journal
+
+**En clair d'abord.** La bannière de la recherche propose une commande — `mail vectors --bert`,
+`mail model install` — avec un bouton « Copier ». Copiée telle quelle, elle échouait deux fois :
+`mail` n'est dans le `PATH` de personne, l'application se lançant depuis le menu Démarrer, et sans
+`--store` elle visait le store par défaut, pas celui que la fenêtre avait ouvert.
+
+**Ce qui a changé.** Le service continue de composer la commande **sans chemin** : sa réponse part
+aussi vers un client distant, et un chemin y dirait l'arborescence d'une machine — le nom
+d'utilisateur compris. C'est la coquille embarquée qui la complète (`mail-shell::gesture`) : le
+`mail.exe` posé à côté d'elle, et `--store` du store ouvert, entre guillemets seulement s'il en
+faut — des guillemets simples avec l'opérateur d'appel sous PowerShell, les apostrophes
+typographiques doublées, puisque PowerShell les lit comme des apostrophes. En mode distant, la
+commande reste telle quelle, suivie de « sur la machine du démon ». Les deux formes ont été
+passées au vrai `mail.exe`, la seconde dans PowerShell avec un chemin à espace.
+
+**Trouvé au passage.** Quatre lignes de journal de `mailauth` écrivaient l'identifiant du compte —
+une adresse — à côté du serveur, dont « jeton d'accès rafraîchi », qui revient toutes les heures.
+`docs/PRIVACY.md` §8 n'en veut aucune dans un journal, et la justification écrite à côté —
+« savoir pour qui » — ne couvrait pas le cas qui compte : un démon dans un conteneur, dont les
+journaux sont gardés par Docker. Seul le serveur reste.
+
+**Et un test qui tombait encore.** `an_index_wiped_behind_the_store_is_rebuilt_at_the_next_arrival`,
+corrigé ce matin pour la CI Windows, est tombé deux fois sur six exécutions de la suite complète —
+jamais sur soixante exécutions seul. Relâcher la boîte ne suffisait pas : le `Drop` du veilleur de
+`meta.json` de tantivy lui demande de s'arrêter **sans l'attendre**, et son fil peut tenir le
+fichier pendant jusqu'à 500 ms encore ; sous la charge de la suite, sa lecture dure assez pour que
+l'effacement tombe dessus. Le test attend que le répertoire soit libéré, deux secondes au plus :
+huit suites complètes sur huit passent ensuite. Le produit n'a pas ce cas — la reconstruction
+n'efface qu'un index illisible, que personne n'a pu ouvrir. La correction du matin traitait la
+moitié de la cause, et la règle du 2026-10-18 l'a rattrapée : *un test qui échoue une fois
+n'échantillonne pas de l'instabilité, il échantillonne un défaut.*

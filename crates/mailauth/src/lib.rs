@@ -224,9 +224,10 @@ pub fn store(host: &str, username: &str, secret: &str) -> Result<()> {
     entry(host, username)?
         .set_password(secret)
         .map_err(|source| Error::Unavailable(source.to_string()))?;
-    // L'hôte et l'identifiant sont journalisés, le secret jamais. Savoir *qu'un* secret a été
-    // enregistré et pour qui est ce qu'il faut pour diagnostiquer ; sa valeur ne l'est pas.
-    tracing::info!(host, username, "secret enregistré dans le trousseau");
+    // L'hôte est journalisé ; ni l'identifiant — c'est une adresse, et `docs/PRIVACY.md` §8 n'en
+    // veut aucune dans un journal —, ni le secret. Savoir *qu'un* secret a été enregistré, et chez
+    // quel serveur, suffit à diagnostiquer.
+    tracing::info!(host, "secret enregistré dans le trousseau");
     Ok(())
 }
 
@@ -269,7 +270,7 @@ pub fn is_stored(host: &str, username: &str) -> bool {
 pub fn forget(host: &str, username: &str) -> Result<()> {
     match entry(host, username)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {
-            tracing::info!(host, username, "secret oublié");
+            tracing::info!(host, "secret oublié");
             Ok(())
         }
         Err(source) => Err(Error::Unavailable(source.to_string())),

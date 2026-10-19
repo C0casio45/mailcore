@@ -55,6 +55,7 @@ mod app;
 mod cache;
 mod clock;
 mod failure;
+mod gesture;
 mod settings;
 mod signature;
 mod theme;
@@ -225,6 +226,15 @@ fn main() -> Result<()> {
     // deuxième copie des mêmes octets.
     let cache_host = cli.daemon.clone();
     let seed = cache_host.as_deref().and_then(cache::load);
+    // Le store et l.outil de cette machine, en embarqué seulement : de quoi compléter les gestes
+    // que la bannière de recherche propose. Un `current_exe` et un `stat`, avant la fenêtre.
+    let local = if cli.daemon.is_none() {
+        store_root(cli.store.clone())
+            .ok()
+            .map(gesture::Local::beside_this_executable)
+    } else {
+        None
+    };
     if let Some(seed) = &seed {
         tracing::info!(
             "{MARK} coquille etape=cache ms={:.1} dossiers={} lignes={}",
@@ -328,6 +338,7 @@ fn main() -> Result<()> {
                 bench,
                 cache_host,
                 seed,
+                local,
             })))
         }),
     )

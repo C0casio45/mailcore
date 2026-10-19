@@ -337,7 +337,15 @@ impl Mailbox {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0, |since| since.as_secs());
 
-        Ok(format!("{data}.{mine}.{search}"))
+        // **La ligne en cours de remise**, qui ne vit pas dans SQLite : le nom dans
+        // `outbox.sending` et le verrou de remise. Un remettant qui meurt n'écrit rien, et sa
+        // ligne doit pourtant passer d'« envoi en cours » à « incertain » à l'écran ; sans ce
+        // terme, rien ne faisait relire la file, et le doute restait caché jusqu'à la prochaine
+        // écriture. Trouvé par la relecture du 2026-10-19 — voir `Store::in_flight`. Une erreur
+        // vaut « aucune », sans journal : cette fonction tourne quatre fois par seconde.
+        let moving = self.store.in_flight().ok().flatten().map_or(0, |id| id.0);
+
+        Ok(format!("{data}.{mine}.{search}.{moving}"))
     }
 
     /// Tous les dossiers, avec leurs compteurs.
@@ -1639,7 +1647,15 @@ mod tests {
         let store = Store::open(&root).unwrap();
 
         // Le répertoire de recherche disparaît — disque remplacé, nettoyage trop zélé.
-        std::fs::remove_dir_all(store.search_dir().as_std_path()).unwrap();
+        //
+        // **Et l'effacement attend le veilleur de tantivy**, depuis le 2026-10-19. Relâcher la
+        // boîte ne suffisait pas : le `Drop` du veilleur de `meta.json` lui demande de s'arrêter
+        // sans l'attendre (`FileWatcher::drop`, tantivy 0.26.1), et pendant jusqu'à 500 ms son fil
+        // peut encore tenir le fichier ouvert pour le relire. Sous Windows le répertoire refuse
+        // alors de partir — erreur 145. Mesuré : 0 échec sur 60 exécutions de ce test seul, 2 sur
+        // 6 de la suite complète, où la charge allonge la lecture. La reconstruction du produit
+        // n'a pas ce cas : elle n'efface qu'un index illisible, que personne n'a pu ouvrir.
+        wipe_once_released(store.search_dir().as_std_path());
 
         // Le compromis, vérifié plutôt que décrit : sans rien de nouveau, la passe ne fait rien
         // et ne le découvre pas. C'est ce qu'on a acheté avec les 15 ms.
@@ -1654,6 +1670,27 @@ mod tests {
 
         let reopened = Mailbox::open(&root).unwrap();
         assert_eq!(reopened.search("facture", 10).unwrap().len(), 2);
+    }
+
+    /// Efface un répertoire qu'un fil en cours d'arrêt tient peut-être encore, deux secondes au
+    /// plus — quatre fois l'intervalle du veilleur de tantivy.
+    fn wipe_once_released(dir: &std::path::Path) {
+        for _ in 0..40 {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => return,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty
+                            | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => panic!("effacement de {}: {error}", dir.display()),
+            }
+        }
+        panic!("{} toujours tenu après deux secondes", dir.display());
     }
 
     /// Ajoute un message au premier dossier, comme une moisson le ferait.
@@ -1772,6 +1809,35 @@ mod tests {
             mailbox.revision().unwrap(),
             before,
             "une écriture locale doit changer la révision"
+        );
+    }
+
+    #[test]
+    fn a_deliverer_that_dies_mid_send_changes_the_revision() {
+        // **Trouvé par la relecture du 2026-10-19.** Une ligne en cours de remise est montrée
+        // « envoi en cours » ; si son remettant meurt, elle doit passer à « incertain ». Mais une
+        // mort n'écrit rien dans SQLite : sans ce terme de la révision, rien ne faisait relire la
+        // file, et le doute restait caché à l'écran jusqu'à la prochaine écriture.
+        let (_dir, mailbox) = mailbox();
+        let root = mailbox.store().root().to_owned();
+        let elsewhere = Store::open(&root).unwrap();
+        let before = mailbox.revision().unwrap();
+
+        let lock = elsewhere.lock_delivery().unwrap();
+        lock.announce(crate::model::OutboxId(7));
+        let sending = mailbox.revision().unwrap();
+        assert_ne!(
+            sending, before,
+            "une remise qui commence ne change pas la révision"
+        );
+
+        // La mort : le verrou rendu par le système, le nom laissé derrière.
+        drop(lock);
+        std::fs::write(root.join("outbox.sending"), "7").unwrap();
+        assert_ne!(
+            mailbox.revision().unwrap(),
+            sending,
+            "un remettant mort ne change pas la révision : le doute reste caché"
         );
     }
 

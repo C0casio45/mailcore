@@ -828,6 +828,11 @@ impl Api {
                 .filter(|it| it.state == mailcore::SendState::Sent)
                 .count();
             let mut skipped = finished.saturating_sub(mailapi::dto::OUTGOING_SUBJECTS_SENT);
+            // La ligne en cours de remise, lue une fois pour toute la file. Une remise qui finit
+            // entre les deux lectures peut faire montrer sa ligne douteuse le temps d'un
+            // rafraîchissement : l'écriture qui la termine change la révision du store, et
+            // déclenche le suivant.
+            let moving = mailbox.store().in_flight_or_none();
             let out: Vec<mailapi::dto::Outgoing> = outbox
                 .iter()
                 .map(|it| {
@@ -841,7 +846,7 @@ impl Api {
                         tracing::warn!(%source, id = it.id.0, "objet d'un envoi illisible");
                         None
                     });
-                    mailapi::dto::Outgoing::with_subject(it, subject)
+                    mailapi::dto::Outgoing::with_subject(it, subject, moving)
                 })
                 .collect();
             encode(&out)
@@ -1746,6 +1751,59 @@ mod tests {
         let listed = call(&api, "outbox.list", Value::Null).await;
         let line = &listed.as_array().unwrap()[0];
         assert_eq!(line["state"], Value::from("committing"));
+        assert_eq!(line["doubtful"], Value::Bool(true));
+        assert_eq!(line["in_flight"], Value::Bool(false));
+    }
+
+    #[tokio::test]
+    async fn a_line_whose_body_is_being_sent_is_listed_in_flight_and_cannot_be_decided() {
+        // **Le défaut du 2026-10-19** : `committing` pendant tout le transfert du corps, la
+        // ligne était listée douteuse, et l'interface offrait de trancher un envoi en cours.
+        let (_dir, api, root) = api_that_can_send();
+        let queued = call(
+            &api,
+            "outbox.send",
+            json!({"account": 1, "to": ["jean@ailleurs.fr"], "text": "bonjour"}),
+        )
+        .await;
+        let id = mailcore::OutboxId(queued["id"].as_i64().unwrap());
+
+        // Un remettant ailleurs — `mail send`, une autre coquille — au milieu du corps.
+        let store = Store::open(&root).unwrap();
+        let lock = store.lock_delivery().unwrap();
+        assert!(
+            store
+                .claim_outgoing(id, mailcore::SendState::Queued)
+                .unwrap()
+        );
+        assert!(store.cross_frontier(id).unwrap());
+        lock.announce(id);
+
+        let listed = call(&api, "outbox.list", Value::Null).await;
+        let line = &listed.as_array().unwrap()[0];
+        assert_eq!(line["state"], Value::from("committing"));
+        assert_eq!(line["in_flight"], Value::Bool(true));
+        assert_eq!(line["doubtful"], Value::Bool(false));
+        let decided = call(
+            &api,
+            "outbox.decide",
+            json!({"id": id.0, "decision": "resend"}),
+        )
+        .await;
+        assert_eq!(decided["resolved"], Value::Bool(false));
+        assert_eq!(
+            store.outgoing(id).unwrap().unwrap().state,
+            mailcore::SendState::Committing,
+            "un envoi en cours a été tranché"
+        );
+
+        // Le remettant **mort** : le système rend son verrou, mais rien ne vide le nom — on le
+        // remet comme il l'aurait laissé. La même ligne redevient un doute — le critère 2.
+        drop(lock);
+        std::fs::write(root.join("outbox.sending"), id.0.to_string()).unwrap();
+        let listed = call(&api, "outbox.list", Value::Null).await;
+        let line = &listed.as_array().unwrap()[0];
+        assert_eq!(line["in_flight"], Value::Bool(false));
         assert_eq!(line["doubtful"], Value::Bool(true));
     }
 

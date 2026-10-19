@@ -240,6 +240,9 @@ pub struct Shell {
 
     /// L'hôte du démon, en mode distant : la clé du cache de lecture. `None` en embarqué.
     cache_host: Option<String>,
+    /// Le store et l.outil de cette machine, en mode embarqué : ce qui rend exécutable un geste
+    /// proposé par le service. Voir [`crate::gesture`].
+    local: Option<crate::gesture::Local>,
     /// Dernière écriture du cache. Sert à ne pas réécrire à chaque page.
     cache_saved: Option<Instant>,
     /// Vrai après une purge : **plus rien n'est écrit jusqu'au prochain lancement**.
@@ -444,6 +447,8 @@ pub struct Setup {
     pub cache_host: Option<String>,
     /// Ce que le cache de lecture avait gardé, s'il y en avait.
     pub seed: Option<crate::cache::Snapshot>,
+    /// Le store de cette machine, en mode embarqué — voir [`crate::gesture`].
+    pub local: Option<crate::gesture::Local>,
 }
 
 impl Shell {
@@ -455,6 +460,7 @@ impl Shell {
             bench,
             cache_host,
             seed,
+            local,
         } = setup;
 
         // Le fuseau se lit pendant que la fenêtre se crée : les premières lignes en ont besoin.
@@ -473,6 +479,7 @@ impl Shell {
             started,
             bench,
             cache_host,
+            local,
             cache_saved: None,
             cache_disabled: false,
             announced: false,
@@ -2574,6 +2581,10 @@ impl Shell {
                 // — une décision à prendre —, le rouge pour le refus, le gris pour l'attente.
                 let (state, color) = if line.doubtful {
                     ("ÉTAT INCERTAIN", theme::warn(ui.ctx()))
+                } else if line.in_flight {
+                    // `committing` pendant tout le transfert du corps, et pas douteuse pour
+                    // autant : son remettant est vivant. Voir `dto::Outgoing::in_flight`.
+                    ("ENVOI EN COURS", ui.visuals().weak_text_color())
                 } else {
                     match line.state.as_str() {
                         "queued" => ("EN ATTENTE", ui.visuals().weak_text_color()),
@@ -2944,7 +2955,12 @@ impl Shell {
                 let waiting = self
                     .outbox
                     .iter()
-                    .filter(|it| it.state == "queued" || it.state == "sending" || it.state == "failed")
+                    .filter(|it| {
+                        it.state == "queued"
+                            || it.state == "sending"
+                            || it.state == "failed"
+                            || it.in_flight
+                    })
                     .count();
                 let doubtful = self.outbox.iter().filter(|it| it.doubtful).count();
                 let running = self.jobs.iter().filter(|job| job.state == "running").count();
@@ -3028,7 +3044,7 @@ impl Shell {
         if self.results.is_some()
             && let Some(semantic) = &self.semantic
         {
-            semantic_banner(ui, semantic);
+            semantic_banner(ui, semantic, self.local.as_ref(), self.cache_host.is_some());
         }
         ui.separator();
 
@@ -4184,7 +4200,15 @@ fn cell_from_right(
 /// Rien quand elle a répondu : une ligne qui dirait « tout va bien » au-dessus de chaque recherche
 /// serait du bruit, et le bruit apprend à ne plus lire la ligne le jour où elle compte. La phrase
 /// et le geste viennent du démon ; cette fonction ne les compose pas, elle les montre.
-fn semantic_banner(ui: &mut egui::Ui, semantic: &dto::Semantic) {
+///
+/// Le geste est complété pour cette machine en mode embarqué — chemin de l'outil, `--store` —, et
+/// dit où se lancer en mode distant. Voir [`crate::gesture`].
+fn semantic_banner(
+    ui: &mut egui::Ui,
+    semantic: &dto::Semantic,
+    local: Option<&crate::gesture::Local>,
+    remote: bool,
+) {
     use dto::SemanticState as State;
     match semantic.state {
         State::Ready | State::Disabled => {}
@@ -4195,11 +4219,16 @@ fn semantic_banner(ui: &mut egui::Ui, semantic: &dto::Semantic) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(&semantic.sentence).color(ui.visuals().warn_fg_color));
                 if let Some(gesture) = &semantic.gesture {
+                    let gesture = crate::gesture::runnable(gesture, local);
                     ui.add(
-                        egui::Label::new(egui::RichText::new(gesture).monospace()).selectable(true),
+                        egui::Label::new(egui::RichText::new(&gesture).monospace())
+                            .selectable(true),
                     );
                     if ui.small_button("Copier").clicked() {
-                        ui.ctx().copy_text(gesture.clone());
+                        ui.ctx().copy_text(gesture);
+                    }
+                    if remote {
+                        ui.weak("— sur la machine du démon.");
                     }
                 }
             });
@@ -5254,7 +5283,13 @@ mod tests {
                     sentence: "Aucun modèle n'est installé.".to_owned(),
                     gesture,
                 };
-                egui::__run_test_ui(|ui| semantic_banner(ui, &semantic));
+                let here = crate::gesture::Local {
+                    store: camino::Utf8PathBuf::from(r"F:\store"),
+                    mail: None,
+                };
+                for (local, remote) in [(Some(&here), false), (None, true)] {
+                    egui::__run_test_ui(|ui| semantic_banner(ui, &semantic, local, remote));
+                }
             }
         }
         let mut row = dto::Row {

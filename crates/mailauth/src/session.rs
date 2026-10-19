@@ -172,11 +172,7 @@ pub fn store_oauth2(host: &str, username: &str, record: &Oauth2Record) -> Result
     entry(host, username)?
         .set_password(&record.to_json())
         .map_err(|source| Error::Unavailable(source.to_string()))?;
-    tracing::info!(
-        host,
-        username,
-        "jetons OAuth2 enregistrés dans le trousseau"
-    );
+    tracing::info!(host, "jetons OAuth2 enregistrés dans le trousseau");
     Ok(())
 }
 
@@ -211,7 +207,7 @@ pub fn load_oauth2(host: &str, username: &str) -> Result<Oauth2Record> {
 pub fn forget_oauth2(host: &str, username: &str) -> Result<()> {
     match entry(host, username)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {
-            tracing::info!(host, username, "jetons OAuth2 oubliés");
+            tracing::info!(host, "jetons OAuth2 oubliés");
             Ok(())
         }
         Err(source) => Err(Error::Unavailable(source.to_string())),
@@ -273,7 +269,7 @@ pub fn access_token(host: &str, username: &str, now: i64) -> Result<String> {
     )?;
     let access = apply_tokens(&mut record, response.status, &response.body, now)?;
     store_oauth2(host, username, &record)?;
-    tracing::info!(host, username, "jeton d'accès rafraîchi");
+    tracing::info!(host, "jeton d'accès rafraîchi");
     Ok(access)
 }
 

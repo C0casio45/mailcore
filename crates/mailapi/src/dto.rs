@@ -615,12 +615,20 @@ pub struct Outgoing {
     pub recipients: Vec<String>,
     /// `queued`, `sending`, `committing`, `sent` ou `failed`.
     pub state: String,
-    /// Vrai pour `committing` et pour rien d'autre.
+    /// Vrai pour `committing` et pour rien d'autre — sauf la ligne [`Self::in_flight`].
     ///
     /// **Le champ que l'interface doit traiter à part.** Un envoi douteux ne repartira pas tout
     /// seul, et l'utilisateur doit décider. Dérivé plutôt que déduit du libellé, pour qu'un
     /// client n'ait pas à connaître la liste des états pour reconnaître celui qui compte.
     pub doubtful: bool,
+    /// Vrai si un remettant vivant est en train de remettre cette ligne — `mailcore::Store::in_flight`.
+    ///
+    /// Une telle ligne est `committing` pendant tout le transfert de son corps, et elle n'est
+    /// **pas** douteuse : quelqu'un saura s'il est parti. Jusqu'au 2026-10-19, l'interface
+    /// affichait le doute et ses deux boutons à chaque envoi. `default` pour un service
+    /// antérieur au champ : faux, donc le doute — le côté sûr.
+    #[serde(default)]
+    pub in_flight: bool,
     /// Combien de tentatives ont eu lieu.
     pub attempts: u32,
     /// Secondes Unix de la mise en file.
@@ -648,15 +656,21 @@ pub struct Outgoing {
 }
 
 impl Outgoing {
-    /// Convertit une ligne du store, sans objet : voir [`Self::with_subject`].
+    /// Convertit une ligne du store, sans objet et hors remise : voir [`Self::with_subject`].
     #[must_use]
     pub fn new(it: &mailcore::Outgoing) -> Self {
-        Self::with_subject(it, None)
+        Self::with_subject(it, None, None)
     }
 
-    /// Convertit une ligne du store, avec l'objet que le service a lu dans son contenu.
+    /// Convertit une ligne du store, avec l'objet que le service a lu dans son contenu, et la
+    /// ligne en cours de remise — `mailcore::Store::in_flight`, lue une fois pour toute la file.
     #[must_use]
-    pub fn with_subject(it: &mailcore::Outgoing, subject: Option<String>) -> Self {
+    pub fn with_subject(
+        it: &mailcore::Outgoing,
+        subject: Option<String>,
+        in_flight: Option<mailcore::OutboxId>,
+    ) -> Self {
+        let in_flight = in_flight == Some(it.id);
         Self {
             subject,
             id: it.id.0,
@@ -664,7 +678,8 @@ impl Outgoing {
             sender: it.sender.clone(),
             recipients: it.recipients.clone(),
             state: it.state.as_str().to_owned(),
-            doubtful: it.state.is_doubtful(),
+            doubtful: it.state.is_doubtful() && !in_flight,
+            in_flight,
             attempts: it.attempts,
             queued_at: it.queued_at,
             last_error: it.last_error.clone(),

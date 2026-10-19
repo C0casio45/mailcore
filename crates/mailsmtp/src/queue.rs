@@ -198,7 +198,7 @@ pub fn deliver_one(
 ) -> Result<Outcome> {
     // **Un seul remettant à la fois**, tenu jusqu'au retour de cette fonction : la ligne est
     // relue, prise, remise et consignée sous le même verrou.
-    let _lock = store.lock_delivery().map_err(|source| Error::Unsendable {
+    let lock = store.lock_delivery().map_err(|source| Error::Unsendable {
         reason: format!("le verrou de remise n'a pas pu être pris : {source}"),
     })?;
     let fresh = store.outgoing(job.id).map_err(|source| Error::Unsendable {
@@ -256,6 +256,11 @@ pub fn deliver_one(
         );
         return Ok(Outcome::NoLongerDue);
     }
+    // **La ligne est à ce remettant, et il le dit.** Passé la frontière, elle est `committing`
+    // pendant tout le transfert du corps : sans ce nom, l'interface la montrait douteuse à
+    // chaque envoi. Le nom ne vaut que tant que le verrou est tenu, donc une mort en plein
+    // transfert laisse bien un doute — voir `Store::in_flight`.
+    lock.announce(job.id);
 
     let mut frontier_error = None;
     let outcome = {
@@ -274,9 +279,11 @@ pub fn deliver_one(
     match outcome {
         Ok(()) => {
             // **Inconditionnelle, et c'est voulu.** Pendant le transfert du corps, la ligne est
-            // `committing`, donc montrée comme douteuse, et l'utilisateur peut trancher. S'il a
-            // cliqué « Renvoyer », une écriture conditionnée à `committing` ne s'appliquerait
-            // pas : la ligne resterait en file, et le message — qui vient de partir — repartirait.
+            // `committing`. Depuis le 2026-10-19 elle est montrée « en cours » et `resolve_doubt` la
+            // refuse — mais seulement si le nom et le verrou se lisent : une lecture ratée penche
+            // vers le doute, et l'utilisateur peut alors trancher. S'il a cliqué « Renvoyer », une
+            // écriture conditionnée à `committing` ne s'appliquerait pas : la ligne resterait en
+            // file, et le message — qui vient de partir — repartirait.
             store
                 .record_attempt(job.id, SendState::Sent, now, None, None, false)
                 .map_err(|source| Error::Unsendable {
@@ -664,6 +671,59 @@ mod tests {
         assert_eq!(after.attempts, 1);
         assert_eq!(after.tried_at, Some(2_000));
         assert!(after.retry_after.is_none());
+    }
+
+    /// Un transport qui regarde la file pendant le transfert du corps, comme le ferait un écran.
+    struct Watching<'a> {
+        store: &'a Store,
+        /// Ce que la file disait, la frontière passée : la ligne en cours, et les douteuses.
+        seen: Option<(Option<OutboxId>, Vec<OutboxId>)>,
+    }
+
+    impl Transport for Watching<'_> {
+        fn deliver(
+            &mut self,
+            _job: &Outgoing,
+            _body: &mut dyn Read,
+            frontier: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            frontier()?;
+            let doubtful = self.store.doubtful().unwrap();
+            self.seen = Some((
+                self.store.in_flight().unwrap(),
+                doubtful.into_iter().map(|line| line.id).collect(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_line_whose_body_is_on_the_wire_is_shown_in_flight_not_doubtful() {
+        // **Le défaut du 2026-10-19** : la frontière franchie, la ligne est `committing` tout le
+        // temps du corps, et l'interface affichait « état incertain » à chaque envoi.
+        let (_dir, store, account, blob) = fixture();
+        let job = enqueue(&store, account, blob);
+        let mut transport = Watching {
+            store: &store,
+            seen: None,
+        };
+
+        assert_eq!(
+            deliver_one(&store, &mut transport, &job, 2_000).unwrap(),
+            Outcome::Sent
+        );
+        let (moving, doubtful) = transport.seen.unwrap();
+        assert_eq!(
+            moving,
+            Some(job.id),
+            "la remise n'a pas dit quelle ligne elle tenait"
+        );
+        assert!(
+            doubtful.is_empty(),
+            "la ligne en cours a été comptée douteuse"
+        );
+        // Et la remise finie, plus rien n'est en cours.
+        assert_eq!(store.in_flight().unwrap(), None);
     }
 
     #[test]

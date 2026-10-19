@@ -572,7 +572,15 @@ pub fn decide(root: Option<&Utf8PathBuf>, id: i64, decision: &str) -> Result<()>
 
     if !store.resolve_doubt(target, choice)? {
         // Le message dit **pourquoi** : « refusé » sans raison ferait chercher au mauvais
-        // endroit. L'état actuel est l'information utile.
+        // endroit. L'état actuel est l'information utile — sauf pour une ligne en cours de
+        // remise, qui est `committing` sans être douteuse : son état seul ferait croire à un
+        // refus absurde.
+        if store.in_flight_or_none() == Some(target) {
+            bail!(
+                "le message #{id} est en train de partir : il n'y a rien à trancher. \
+                 `mail outbox` dira comment l'envoi s'est terminé."
+            );
+        }
         let state = store.outgoing(target)?.map_or_else(
             || "inexistant".to_owned(),
             |it| it.state.as_str().to_owned(),

@@ -59,6 +59,11 @@ d'envoi expédie un message à quelqu'un. Les critères 1, 2 et 8 de `docs/PHASE
   `outbox.id` est en `AUTOINCREMENT` depuis `SCHEMA_V16` — SQLite redonnait le numéro du dernier
   envoi annulé, et la relecture trouvait un autre message, qu'elle envoyait avec le compte du
   premier. La leçon du carnet sur les `rowid`, qui n'avait été appliquée qu'aux messages.
+  Et **`committing` ne veut pas dire « douteux » tant que son remettant vit** : la ligne y passe
+  avant le corps, donc pendant tout le transfert. Ce qui distingue les deux est le verrou, jamais
+  une colonne — une colonne resterait vraie après la mort du remettant. `Store::in_flight` lit le
+  nom que le détenteur écrit dans `outbox.sending` **et** contrôle que le verrou est tenu ; il
+  décide de l'affichage et d'un refus de trancher, **jamais** d'une remise.
 
 Et une leçon sur les types qui portent un secret : `#[derive(Debug)]` y est le **défaut
 dangereux**. Il affichait le mot de passe dans `Credential`, des deux côtés. Les deux ont

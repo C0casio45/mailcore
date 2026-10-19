@@ -5,6 +5,9 @@
 //! ├── blobs/<aa>/<bb>/<hash>   message RFC 5322 brut, compressé zstd
 //! ├── index.sqlite             métadonnées, références, fils, comptes
 //! ├── search/                  index tantivy
+//! ├── outbox.lock              verrou de remise — voir `outbox::DeliveryLock`
+//! ├── outbox.sending           la ligne que le détenteur du verrou remet — voir
+//! │                            `Store::in_flight`
 //! └── tmp/                     temporaires d'écriture, même volume que blobs/
 //! ```
 //!

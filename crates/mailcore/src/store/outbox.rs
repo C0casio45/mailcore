@@ -138,7 +138,7 @@ impl Store {
     ///
     /// [`crate::Error::Io`] si le fichier de verrou n'est pas ouvrable ou verrouillable.
     pub fn lock_delivery(&self) -> Result<DeliveryLock> {
-        let path = self.root.join("outbox.lock");
+        let path = self.root.join(DELIVERY_LOCK);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -149,17 +149,107 @@ impl Store {
                 source,
             })?;
         match file.try_lock() {
-            Ok(()) => return Ok(DeliveryLock { _file: file }),
+            Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                tracing::info!("un autre remettant tient la file : attente de son tour");
+                tracing::info!("verrou de remise occupé : attente de son tour");
+                file.lock()
+                    .map_err(|source| crate::Error::Io { path, source })?;
             }
             Err(std::fs::TryLockError::Error(source)) => {
                 return Err(crate::Error::Io { path, source });
             }
         }
-        file.lock()
-            .map_err(|source| crate::Error::Io { path, source })?;
-        Ok(DeliveryLock { _file: file })
+        let lock = DeliveryLock {
+            _file: file,
+            marker: self.root.join(IN_FLIGHT),
+        };
+        // **Ce qu'un remettant mort a laissé s'efface ici**, avant toute remise : sous le verrou,
+        // la ligne que nomme le fichier n'est plus celle de personne. Voir [`Store::in_flight`].
+        lock.write_marker("");
+        Ok(lock)
+    }
+
+    /// La ligne qu'un remettant **vivant** est en train de remettre, s'il y en a une.
+    ///
+    /// ## Pourquoi, depuis le 2026-10-19
+    ///
+    /// La frontière du doute est franchie **avant** le corps — c'est le critère 2 : une coupure
+    /// pendant le transfert doit laisser un doute, pas une ligne remettable. Mais pendant tout ce
+    /// transfert, des dizaines de secondes pour une pièce jointe, la ligne était donc
+    /// `committing`, et l'interface l'affichait comme **douteuse** : « état incertain », et les
+    /// deux boutons du doute, sur un envoi qui se passait normalement. Un avertissement qui
+    /// s'affiche à chaque envoi finit par ne plus être lu — y compris le jour où il compte.
+    ///
+    /// L'état ne peut pas porter la différence : un remettant qui meurt ne réécrit rien, et sa
+    /// ligne doit **alors** devenir douteuse sans que personne n'y touche. Ce qui le peut est le
+    /// verrou de remise, que le système rend à la mort du processus. Le remettant écrit le
+    /// numéro de sa ligne dans `outbox.sending` ([`DeliveryLock::announce`]) ; la ligne est en
+    /// cours si ce fichier la nomme **et** que le verrou est tenu.
+    ///
+    /// ## Les deux lectures du fichier
+    ///
+    /// Le fichier est lu avant et après le contrôle du verrou, et les deux lectures doivent
+    /// s'accorder. Sans la seconde, un remettant qui finit la ligne lue pendant qu'un autre prend
+    /// le verrou pour la suivante ferait passer la première pour en cours alors qu'elle vient
+    /// peut-être de tomber en doute.
+    ///
+    /// Ce qui reste, et qui est borné : un remettant **tué** laisse le fichier derrière lui ; le
+    /// suivant l'efface sitôt le verrou pris ([`Store::lock_delivery`]). Entre les deux appels
+    /// système, une lecture peut voir la ligne du mort comme en cours — le temps d'un
+    /// rafraîchissement d'écran, et seulement après une mort.
+    ///
+    /// ## Ce que la réponse décide
+    ///
+    /// L'affichage, et un refus : [`Store::resolve_doubt`] ne tranche pas une ligne en cours,
+    /// et [`Store::doubtful`] ne la compte pas. Elle ne décide **jamais** d'une remise — la règle
+    /// du critère 2 reste sur l'état, dans `Store::deliverable`.
+    ///
+    /// Le contrôle prend le verrou **en partage** un instant s'il est libre : un remettant qui
+    /// arrive à ce moment attend quelques microsecondes, et deux lecteurs ne se gênent pas.
+    ///
+    /// **Ce n'est pas une notification.** Un remettant qui meurt ne réécrit rien dans SQLite ;
+    /// c'est `Mailbox::revision` qui porte ce terme, pour que les clients relisent la file.
+    ///
+    /// Sur un système de fichiers où `flock` est émulé par `fcntl` — certains montages réseau —,
+    /// fermer la poignée de lecture rendrait aussi le verrou d'un remettant **du même processus**.
+    /// Le verrou de remise avait déjà cette limite : un store ne vit pas sur un montage réseau.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Io`] si le fichier ou le verrou ne se lisent pas. Un appelant qui affiche
+    /// doit alors pencher du côté du doute : le montrer à tort coûte un regard, le cacher à tort
+    /// peut coûter un message.
+    pub fn in_flight(&self) -> Result<Option<OutboxId>> {
+        let marker = self.root.join(IN_FLIGHT);
+        named_while_held(|| read_marker(&marker), || self.delivery_held())
+    }
+
+    /// Vrai si un remettant tient le verrou de remise, sans l'attendre.
+    ///
+    /// **Un verrou partagé, rendu aussitôt.** Exclusif, deux lecteurs simultanés — la coquille
+    /// et `mail doctor` — se voyaient l'un l'autre comme un remettant, et le nom d'un mort passait
+    /// pour en cours. Partagé, il ne heurte que le verrou exclusif d'un remettant. Et il est
+    /// rendu par `unlock` avant la fermeture : sous Windows, un verrou rendu par la seule
+    /// fermeture de la poignée l'est « selon les ressources disponibles ».
+    fn delivery_held(&self) -> Result<bool> {
+        let path = self.root.join(DELIVERY_LOCK);
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .open(path.as_std_path())
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(crate::Error::Io { path, source }),
+        };
+        match file.try_lock_shared() {
+            Ok(()) => {
+                file.unlock()
+                    .map_err(|source| crate::Error::Io { path, source })?;
+                Ok(false)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+            Err(std::fs::TryLockError::Error(source)) => Err(crate::Error::Io { path, source }),
+        }
     }
 
     /// Prend une ligne pour la remettre : `sending`, **si elle est encore dans l'état `seen`**.
@@ -478,6 +568,11 @@ impl Store {
     /// C'est ce que l'interface doit montrer, et ce que la boucle de remise doit ignorer. Deux
     /// lecteurs, une seule vérité.
     ///
+    /// La ligne qu'un remettant vivant est en train de remettre n'en fait pas partie : elle est
+    /// `committing` pendant tout le transfert de son corps, et quelqu'un sait où elle en est —
+    /// voir [`Store::in_flight`]. Si cette question échoue, la ligne est gardée : on penche du
+    /// côté du doute.
+    ///
     /// # Errors
     ///
     /// Comme [`Store::deliverable`].
@@ -491,7 +586,20 @@ impl Store {
               ORDER BY id",
         )?;
         let rows = statement.query_map([], row_to_outgoing)?;
-        collect(rows)
+        let mut lines = collect(rows)?;
+        if let Some(moving) = self.in_flight_or_none() {
+            lines.retain(|line| line.id != moving);
+        }
+        Ok(lines)
+    }
+
+    /// [`Store::in_flight`], une erreur valant « aucune » — donc le doute. Pour les appelants
+    /// qui affichent ou refusent, jamais pour ceux qui remettent.
+    pub fn in_flight_or_none(&self) -> Option<OutboxId> {
+        self.in_flight().unwrap_or_else(|source| {
+            tracing::warn!(%source, "remise en cours illisible : la ligne est montrée douteuse");
+            None
+        })
     }
 
     /// Une ligne de la file, par identifiant.
@@ -589,6 +697,75 @@ impl Store {
 #[derive(Debug)]
 pub struct DeliveryLock {
     _file: std::fs::File,
+    /// `outbox.sending` : la ligne que ce remettant remet. Voir [`Store::in_flight`].
+    marker: camino::Utf8PathBuf,
+}
+
+/// Le fichier du verrou de remise, à la racine du store.
+const DELIVERY_LOCK: &str = "outbox.lock";
+
+/// Le fichier qui nomme la ligne en cours de remise, à la racine du store.
+const IN_FLIGHT: &str = "outbox.sending";
+
+impl DeliveryLock {
+    /// Dit quelle ligne ce remettant est en train de remettre, jusqu'à ce qu'il lâche le
+    /// verrou. Voir [`Store::in_flight`].
+    ///
+    /// Une écriture ratée n'arrête pas la remise : elle ne sert qu'à l'affichage. D'ordinaire la
+    /// ligne est alors montrée douteuse pendant son transfert — ce qu'elle était avant le
+    /// 2026-10-19. Le cas qui échappe : si l'effacement à la prise **et** l'annonce ratent tous
+    /// deux, le nom d'un remettant mort survit sous un verrou vivant, et la ligne du mort passe
+    /// pour en cours le temps de cette remise. Le journal le dit, en avertissement.
+    pub fn announce(&self, id: OutboxId) {
+        self.write_marker(&id.0.to_string());
+    }
+
+    fn write_marker(&self, text: &str) {
+        if let Err(source) = std::fs::write(self.marker.as_std_path(), text) {
+            tracing::warn!(
+                %source,
+                path = %self.marker,
+                "ligne en cours de remise non signalée : elle sera montrée douteuse"
+            );
+        }
+    }
+}
+
+impl Drop for DeliveryLock {
+    /// Le fichier est vidé **avant** que le verrou ne soit rendu — les champs tombent après ce
+    /// corps : aucun instant où le verrou passerait à un autre avec ce nom encore écrit.
+    fn drop(&mut self) {
+        self.write_marker("");
+    }
+}
+
+/// La règle de [`Store::in_flight`], séparée des fichiers pour que sa course se teste : le nom,
+/// le verrou, puis le nom encore — les deux lectures doivent s'accorder.
+fn named_while_held(
+    mut named: impl FnMut() -> Result<Option<OutboxId>>,
+    held: impl FnOnce() -> Result<bool>,
+) -> Result<Option<OutboxId>> {
+    let Some(first) = named()? else {
+        return Ok(None);
+    };
+    // Libre : personne ne remet, et le nom est le reste d'un mort.
+    if !held()? {
+        return Ok(None);
+    }
+    Ok((named()? == Some(first)).then_some(first))
+}
+
+/// La ligne que nomme `outbox.sending` : `None` s'il est absent, vide ou illisible comme
+/// nombre — un fichier coupé au milieu d'une écriture se lit vide.
+fn read_marker(path: &camino::Utf8Path) -> Result<Option<OutboxId>> {
+    match std::fs::read_to_string(path.as_std_path()) {
+        Ok(text) => Ok(text.trim().parse().ok().map(OutboxId)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(crate::Error::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 /// Ce que l'utilisateur décide d'un message douteux.
@@ -652,7 +829,7 @@ impl Store {
     /// # Errors
     ///
     /// [`crate::Error::Sqlite`] si l'écriture échoue. Rend `false` — et n'écrit rien — si la
-    /// ligne n'existe pas ou n'est pas douteuse.
+    /// ligne n'existe pas, n'est pas douteuse, ou est en train de partir.
     ///
     /// ## Pas d'horodatage de la décision
     ///
@@ -668,6 +845,16 @@ impl Store {
                 job = id.0,
                 state = line.state.as_str(),
                 "décision refusée : ce message n'est pas douteux"
+            );
+            return Ok(false);
+        }
+        // **Une ligne en cours de remise n'est pas douteuse** : son remettant est vivant, et il
+        // saura s'il est parti. Trancher à sa place, sur un bouton resté affiché d'un écran
+        // ancien, serait parier là où il suffit d'attendre. Voir [`Store::in_flight`].
+        if self.in_flight_or_none() == Some(id) {
+            tracing::warn!(
+                job = id.0,
+                "décision refusée : ce message est en train de partir"
             );
             return Ok(false);
         }
@@ -1069,6 +1256,149 @@ mod tests {
             "le verrou relâché n'est jamais passé à l'autre connexion"
         );
         waiter.join().unwrap();
+    }
+
+    /// Une ligne prise et passée la frontière, comme la remise le fait.
+    fn in_transfer(store: &Store, id: OutboxId) {
+        assert!(store.claim_outgoing(id, SendState::Queued).unwrap());
+        assert!(store.cross_frontier(id).unwrap());
+    }
+
+    #[test]
+    fn a_line_whose_body_is_being_sent_is_in_flight_not_doubtful() {
+        // **Le défaut du 2026-10-19.** Pendant le transfert du corps, la ligne est `committing`
+        // et l'interface la montrait douteuse, boutons du doute compris.
+        let (dir, store, account) = store();
+        let id = queued(&store, account);
+        let lock = store.lock_delivery().unwrap();
+        in_transfer(&store, id);
+        lock.announce(id);
+
+        assert_eq!(store.in_flight().unwrap(), Some(id));
+        assert!(
+            store.doubtful().unwrap().is_empty(),
+            "une ligne en cours de transfert est comptée douteuse"
+        );
+        assert!(
+            !store.resolve_doubt(id, Decision::Resend).unwrap(),
+            "un doute a été tranché sur une ligne en train de partir"
+        );
+        assert_eq!(
+            store.outgoing(id).unwrap().unwrap().state,
+            SendState::Committing
+        );
+
+        // Le verrou lâché proprement ne laisse pas de nom derrière lui : sans ça, la seconde
+        // lecture de `in_flight` ne protégerait de rien.
+        drop(lock);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(IN_FLIGHT)).unwrap(),
+            ""
+        );
+
+        // Le contrôle inverse, celui du critère 2 : un remettant **mort** ne vide pas le nom —
+        // on le remet comme il l'aurait laissé —, mais le système rend son verrou. La ligne
+        // devient douteuse sans que personne n'y touche.
+        std::fs::write(dir.path().join(IN_FLIGHT), id.0.to_string()).unwrap();
+        assert_eq!(store.in_flight().unwrap(), None);
+        assert_eq!(store.doubtful().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_name_without_the_lock_is_not_in_flight() {
+        // Le reste d'un remettant tué : il ne vide pas `outbox.sending`, mais le système rend
+        // son verrou. C'est le verrou qui décide, pas le fichier.
+        let (dir, store, account) = store();
+        let id = queued(&store, account);
+        in_transfer(&store, id);
+        // Le fichier de verrou existe, comme après toute remise passée.
+        drop(store.lock_delivery().unwrap());
+        std::fs::write(dir.path().join(IN_FLIGHT), id.0.to_string()).unwrap();
+
+        assert_eq!(store.in_flight().unwrap(), None);
+        assert_eq!(
+            store.doubtful().unwrap().len(),
+            1,
+            "le nom laissé par un mort a caché un doute"
+        );
+        assert!(store.resolve_doubt(id, Decision::Accept).unwrap());
+    }
+
+    #[test]
+    fn another_reader_checking_the_lock_is_not_taken_for_a_deliverer() {
+        // **Trouvé par la relecture du 2026-10-19.** Le contrôle prenait le verrou en exclusif :
+        // un second lecteur au même instant — la coquille et `mail doctor` — voyait le premier
+        // comme un remettant, et le nom d'un mort passait pour en cours.
+        let (dir, store, account) = store();
+        let id = queued(&store, account);
+        in_transfer(&store, id);
+        drop(store.lock_delivery().unwrap());
+        std::fs::write(dir.path().join(IN_FLIGHT), id.0.to_string()).unwrap();
+
+        // L'autre lecteur, au milieu de son contrôle.
+        let other = std::fs::File::open(dir.path().join(DELIVERY_LOCK)).unwrap();
+        other.lock_shared().unwrap();
+        assert_eq!(
+            store.in_flight().unwrap(),
+            None,
+            "un lecteur a été pris pour un remettant"
+        );
+        assert_eq!(store.doubtful().unwrap().len(), 1);
+        other.unlock().unwrap();
+    }
+
+    #[test]
+    fn the_lock_held_for_another_line_does_not_hide_an_older_doubt() {
+        // Un vieux doute, et le facteur qui remet une autre ligne : le verrou est tenu, mais
+        // pas pour celle-là.
+        let (_dir, store, account) = store();
+        let old = queued(&store, account);
+        in_transfer(&store, old);
+        let new = queued(&store, account);
+        let lock = store.lock_delivery().unwrap();
+        in_transfer(&store, new);
+        lock.announce(new);
+
+        let doubtful: Vec<_> = store
+            .doubtful()
+            .unwrap()
+            .into_iter()
+            .map(|line| line.id)
+            .collect();
+        assert_eq!(doubtful, vec![old]);
+        drop(lock);
+    }
+
+    #[test]
+    fn a_line_finished_while_the_next_one_takes_the_lock_is_not_in_flight() {
+        // La course de la seconde lecture : le nom lu est celui d'une remise qui finit, et le
+        // verrou, contrôlé juste après, est déjà celui de la suivante. Sans la seconde lecture,
+        // la première ligne — tombée en doute, peut-être — passerait pour en cours.
+        let (finished, next) = (OutboxId(1), OutboxId(2));
+        let mut reads = [Some(finished), Some(next)].into_iter();
+        let seen = named_while_held(|| Ok(reads.next().flatten()), || Ok(true)).unwrap();
+        assert_eq!(seen, None);
+
+        // Les contrôles : un nom stable sous un verrou tenu est en cours ; sans verrou, non.
+        let seen = named_while_held(|| Ok(Some(next)), || Ok(true)).unwrap();
+        assert_eq!(seen, Some(next));
+        let seen = named_while_held(|| Ok(Some(next)), || Ok(false)).unwrap();
+        assert_eq!(seen, None);
+    }
+
+    #[test]
+    fn a_new_holder_wipes_the_name_a_dead_one_left() {
+        // Sans l'effacement à la prise, la ligne du mort passerait pour en cours pendant toute
+        // la remise suivante — le verrou serait tenu, et le nom toujours écrit.
+        let (dir, store, account) = store();
+        let id = queued(&store, account);
+        in_transfer(&store, id);
+        std::fs::write(dir.path().join(IN_FLIGHT), id.0.to_string()).unwrap();
+
+        let lock = store.lock_delivery().unwrap();
+        assert_eq!(store.in_flight().unwrap(), None);
+        assert_eq!(store.doubtful().unwrap().len(), 1);
+        drop(lock);
     }
 
     #[test]
