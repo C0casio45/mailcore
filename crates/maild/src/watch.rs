@@ -12,6 +12,14 @@
 //! d'échouer en silence relatif — un compte dont le veilleur est tombé se synchronise encore à
 //! l'échéance.
 //!
+//! ## Chaque connexion commence par une synchronisation
+//!
+//! `IDLE` dit ce qui arrive **pendant** qu'on écoute, jamais ce qui est arrivé avant. Au
+//! lancement, et après chaque reconnexion, le veilleur met donc une synchronisation en file
+//! avant de se mettre en attente — une seule. Jusqu'au 2026-10-20, il ne le faisait pas : le
+//! courrier reçu application fermée attendait l'échéance, et une session de moins de
+//! vingt-quatre minutes ne le voyait jamais.
+//!
 //! ## Un dossier, pas quatre-vingts
 //!
 //! `IDLE` ne rapporte que la **boîte sélectionnée**. Surveiller les 80 dossiers du corpus
@@ -304,6 +312,13 @@ where
     let idle = client.has("IDLE");
     tracing::info!(compte = account, idle, "veille en place");
 
+    // **Une connexion commence par rattraper.** `IDLE` n'annonce que ce qui arrive pendant
+    // qu'on écoute : le courrier reçu application fermée, ou pendant une coupure, n'est annoncé
+    // par personne. Sans cette ligne, il attendait l'échéance — vingt-quatre minutes — ou une
+    // arrivée suivante ; le store du quotidien n'avait reçu que cinq messages en une semaine.
+    // Une seule fois par connexion, jamais par tranche, et `trigger` ne double pas un job vivant.
+    trigger(account, jobs);
+
     if !idle {
         // **La connexion est rendue.** Sans `IDLE` il n'y a rien à écouter, et la garder
         // ouverte pour ne jamais la lire prendrait une des quelques connexions simultanées que
@@ -576,19 +591,24 @@ mod loop_tests {
         client
     }
 
-    /// Attend qu'un job de synchronisation apparaisse, ou rend faux au bout de `patience`.
+    /// Combien de synchronisations le registre a vu passer, finies comprises.
+    fn syncs(jobs: &Jobs) -> usize {
+        jobs.list()
+            .iter()
+            .filter(|it| matches!(it.kind, Kind::Sync { .. }))
+            .count()
+    }
+
+    /// Attend qu'il y ait eu au moins `wanted` synchronisations, ou rend faux au bout de
+    /// `patience`.
     ///
     /// Sonde le registre plutôt que d'attendre une durée fixe : le veilleur passe par un
     /// aller-retour réseau et par un `EXAMINE` avant de pouvoir annoncer quoi que ce soit, et
     /// une attente fixe serait soit trop courte sur une machine lente, soit du temps perdu.
-    fn wait_for_sync(jobs: &Jobs, patience: Duration) -> bool {
+    fn wait_for_syncs(jobs: &Jobs, wanted: usize, patience: Duration) -> bool {
         let deadline = Instant::now() + patience;
         while Instant::now() < deadline {
-            if jobs
-                .list()
-                .iter()
-                .any(|it| matches!(it.kind, Kind::Sync { .. }))
-            {
+            if syncs(jobs) >= wanted {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -597,9 +617,40 @@ mod loop_tests {
     }
 
     #[test]
+    fn a_connection_catches_up_before_it_listens() {
+        // Le courrier reçu application fermée : personne ne l'annonce, et il attendait
+        // l'échéance, vingt-quatre minutes. Un serveur muet doit donc recevoir une
+        // synchronisation dès la connexion — et une seule, voir `a_quiet_server_…`.
+        let server =
+            Server::start(Config::with_inbox().with_fault(Fault::IdleStaysSilent)).unwrap();
+        let (_dir, jobs) = jobs();
+        let mut client = connect(&server);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let watcher_stop = Arc::clone(&stop);
+        let watcher_jobs = jobs.clone();
+        let watcher =
+            std::thread::spawn(move || watch_over(&mut client, 7, &watcher_jobs, &watcher_stop));
+
+        let caught_up = wait_for_syncs(&jobs, 1, Duration::from_secs(10));
+        stop.store(true, Ordering::Relaxed);
+        drop(watcher.join());
+
+        assert!(caught_up, "aucune synchronisation à la connexion");
+        assert!(
+            jobs.list()
+                .iter()
+                .any(|it| matches!(it.kind, Kind::Sync { account: Some(7) })),
+            "le rattrapage ne vise pas le compte du veilleur : {:?}",
+            jobs.list()
+        );
+    }
+
+    #[test]
     fn an_announced_arrival_queues_a_synchronisation() {
         // **Le test qui compte.** C'est la raison d'être du module : le serveur dit qu'il s'est
-        // passé quelque chose, et une synchronisation part.
+        // passé quelque chose, et une synchronisation part. Elle vient **après** celle de la
+        // connexion : en attendre une seule ne prouverait plus rien, le rattrapage la donne.
         let server = Server::start(Config::with_inbox().announcing_on_idle("* 4 EXISTS")).unwrap();
         let (_dir, jobs) = jobs();
         let mut client = connect(&server);
@@ -611,7 +662,7 @@ mod loop_tests {
             std::thread::spawn(move || watch_over(&mut client, 7, &watcher_jobs, &watcher_stop));
 
         assert!(
-            wait_for_sync(&jobs, Duration::from_secs(10)),
+            wait_for_syncs(&jobs, 2, Duration::from_secs(10)),
             "aucune synchronisation mise en file après une arrivée annoncée"
         );
         stop.store(true, Ordering::Relaxed);
@@ -628,9 +679,10 @@ mod loop_tests {
 
     #[test]
     fn a_quiet_server_queues_nothing() {
-        // L'autre moitié : un serveur qui se tait ne doit **rien** déclencher avant l'échéance,
-        // qui est à vingt-quatre minutes. Un veilleur qui synchroniserait par acquit de
-        // conscience à chaque tranche de cinq secondes serait pire que pas de veilleur du tout.
+        // L'autre moitié : un serveur qui se tait ne doit rien déclencher **de plus** que le
+        // rattrapage de la connexion avant l'échéance, qui est à vingt-quatre minutes. Un
+        // veilleur qui synchroniserait par acquit de conscience à chaque tranche de cinq
+        // secondes serait pire que pas de veilleur du tout.
         let server =
             Server::start(Config::with_inbox().with_fault(Fault::IdleStaysSilent)).unwrap();
         let (_dir, jobs) = jobs();
@@ -643,8 +695,9 @@ mod loop_tests {
             std::thread::spawn(move || watch_over(&mut client, 7, &watcher_jobs, &watcher_stop));
 
         assert!(
-            !wait_for_sync(&jobs, Duration::from_secs(2)),
-            "une synchronisation a été mise en file alors que le serveur n'a rien dit"
+            !wait_for_syncs(&jobs, 2, Duration::from_secs(2)),
+            "une synchronisation a été mise en file alors que le serveur n'a rien dit : {:?}",
+            jobs.list()
         );
         stop.store(true, Ordering::Relaxed);
         drop(watcher.join());
@@ -681,8 +734,8 @@ mod loop_tests {
 
     #[test]
     fn a_server_without_idle_queues_nothing_before_the_deadline() {
-        // Sans `IDLE`, le veilleur rend sa connexion et attend l'échéance. Rien ne doit partir
-        // avant — et surtout, il doit rester arrêtable pendant cette attente.
+        // Sans `IDLE`, le veilleur rattrape, rend sa connexion et attend l'échéance. Rien d'autre
+        // ne doit partir avant — et surtout, il doit rester arrêtable pendant cette attente.
         let server = Server::start(Config::with_inbox().without_idle()).unwrap();
         let (_dir, jobs) = jobs();
         let mut client = connect(&server);
@@ -694,8 +747,13 @@ mod loop_tests {
             std::thread::spawn(move || watch_over(&mut client, 7, &watcher_jobs, &watcher_stop));
 
         assert!(
-            !wait_for_sync(&jobs, Duration::from_millis(600)),
-            "une synchronisation est partie avant l'échéance"
+            wait_for_syncs(&jobs, 1, Duration::from_secs(10)),
+            "le chemin sans IDLE ne rattrape pas à la connexion"
+        );
+        assert!(
+            !wait_for_syncs(&jobs, 2, Duration::from_millis(600)),
+            "une synchronisation est partie avant l'échéance : {:?}",
+            jobs.list()
         );
         let asked = Instant::now();
         stop.store(true, Ordering::Relaxed);
@@ -725,7 +783,9 @@ mod courtesy_tests {
     #[test]
     fn a_courtesy_line_does_not_queue_a_synchronisation() {
         // Le serveur dit `* OK Still here` dès la mise en attente, et rien d'autre. Le veilleur
-        // ne doit **rien** déclencher : c'est de la politesse, pas du courrier.
+        // ne doit rien déclencher **de plus** que le rattrapage de la connexion : c'est de la
+        // politesse, pas du courrier. Le serveur la répète à chaque `IDLE`, donc une ligne prise
+        // pour une arrivée donnerait une synchronisation par seconde — deux au moins ici.
         let server =
             Server::start(Config::with_inbox().announcing_on_idle("* OK Still here")).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -751,8 +811,12 @@ mod courtesy_tests {
         stop.store(true, Ordering::Relaxed);
         drop(watcher.join());
 
+        let syncs = queued
+            .iter()
+            .filter(|it| matches!(it.kind, Kind::Sync { .. }))
+            .count();
         assert!(
-            !queued.iter().any(|it| matches!(it.kind, Kind::Sync { .. })),
+            syncs <= 1,
             "une ligne de courtoisie a déclenché une synchronisation : {queued:?}"
         );
     }

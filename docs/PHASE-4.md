@@ -3919,3 +3919,46 @@ Un choix assumé, signalé par la même relecture : au-delà de 64 messages, un 
 qu'on cherche attend cinq minutes après la dernière recherche, là où il était confié en quelques
 secondes. C'est le prix de ne pas tourner en priorité normale à côté des recherches ; quelqu'un
 qui chercherait sans arrêt pendant des heures repousserait d'autant le rattrapage.
+
+### 2026-10-20 — un lancement de quatre secondes, et le courrier qui n'arrivait pas
+
+**En clair d'abord.** L'application mettait quatre secondes à afficher sa première image sur le
+store du quotidien. Le journal de la coquille, écrit la veille, l'a dit en une ligne : 249 ms
+pour la fenêtre, puis 4 244 ms pour ouvrir la boîte. La cause est l'index de la recherche par
+mots, encore en **149 morceaux** — 901 fichiers, 189 Mio — que le système relit et fait scanner
+à froid. La correction des fusions du 2026-10-18 devait les recoller « à la première arrivée ».
+Il n'y en a eu aucune : **l'application ne relevait pas le courrier au lancement**. Le veilleur
+`IDLE` n'entend que ce qui arrive pendant qu'il écoute ; ce qui était arrivé application fermée
+attendait l'échéance, vingt-quatre minutes, ou une arrivée suivante. Le store du quotidien
+n'avait reçu que cinq messages en une semaine.
+
+**Mesuré sur une copie** de l'index et de la base, hors du store de production, par une sonde qui
+chronomètre `Mailbox::open` morceau par morceau. Trois exécutions, la première jetée ; la charge
+de fond était de 21 à 26 %, son niveau ordinaire :
+
+| | 149 segments | après fusion |
+|---|---|---|
+| fichiers de l'index | 901, 189 Mio | 7, 84 Mio |
+| ouverture SQLite | 3,1 à 3,9 ms | 2,6 à 2,9 ms |
+| montage du chercheur | 83,9 à 85,1 ms | 0,9 ms |
+| `Mailbox::open`, à chaud | 83,2 à 96,2 ms | 4,6 ms |
+
+La fusion des 149 segments a pris 3,4 s sur la copie. Les quatre secondes du lancement sont le
+même travail **à froid** — fichiers hors du cache, antivirus — et sa part se lira dans le journal
+du prochain lancement : le chiffre à froid n'est pas reproductible à la demande.
+
+**La correction** est dans le veilleur, pas dans l'index. Chaque connexion — au lancement, et
+après chaque reconnexion, qui perd elle aussi ce qui est arrivé pendant la coupure — met une
+synchronisation en file **avant** de se mettre à l'écoute. Une seule : `trigger` ne double pas
+un job vivant. La première, sur le store du quotidien, indexera ce qui manque, et la fusion de
+l'arriéré suivra — une quinzaine de secondes de fond une fois, mesurées le 2026-10-18.
+
+**Un test verrouillait plus que sa raison.** `a_quiet_server_queues_nothing` interdisait toute
+synchronisation sans annonce, au motif qu'un veilleur qui synchroniserait « à chaque tranche de
+cinq secondes » serait pire que rien. Le motif couvrait les tranches, pas la connexion. Le test
+admet maintenant le rattrapage et rien de plus, et un test neuf exige le rattrapage. Contrôles
+négatifs : sans le rattrapage, le test neuf et celui du serveur sans `IDLE` tombent ; avec une
+ligne de courtoisie lue comme une arrivée, le test de courtoisie tombe encore — passer de « zéro »
+à « au plus une » ne l'a pas désarmé. Une synchronisation **par tranche**, elle, n'est pas
+attrapable par ces tests, dont la fenêtre de deux secondes est plus courte qu'une tranche ; c'était
+déjà vrai avant.
