@@ -121,6 +121,7 @@ pub fn check(
             blob: row.blob,
             subject: row.subject.clone(),
             from_name: row.from_name.clone(),
+            attach_rev: row.attach_rev,
         };
         let text = match mailvec::pass::compose(&store, &row, budget)? {
             Composed::Missing | Composed::Unreadable => {

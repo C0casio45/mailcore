@@ -1244,16 +1244,32 @@ impl Shell {
         ctx.request_repaint_after(JOBS_POLL);
     }
 
+    /// Le mot de l'insigne « Activité » pendant un rattrapage : ce qui travaille, PDF d'abord —
+    /// c'est la lecture des PDF qui passe avant chaque passage des vecteurs.
+    fn background_label(&self) -> &'static str {
+        let reading = self
+            .background
+            .as_ref()
+            .and_then(|said| said.attachments.as_ref())
+            .is_some_and(|pdf| pdf.state == dto::AttachmentsState::Working);
+        if reading { "PDF" } else { "sens" }
+    }
+
     /// Vrai pendant que la passe de fond rattrape du courrier : la relève continue jusqu'à ce
     /// qu'elle ait fini, sans quoi le compte affiché resterait celui du démarrage.
     fn catching_up(&self) -> bool {
         // Un démon qui ne sait pas répondre ne dira jamais que c'est fini : l'état de `hello`
         // resterait « en cours » toute la session, relevé toutes les 500 ms.
+        // La lecture des PDF joints est faite par la même passe : un rattrapage de PDF se relève
+        // comme un rattrapage de vecteurs.
         !self.background_unsupported
-            && self
-                .background
-                .as_ref()
-                .is_some_and(|said| said.state == dto::SemanticState::Working)
+            && self.background.as_ref().is_some_and(|said| {
+                said.state == dto::SemanticState::Working
+                    || said
+                        .attachments
+                        .as_ref()
+                        .is_some_and(|pdf| pdf.state == dto::AttachmentsState::Working)
+            })
     }
 }
 
@@ -2876,6 +2892,27 @@ impl Shell {
                 }
                 _ => semantic_banner(ui, said, self.local.as_ref(), self.cache_host.is_some()),
             }
+            // La lecture des PDF joints, faite par la même passe : la phrase du démon, telle
+            // quelle, et un indicateur pendant qu'elle lit.
+            if let Some(pdf) = &said.attachments {
+                section(ui, "PDF joints");
+                ui.horizontal(|ui| {
+                    if pdf.state == dto::AttachmentsState::Working {
+                        ui.spinner();
+                    }
+                    match pdf.state {
+                        dto::AttachmentsState::Unavailable => {
+                            ui.colored_label(ui.visuals().warn_fg_color, &pdf.sentence);
+                        }
+                        dto::AttachmentsState::Working => {
+                            ui.label(&pdf.sentence);
+                        }
+                        _ => {
+                            ui.weak(&pdf.sentence);
+                        }
+                    }
+                });
+            }
         }
 
         section(ui, "Importer");
@@ -3052,7 +3089,7 @@ impl Shell {
                         } else if self.catching_up() {
                             // Pas une tâche — rien à annuler —, mais du travail de fond qu'on
                             // doit pouvoir voir sans chercher : la vue dit lequel.
-                            Some(("sens".to_owned(), ui.visuals().weak_text_color()))
+                            Some((self.background_label().to_owned(), ui.visuals().weak_text_color()))
                         } else {
                             None
                         },
@@ -4925,6 +4962,7 @@ fn job_label(job: &dto::Job) -> String {
         "thread" => "Fils de discussion",
         "contacts" => "Carnet d'adresses",
         "sync" => "Synchronisation",
+        "follow" => "Texte des PDF joints",
         other => other,
     }
     .to_owned()
@@ -5352,6 +5390,7 @@ mod tests {
                     state,
                     sentence: "Aucun modèle n'est installé.".to_owned(),
                     gesture,
+                    attachments: None,
                 };
                 let here = crate::gesture::Local {
                     store: camino::Utf8PathBuf::from(r"F:\store"),

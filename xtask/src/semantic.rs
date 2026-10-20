@@ -568,10 +568,13 @@ pub fn measure_arrival(sources: &Sources, arrivals: usize) -> Result<()> {
     let store = Store::open(&replica.root).context("ouverture de la réplique")?;
 
     store.reset_vectorised()?;
-    let all: Vec<MessageId> = store
+    // Chaque message avec la révision de ses pièces jointes : le marquage est conditionnel à elle
+    // (`SCHEMA_V17`), et un banc qui la devinerait ne marquerait rien sur un store dont des PDF
+    // ont été lus — l'`ensure` qui suit le dirait, plutôt que de mesurer à côté.
+    let all: Vec<(MessageId, i64)> = store
         .unvectorised(usize::MAX)?
         .into_iter()
-        .map(|row| row.id)
+        .map(|row| (row.id, row.attach_rev))
         .collect();
     anyhow::ensure!(all.len() > arrivals, "la réplique a trop peu de messages");
     let summary = mailcore::vectors::summary_of(&store.vectors_path())?
@@ -591,7 +594,7 @@ pub fn measure_arrival(sources: &Sources, arrivals: usize) -> Result<()> {
     );
     // Les plus récents : c'est ce qui arrive. Ils ont déjà un record — la relecture garde le
     // dernier, donc un second ne change rien à ce qui se cherche, et rien à ce qui se mesure.
-    let targets: Vec<MessageId> = all.iter().rev().take(arrivals).copied().collect();
+    let targets: Vec<MessageId> = all.iter().rev().take(arrivals).map(|(id, _)| *id).collect();
 
     // Ce que le démon paie **dans son propre processus** avant de lancer quoi que ce soit.
     store.mark_vectorised(&all)?;
@@ -615,7 +618,8 @@ pub fn measure_arrival(sources: &Sources, arrivals: usize) -> Result<()> {
     let mut rounds = Vec::with_capacity(arrivals);
     for target in &targets {
         store.reset_vectorised()?;
-        let others: Vec<MessageId> = all.iter().filter(|id| *id != target).copied().collect();
+        let others: Vec<(MessageId, i64)> =
+            all.iter().filter(|(id, _)| id != target).copied().collect();
         store.mark_vectorised(&others)?;
         anyhow::ensure!(
             store.unvectorised_total()? == 1,
@@ -711,7 +715,7 @@ fn warm_rounds(
     program: &Utf8PathBuf,
     root: &Utf8PathBuf,
     store: &Store,
-    all: &[MessageId],
+    all: &[(MessageId, i64)],
     targets: &[MessageId],
 ) -> Result<Vec<Duration>> {
     let engine = maild::semantic::Engine::start(
@@ -738,7 +742,8 @@ fn warm_rounds(
     let mut out = Vec::with_capacity(targets.len());
     for target in targets {
         store.reset_vectorised()?;
-        let others: Vec<MessageId> = all.iter().filter(|id| *id != target).copied().collect();
+        let others: Vec<(MessageId, i64)> =
+            all.iter().filter(|(id, _)| id != target).copied().collect();
         store.mark_vectorised(&others)?;
         anyhow::ensure!(
             store.unvectorised_total()? == 1,

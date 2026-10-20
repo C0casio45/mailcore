@@ -1342,8 +1342,14 @@ fn fetch_bodies<S: Read + Write>(
     }
 
     let writer = store.writer()?;
-    for (fetched, body, outcome) in prepared {
-        let (message, _) = writer.insert_message(&new_message(body, &outcome.hash)?)?;
+    for (fetched, body, _) in prepared {
+        let (new, carries_pdf) = crate::headers::parse_with_pdf(body)?;
+        let (message, created) = writer.insert_message(&new)?;
+        // La porte des PDF : un message neuf sans PDF n'a rien à faire lire à l'enfant extracteur —
+        // `SCHEMA_V17`. Un message déjà connu garde l'état que sa première insertion lui a donné.
+        if created && !carries_pdf {
+            writer.mark_without_pdf(message)?;
+        }
         let flags = flags_of(&fetched.flags);
         writer.insert_ref(message, folder, date_of(body), flags)?;
         if writer.record_copy(&RemoteCopy {
@@ -1567,12 +1573,6 @@ fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |it| i64::try_from(it.as_secs()).unwrap_or(0))
-}
-
-/// Extrait les métadonnées d'un message pour le store.
-fn new_message<'a>(body: &'a [u8], hash: &mailcore::BlobHash) -> Result<mailcore::NewMessage<'a>> {
-    let _ = hash;
-    crate::headers::parse(body)
 }
 
 /// La date d'un message, en secondes Unix.

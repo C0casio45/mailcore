@@ -1,0 +1,24 @@
+[package]
+name        = "mailpdf"
+description = "Le texte d'un PDF joint. Le seul crate qui en lit un, et il ne s'exécute que dans un processus enfant."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# **Une dépendance qui lit des fichiers écrits par des inconnus**, choisie le 2026-10-20 par un
+# banc dont la règle était gelée avant la première exécution — `docs/PHASE-4.md`. Elle ne
+# s'exécute que dans l'enfant `--mailcore-attachments` : une panique, une boucle ou une bombe de
+# décompression n'y tuent que lui. Version **épinglée** : vingt-six versions en quatre mois, et
+# chaque montée se relit avant d'entrer.
+[dependencies]
+mailcore.workspace              = true
+pdf-inspector.workspace         = true
+lopdf.workspace                 = true
+unicode-normalization.workspace = true
+thiserror.workspace             = true
+
+[lints]
+workspace = true

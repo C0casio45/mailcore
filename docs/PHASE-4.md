@@ -183,9 +183,12 @@ utilisable.
      reste du message n'a pas, sans une ligne de dépendance nouvelle. Aucune régression sur le
      banc, et aucun gain non plus — le jeu de requêtes ne vise aucune pièce jointe, ce qui est une
      limite de l'instrument et non un résultat.
-   - **Le PDF**, 1 222 messages, en attente d'une décision : il demande une dépendance qui
-     analysera 1,1 Gio de fichiers écrits par des inconnus. Le gain attendu est du même ordre que
-     ce que les formats gratuits viennent de rapporter.
+   - ~~**Le PDF**~~ — décidé, choisi et branché le 2026-10-20 : pdf-inspector, retenu par un banc
+     à règle gelée, dans un processus enfant borné par le système (`maild::attachments`). Recompté
+     avec la détection livrée : **1 330 messages**, 1 338 PDF distincts dans le corpus ; sur une
+     réplique du store du quotidien, la première lecture marque ses 50 100 messages et remet 939
+     messages à l'index. Reste à le voir tourner dans l'application, au premier lancement de
+     l'utilisateur. Voir le journal.
    - **Hors périmètre, écrit pour ne pas le redécouvrir** : l'OCR des images (4 659 messages, donc
      un second modèle à installer) et `application/ms-tnef` (738 messages), qui est un conteneur
      et se traitera après les formats qu'il contient, jamais avant.
@@ -3962,3 +3965,274 @@ ligne de courtoisie lue comme une arrivée, le test de courtoisie tombe encore �
 à « au plus une » ne l'a pas désarmé. Une synchronisation **par tranche**, elle, n'est pas
 attrapable par ces tests, dont la fenêtre de deux secondes est plus courte qu'une tranche ; c'était
 déjà vrai avant.
+
+**Le lancement qui devait le vérifier n'a pas encore eu lieu**, relevé le même jour à 11 h : le
+dernier journal de la coquille, celui des 4 244 ms, date de 00 h 23 — avant les binaires du
+correctif, compilés entre 00 h 40 et 00 h 42 —, et l'index du store du quotidien porte toujours
+ses 149 segments, `meta.json` du 2026-10-13. Le journal dira ce qu'il faut : « synchronisation mise
+en file » par compte, puis « compte synchronisé … nouveaux= » et « index avancé indexed= » ; les
+segments se comptent dans `meta.json`, coquille fermée — l'ouvrir pendant une validation de tantivy
+ferait refuser son remplacement. Le chiffre de comparaison est un lancement **à froid** : une
+relance juste après la fermeture trouverait les fichiers en cache et flatterait le correctif.
+
+### 2026-10-20 (suite) — le PDF : compter avant d'écrire, et faire relire la conception avant le code
+
+**En clair d'abord.** L'utilisateur a donné son accord pour la dernière étape de la phase : lire le
+texte des PDF joints, pour la recherche par mots et par le sens. Rien n'en est encore câblé. La
+journée a servi à trois choses qui passent avant : une conception soumise à une relecture
+contradictoire, qui l'a retournée sur plusieurs points ; une détection des PDF écrite une seule
+fois, que le recensement et le futur extracteur appellent tous les deux ; et un recensement refait
+avec elle, qui trouve **1 330 messages** au lieu de 1 222.
+
+**La conception, relue avant la première ligne.** Un projet écrit, puis relu sous quatre angles —
+concurrence, entrée hostile, simplicité, méthode de mesure —, chaque remarque soumise à un
+contradicteur chargé de la réfuter : 45 tiennent, 3 sont réfutées. Ce qu'elles ont changé, et qui
+vaut d'être écrit parce que c'est la pente naturelle du code existant :
+
+- **un enfant tué par nous n'est pas un enfant mort.** Le projet rangeait « illisible pour
+  toujours » le PDF en cours à chaque mort de l'enfant extracteur. Or c'est l'application qui le
+  tue : un job qui démarre, une recherche, la fermeture de la fenêtre. Thunderbird ouvert à côté
+  suffit à déclencher une moisson, donc à empoisonner une facture saine. Seul le fil qui tue
+  décide, et il note pourquoi **avant** de tuer ; une mort inexpliquée n'accuse qu'à la seconde ;
+- **un délai se compte en temps de calcul.** L'enfant tourne en priorité minimale : pendant une
+  compilation, un PDF ordinaire dépassait ses trente secondes d'horloge ;
+- **la bibliothèque ne borne pas la mémoire là où on le croyait.** pdf-inspector ne borne la
+  décompression qu'au chargement du fichier ; une bombe placée dans une police ou dans sa table
+  ToUnicode passe outre. Il faut une borne posée par le système ;
+- **le texte d'un PDF ne voyage jamais tel quel dans un protocole de lignes** : une fin de ligne
+  dans un PDF fabriquait des lignes de protocole. Un objet JSON par ligne ;
+- **un message qui reçoit un PDF déjà lu ailleurs doit être réindexé aussi** — la remise se décide
+  sur ce que le store contient, pas sur ce que l'enfant vient de rendre ;
+- **un banc sans vérité terrain récompense le silence** : un extracteur qui ne rend rien a zéro
+  caractère illisible. Le choix de la bibliothèque se fera sur des termes relevés **à l'œil** dans
+  quarante PDF tirés au hasard, fichier gelé avec sa règle de décision avant le premier relevé.
+
+**La détection, une fois** (`mailcore::attachtext::pieces`). Un verdict par axe — la voie (type
+déclaré, type générique avec un nom en `.pdf`, ni l'un ni l'autre), la signature `%PDF-` dans le
+premier kilo-octet, la profondeur dans un message transféré (deux niveaux au plus) — et une seule
+règle, `Verdict::accepted`. Le recensement compte chaque axe, l'enfant ne retiendra que la règle.
+**Un piège trouvé en l'écrivant** : une pièce sans `Content-Type` est du texte pour mail-parser — la
+RFC 2045 le veut —, et ses octets passent par `from_utf8_lossy` ; la signature, en ASCII, survit,
+le PDF non. Elle est écartée, et le recensement dit combien il y en a. Treize tests, et cinq
+mutations — chaque règle retirée — font chacune tomber au moins un test. Une seule garde n'a pas de
+test à elle : `encoding_problem` est aujourd'hui couverte par le décodage en texte et par la
+signature, et le code le dit.
+
+**Le recensement, refait avec elle** (`cargo xtask pdf-census`, sur une réplique : le corpus est
+au schéma 15, et l'ouvrir avec un binaire au 16 l'aurait migré) :
+
+| | |
+|---|---|
+| pièces retenues | **1 808**, dans **1 330 messages** — 1 221 par le type déclaré, 105 par un type générique et un nom en `.pdf`, 5 dans un message transféré |
+| empreintes distinctes | **1 338**, dont 333 portées par plusieurs messages — un quart des pièces sont des doublons |
+| octets décodés | 1,1 Gio au total, 836 Mio distincts |
+| taille d'un PDF | p50 179 Kio, p90 1,6 Mio, p99 6,9 Mio, max 22 Mio |
+| PDF par message | p50 1, p99 6, max 9 |
+| écartées | 28 pièces sans type, décodées en texte (16 messages) ; 1 déclarée sans signature ; 3 avec la signature sans type ni nom |
+| messages de plus de 16 Mio portant un PDF | 15 — la passe des vecteurs n'en lit que 16 Mio |
+| balayage MIME | 25,3 s de calcul pour 73 658 messages, p50 137 µs, p95 711 µs |
+
+Le balayage complet a pris 14 min 52 s d'horloge : c'est la lecture des blobs, pas l'analyse. La
+première passe de l'extracteur sur un store existant paiera ce prix une fois, en fond.
+
+**Trouvé au passage, corrigé** : `copy_index`, qui fabrique les répliques de tous les bancs, ne
+copiait pas le journal WAL. Le store du quotidien en portait huit pages non reportées, laissées la
+veille — son en-tête disait encore le schéma 15 : une réplique était donc d'avant ses dernières
+validations, sans rien en dire. Le journal est copié avec la base ; le test fabrique une validation
+restée dans le journal, et son contrôle inverse vérifie que la base seule ne la porte pas.
+
+**La vérité terrain, gelée avant le premier relevé.** `cargo xtask pdf-sample` a tiré 50 PDF
+distincts, à graine fixe, parmi les 1 338 du corpus : 40 qui décident, 10 de réserve pour mettre le
+banc au point sans toucher aux premiers. Pour chacun, quatre à huit termes qu'on chercherait —
+intitulés, organismes, références, montants, au moins deux termes accentués quand le document en
+porte —, relevés **à l'œil sur l'image des pages**, jamais dans la sortie d'un candidat ; aucune
+donnée personnelle d'un particulier. L'utilisateur a consenti à ce que l'assistant les lise : ce
+sont des documents réels et sensibles — fiches de paie, bail, avis d'impôt —, plus que les corps de
+message lus pour les jeux de requêtes précédents. Les PDF décodés ont vécu le temps de la lecture,
+hors du dépôt, puis ont été effacés ; le tirage se refait à l'identique.
+
+Sept documents sont des scans, sans couche texte ou avec une couche OCR inutilisable — quatre dans
+le jeu de décision ; ils n'entrent pas dans la métrique. La règle de décision est écrite en tête du
+même fichier, `measurements/pdf-terms.toml`, **gelé le 2026-10-20 à 13 h 57**, empreinte BLAKE3
+`120524423fb9e65eeec0b1e7bc6bd07cbd2a614eb449292e74042197256b8003` (`cargo xtask pdf-terms`, qui
+refuse de réécrire un fichier gelé). En résumé : pdf-inspector est retenu si pdf-extract n'est pas
+significativement meilleur sur la part des termes retrouvés — test de signe apparié, document par
+document —, s'il en retrouve au moins 80 % en moyenne, et si cinq conditions dures tiennent sur les
+1 338 PDF : contrôles bloquants passés, toute issue classée, au plus 1 % de morts, délais et
+dépassements de mémoire réunis, crête sous 512 Mio pour 99 % des PDF, caractères illisibles pas
+plus de 1,25 fois ceux de la référence. Sinon, ni l'un ni l'autre, et l'utilisateur est consulté
+avant toute bibliothèque en C ou C++.
+
+**Ce qui ne dépend pas de la bibliothèque, écrit pendant que le banc tourne.** Le schéma 17
+(`SCHEMA_V17`) range le texte des PDF dans `message_pdfs`, une ligne par pièce de message, texte
+compressé et plafonné, la cascade l'emportant avec son message ; `messages` gagne
+`attachments_scanned` (à lire, lu, analyse mortelle, trop gros) et `attach_rev`. Trois règles y
+sont écrites et chacune a son test qui tombe quand on la retire — six mutations, six tests :
+
+- **un marquage ne couvre pas un texte arrivé pendant la passe.** L'index et la passe des vecteurs
+  lisent `attach_rev` avec leur ligne, composent avec les textes lus **dans la même instruction**
+  (`Store::attachment_texts`, l'unique porte des deux côtés), et marquent `… WHERE attach_rev = ?`.
+  Sans cela, un PDF lu pendant qu'une passe tourne laissait pour toujours un document sans son
+  texte ;
+- **la remise se décide sur ce que le store contient** : un message achevé qui porte un PDF en texte
+  est remis à indexer et à vectoriser, même si l'enfant n'a rien lu de neuf — la réponse qui
+  reporte une facture déjà lue ailleurs ;
+- **un poison ne remplace jamais un texte**, et une ligne dont le blob ne correspond plus ne reçoit
+  rien — `messages.id` est un `rowid` que SQLite peut redonner.
+
+La révision de composition des vecteurs ne monte pas, et le tableau des révisions de
+`mailvec::text` dit pourquoi : la règle n'a pas changé, seul l'apport des pièces change, et il
+remet les seuls messages touchés. La porte de la moisson marque « rien à lire » un message neuf
+sans PDF — 98 % des arrivées — par la même détection que l'enfant ; ses deux contrôles négatifs
+tombent. Et la migration prend désormais une transaction **immédiate** et relit la version sous
+son verrou : deux ouvertures simultanées d'un store — la coquille et `mail` — rejouaient toutes deux
+la migration, et la seconde échouait sur une table déjà créée. Défaut de toutes les migrations
+depuis la première, attrapé par un test qui fabrique l'ouverture concurrente, et dont le contrôle
+négatif tombe sur « table message_pdfs already exists ».
+
+### 2026-10-20 (soir) — pdf-inspector retenu, et l'extracteur branché
+
+**En clair d'abord.** Le banc a tranché selon la règle gelée à midi : **pdf-inspector est retenu**.
+L'extracteur est écrit et branché — un processus enfant qui lit les PDF joints, et la passe de fond
+qui le lance avant chaque passage des vecteurs. Un message dont le PDF a du texte est remis à
+l'index et aux vecteurs, et le texte devient cherchable sans que personne ne lance rien. Ce qui
+manque encore : la mesure sur une réplique du store du quotidien, et le lancement de l'application
+par l'utilisateur, qui fera la première lecture des 1 330 messages.
+
+**Le verdict, sur les 1 338 PDF distincts du corpus**, trois exécutions, la première jetée pour les
+temps :
+
+| | pdf-inspector | pdf-extract | lopdf brut |
+|---|---|---|---|
+| termes retrouvés (36 PDF à texte, 279 termes) | **261 — 93,5 %** | 236 — 84,6 % | 199 — 71,3 % |
+| moyenne par document | **0,934** | 0,841 | 0,712 |
+| part par document, p10 | 0,75 | 0,38 | 0,00 |
+| issues hors texte | 1 erreur | 29 erreurs, 10 paniques | 1 erreur |
+| morts, délais, mémoire | 0 | 0 | 0 |
+| crête de mémoire, p99 | 98,6 Mio | — | — |
+| temps mural par PDF, p50 / p90 | 24 ms / 181 ms | 8 ms / 110 ms | 5 ms / 43 ms |
+
+Apparié contre pdf-extract, document par document : 10 victoires, 4 défaites, 22 égalités — test de
+signe p = 0,18, donc **pas** significatif. La règle ne demandait pas que pdf-inspector gagne : elle
+demandait que pdf-extract ne soit pas significativement meilleur, et les cinq conditions dures
+tiennent toutes. Caractères illisibles : 1 043 contre 8 092 sur les documents lus par les deux. La
+dispersion des temps entre exécutions est lue d'abord : p50 0,15, p90 0,37 — des temps de quelques
+millisecondes, au pas d'horloge près ; la médiane ne sert qu'à dire l'ordre de grandeur. Il est
+deux à trois fois plus lent que pdf-extract, et c'est le prix de la séparation des mots — le
+contrôle de câblage le montre : `(Bonjour) Tj 60 0 Td (monde) Tj` donne un jeton à lopdf, deux aux
+deux autres.
+
+**L'extracteur** (`maild::attachments`). Le même exécutable, relancé en enfant, en priorité
+minimale, **sous une borne de mémoire posée par le système** avant que la requête ne lui soit écrite
+— un objet de travail sous Windows, `RLIMIT_DATA` sous Linux (`mailbound`, le seul `unsafe` du
+projet, quatre appels Win32 commentés). Il lit au plus deux cents messages, rend une ligne JSON par
+fait, et sort. Le parent range par lots, une validation toutes les deux secondes au plus : chacune
+réveille les clients qui attendent le store, et une par message ferait relire sa liste à
+l'interface pendant tout un rattrapage.
+
+**Une mort s'attribue sur la raison posée avant de tuer, et sur rien d'autre.** C'est la règle que
+la relecture de la conception avait imposée, et c'est la partie la plus testée :
+
+- un enfant tué par un job, par la recherche par le sens ou par l'arrêt **n'accuse rien** ; ce qu'il
+  avait lu du message en cours est gardé ;
+- un enfant **silencieux** dix minutes est tué sans accuser : une machine pleine fait attendre un
+  enfant en priorité minimale ;
+- un **budget de temps processeur** épuisé — trente secondes depuis sa dernière ligne — fait passer
+  la pièce en cours « délai » ; une allocation refusée sous la borne, « mémoire » ;
+- une **mort sans cause** rend le message suspect : il est relu seul, dans un enfant neuf, et seule
+  une seconde mort condamne la pièce. Les pièces qui la précèdent et qui la suivent sont lues.
+
+Onze tests d'intégration avec le vrai binaire, les morts fabriquées par un crochet de test — une
+marque écrite dans un PDF, qui n'agit que si le parent pose la variable ; son contrôle inverse lit
+le même PDF sans crochet. Cinq contrôles négatifs, chacun une règle retirée, chacun fait tomber le
+test qui la garde : une première mort qui accuse (deux tests tombent), un arrêt pour recherche qui
+accuse, le silence compté comme du calcul, l'allocation refusée non reconnue, ce qui précède une
+mort jeté. Le canari du critère 6 porte maintenant un PDF qui le désigne par un lien, une base
+d'adresses et un script d'ouverture ; son contrôle positif vérifie que le texte du PDF a bien été
+lu et trouvé.
+
+**Deux trouvailles en l'écrivant.** Un texte de deux mots — « bonjour monde » — est rangé « sans
+texte » : c'est la règle de `mailpdf::readable` (trois mots au moins), écrite pour qu'un scan au
+calque OCR illisible ne passe pas pour un texte. Les fixtures ont changé, pas la règle. Et la même
+question s'est posée deux fois, à deux endroits : **un travail en cours couvre-t-il ce qui arrive
+pendant qu'il tourne ?** Non. Une moisson en cours a peut-être déjà passé sa mise à jour de l'index,
+donc la mise à jour demandée après une lecture de PDF n'est couverte que par un job **en file**
+(`Jobs::follow`) ; et pour la même raison, une annonce `IDLE` n'est couverte que par une
+synchronisation en file — `watch::covered` l'acceptait d'une synchronisation en cours, qui avait
+peut-être déjà lu l'INBOX. Corrigé à part, avec son test et son contrôle inverse.
+
+**Ce qui se voit.** `dto::Semantic` porte un champ `attachments` — l'état, ce qui reste, une phrase
+composée par le démon à un seul endroit (`attachments::describe`) ; seul l'échec promet un nouvel
+essai, parce que c'est le seul état où un recul est posé. La page Activité a une section « PDF
+joints », et la coquille relève l'état pendant une lecture comme pendant un rattrapage de vecteurs.
+La mise à jour de l'index après une lecture est un job, `follow`, qu'aucun client ne peut lancer,
+coalescé, dont le registre ne garde que le dernier fini — quarante d'affilée ne poussent pas hors de
+l'historique le bilan d'un import.
+
+**La relecture du code, avant la mesure.** Quatre angles — l'attribution des morts, la cohérence
+du store, l'entrée hostile et la vie privée, le câblage jusqu'à l'écran —, chaque remarque soumise
+à un contradicteur chargé de la réfuter : 23 tiennent, 4 sont réfutées. Les contradicteurs les ont
+toutes jugées mineures, parce que leurs déclencheurs sont rares ; plusieurs auraient pourtant
+**arrêté la lecture pour de bon**, sans rien en dire, et ce sont elles qui comptent :
+
+- **une boucle sans fin après une montée de révision.** Une pièce déjà lue en texte, qui tue
+  l'enfant à la relecture, recevait un poison que la règle « un poison ne remplace jamais un
+  texte » refusait en silence : la pièce ne devenait jamais connue, et le message était relancé
+  sans pause, pour toujours. Le poison garde maintenant le texte **et monte la révision** ; une
+  autre pièce au même rang — une ligne périmée — est remplacée ;
+- **un message silencieux barrait la route à tous les plus anciens** : jamais accusé, il revenait
+  en tête de chaque passage. Il est mis de côté jusqu'au prochain lancement, toujours sans
+  accusation ;
+- **la liste des pièces connues n'avait pas de plafond** : au-delà de deux cent cinquante mille PDF
+  distincts, la requête dépassait sa borne et plus aucun PDF n'était lu. Elle est bornée aux cent
+  mille les plus récemment portés — une pièce laissée dehors est relue, à l'identique ;
+- **une course pouvait condamner un message dont aucune pièce n'avait été ouverte** : entre le
+  relevé du processeur et le `kill`, une ligne déjà écrite — le début du message suivant —
+  déplaçait l'accusation. Plus rien n'entre dans l'automate après un `kill`, et une mort entre deux
+  pièces ne condamne jamais le message entier ;
+- **une ligne refusée vidait l'automate**, si bien qu'une violation du protocole n'accusait jamais
+  rien et revenait à la même place à chaque passage, sous un code faux.
+
+Et sept de moindre portée : les remises d'un passage interrompu n'étaient pas dues à l'index ; une
+moisson en file « couvrait » une mise à jour qu'elle ne fait pas quand tous ses comptes échouent ;
+le drapeau d'une allocation refusée était lu avant la fin du journal de l'enfant ; un relevé de
+processeur manqué comptait pour zéro, donc toute la vie de l'enfant contre la pièce suivante ; un
+lecteur de sortie non lancé laissait l'enfant sans surveillance ; le plafond du journal valait par
+enfant, pas par minute ; l'état était publié un passage en retard, « en pause » s'affichait sans
+rien à lire, et l'insigne disait « sens » pendant une lecture de PDF.
+
+Chaque correction qui se teste a son test, et son contrôle négatif — la règle retirée, le test
+tombe : dix en tout — l'un d'eux n'a rien fait tomber au premier essai, parce que `rustfmt` avait remis la ligne visée sur une seule ligne et que la substitution ne l'avait pas trouvée ; relancé, il tombe. **Trois n'ont pas de test**, et c'est écrit ici pour ne pas le croire : la
+garde qui ne nourrit plus l'automate après un `kill` (une course de quelques millisecondes ; ce
+qu'elle protège est vérifié au niveau du classement), le relevé de processeur manqué, et l'échec du
+lancement d'un fil de lecture. **Une limite reste, assumée** : les pièces pas encore lues d'un
+message restent en mémoire pendant qu'une autre est extraite — 120 Mio au plus sur la borne de
+1 Gio. Un PDF dont la crête tombe entre 0,88 et 1 Gio pourrait donc être « hors mémoire » dans un
+message chargé et pas seul, et ce poison passe à tous les messages qui le portent ; le banc n'a
+trouvé aucun PDF au-dessus de 206 Mio.
+
+**La première lecture, mesurée sur une réplique du store du quotidien** (`cargo xtask
+pdf-catch-up` : l'enfant livré, la base copiée, les blobs lus en place ; trois exécutions, la
+première jetée pour les temps) :
+
+| | |
+|---|---|
+| messages | **50 100**, tous marqués lus ; **939** remis à l'index et aux vecteurs |
+| pièces rangées | 1 425 — 1 235 en texte, 188 sans texte, 2 chiffrées ; aucune morte, hors délai ni hors mémoire |
+| base | 42,8 → 52,3 Mio, **+9,6 Mio** de texte compressé |
+| crête d'un enfant | 207,5 Mio — sous la borne de 1 Gio, cinq fois |
+| durée | **393 s** à froid ; 166 s et 126 s ensuite |
+
+La dispersion d'abord : les deux exécutions retenues s'écartent de **24 %**, et le binaire venait
+d'être compilé — le biais du 2026-09-02, encore. Le chiffre à chaud ne vaut donc que pour son
+ordre de grandeur, deux à trois minutes. Celui qui compte est le premier, à froid : c'est ce que
+le premier lancement de l'application paiera, **une fois**, en fond et en priorité minimale —
+l'essentiel en lecture de blobs, comme le recensement l'avait montré.
+
+**Ce qui n'est pas mesuré, écrit pour ne pas le croire fait** : la mise à jour de l'index des 939
+messages remis — la réplique n'a pas d'index tantivy, et en reconstruire un mesurerait autre
+chose ; le coût d'une arrivée de courrier portant un PDF ; la non-régression du critère 1 ; et le
+démarrage de la coquille, qui attend toujours le lancement de l'utilisateur. La coquille livrée
+n'est d'ailleurs **pas** recompilée : son prochain lancement doit d'abord vérifier le correctif du
+démarrage avec le binaire qui l'apporte, sans qu'une migration et une première lecture de PDF
+viennent se mêler à la mesure.

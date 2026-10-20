@@ -1,0 +1,35 @@
+[package]
+name        = "mailbound"
+description = "La borne de mémoire que le système pose à un processus enfant. Le seul `unsafe` de mailcore, justifié dans src/lib.rs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+publish.workspace      = true
+
+# Sous Windows, quatre appels Win32 pour un objet de travail — aucun crate ne règle la mémoire
+# **engagée** d'un processus (`win32job` 2.0.3 ne règle que l'ensemble de travail, qui ne fait
+# jamais échouer une allocation). Sous Linux, `prlimit` par rustix, une API sûre.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["process", "std"] }
+
+# **Pas** `workspace = true` : l'espace de travail interdit `unsafe_code` sans recours possible,
+# et ce crate est l'exception écrite. Le reste des règles est recopié tel quel, et chaque bloc
+# `unsafe` doit porter son contrat (`undocumented_unsafe_blocks`).
+[lints.rust]
+unsafe_code                   = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used                = "deny"
+expect_used                = "deny"
+undocumented_unsafe_blocks = "deny"

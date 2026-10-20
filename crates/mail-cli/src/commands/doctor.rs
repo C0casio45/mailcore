@@ -116,6 +116,34 @@ pub fn run(store_root: Option<&Utf8PathBuf>, purge_orphans: bool) -> Result<()> 
         ));
     }
 
+    // Le texte des PDF joints : ce qui reste à lire, et ce que les pièces sont devenues. Des
+    // comptes, pas des points à regarder : c'est la passe de fond du démon qui les lit, et rien
+    // ne se relance à la main.
+    let unread = store.unscanned_total().context("messages à lire")?;
+    let pdfs = store.pdf_counts().context("pièces PDF")?;
+    if unread > 0 || !pdfs.is_empty() {
+        use mailcore::attachtext::PdfState;
+        let name = |state: PdfState| match state {
+            PdfState::Text => "en texte",
+            PdfState::NoText => "sans texte",
+            PdfState::Encrypted => "chiffrés",
+            PdfState::Invalid => "illisibles",
+            PdfState::TooBig => "trop gros",
+            PdfState::Crashed => "mortels",
+            PdfState::TimedOut => "hors délai",
+            PdfState::OutOfMemory => "hors mémoire",
+        };
+        let read: Vec<String> = pdfs
+            .iter()
+            .map(|(state, count)| format!("{count} {}", name(*state)))
+            .collect();
+        println!(
+            "PDF joints         {unread} messages à lire{}{}",
+            if read.is_empty() { "" } else { " ; pièces " },
+            read.join(", ")
+        );
+    }
+
     // 5. La file d'envoi. **Le seul point de ce diagnostic qui demande une décision humaine**,
     //    et non une commande à relancer : un message douteux a peut-être été remis, et rien ne
     //    lèvera le doute. Voir `docs/PHASE-3.md`, critère 2.

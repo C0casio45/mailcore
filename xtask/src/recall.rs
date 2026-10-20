@@ -1666,7 +1666,7 @@ fn wilson(found: usize, total: usize) -> (f64, f64) {
 /// Calculée par somme de binomiales à p = 1/2, sans fonction gamma : les effectifs sont de
 /// quelques dizaines, donc un produit itératif suffit et reste exact. Un test qui se trompe sur
 /// ses propres bornes dirait n'importe quoi avec assurance.
-fn sign_test(wins: usize, decided: usize) -> f64 {
+pub(crate) fn sign_test(wins: usize, decided: usize) -> f64 {
     if decided == 0 {
         return 1.0;
     }

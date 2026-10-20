@@ -26,8 +26,13 @@ members = [
     "crates/mailsmtp",
     "crates/mailcal",
     "crates/mailvec",
+    "crates/mailpdf",
+    "crates/mailbound",
     "xtask",
 ]
+# Le lecteur de candidats du banc du PDF a son propre verrou : les bibliothèques qui perdent le
+# comparatif n'entrent ni dans `Cargo.lock` ni dans la CI. Voir `tools/pdf-runner/Cargo.toml`.
+exclude = ["tools/pdf-runner"]
 resolver = "3"
 
 [workspace.package]
@@ -53,6 +58,8 @@ mailauth   = { path = "crates/mailauth" }
 mailsmtp   = { path = "crates/mailsmtp" }
 mailcal    = { path = "crates/mailcal" }
 mailvec    = { path = "crates/mailvec" }
+mailpdf    = { path = "crates/mailpdf" }
+mailbound  = { path = "crates/mailbound" }
 
 # --- coeur : stockage, index, parsing ---
 blake3      = "1.8"
@@ -95,6 +102,12 @@ candle-transformers = { version = "0.9", default-features = false }
 
 # --- transverse ---
 thiserror          = "2.0"
+# La lecture d'un PDF, dans l'enfant extracteur seulement — `crates/mailpdf`. Épinglées : voir là-bas.
+# Fonctions par défaut retirées : pdf-inspector n'en a pas, et celles qu'il offre en option tirent un
+# client HTTP (`ureq`), un moteur OCR et pdfium — `xtask/tests/reseau.rs` le vérifie.
+pdf-inspector      = { version = "=1.25.2", default-features = false }
+lopdf              = { version = "=0.45.0", default-features = false }
+unicode-normalization = "0.1.26"
 anyhow             = "1.0"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

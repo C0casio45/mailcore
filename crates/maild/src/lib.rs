@@ -48,6 +48,7 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod attachments;
 pub mod config;
 pub mod jobs;
 pub mod outbox;
@@ -160,6 +161,12 @@ impl Service {
         // Quand l'enfant de la recherche est chaud, c'est lui qui fait la passe : il a déjà le
         // modèle. Voir `Vectoriser::delegate_to`.
         vectoriser.delegate_to(&semantic);
+        // Le texte des PDF lus doit entrer dans l'index plein texte, et seul un job y écrit : la
+        // passe de fond en demande un, que les jobs coalescent — voir `jobs::Jobs::follow`.
+        let follow_jobs = jobs.clone();
+        vectoriser.on_follow(move || {
+            let _ = follow_jobs.follow();
+        });
         let api = api
             .with_vectoriser(Arc::clone(&vectoriser))
             .with_semantic(Arc::clone(&semantic));

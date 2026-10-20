@@ -205,6 +205,56 @@ fn a_new_message_is_picked_up_without_retouching_the_others() {
     assert_eq!(count(&store, "refs"), 4);
 }
 
+/// La porte des PDF : un message neuf sans PDF n'a rien à faire lire à l'enfant extracteur, et la
+/// moisson le dit dès l'insertion ; un message qui en porte un reste à lire — `SCHEMA_V17`.
+#[test]
+fn a_harvested_message_without_a_pdf_is_left_out_of_the_extractor() {
+    let with_pdf = Message {
+        body: b"From: Marie <marie@exemple.fr>\r\n\
+                Subject: facture\r\n\
+                Message-ID: <pdf@exemple.fr>\r\n\
+                MIME-Version: 1.0\r\n\
+                Content-Type: multipart/mixed; boundary=SEP\r\n\
+                \r\n\
+                --SEP\r\n\
+                Content-Type: text/plain; charset=utf-8\r\n\
+                \r\n\
+                Ci-joint la facture.\r\n\
+                --SEP\r\n\
+                Content-Type: application/pdf; name=\"facture.pdf\"\r\n\
+                Content-Disposition: attachment; filename=\"facture.pdf\"\r\n\
+                Content-Transfer-Encoding: base64\r\n\
+                \r\n\
+                JVBERi0xLjQKJSVFT0YK\r\n\
+                --SEP--\r\n"
+            .to_vec(),
+        ..Message::simple(2, "facture")
+    };
+    let without = Message::simple(1, "bonjour");
+    let config = Config::with_inbox().with_mailboxes(vec![Mailbox::new(
+        "INBOX",
+        1000,
+        vec![without.clone(), with_pdf.clone()],
+    )]);
+    let server = Server::start(config).unwrap();
+    let (_dir, store, folder) = store();
+    let mut client = connect(&server);
+
+    harvest(&mut client, &store, folder, b"INBOX").unwrap();
+
+    let porter = store
+        .message_by_blob(mailcore::BlobHash::of(&with_pdf.body))
+        .unwrap()
+        .unwrap();
+    let to_read: Vec<_> = store
+        .unscanned(10)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    assert_eq!(to_read, [porter], "seul le message au PDF reste à lire");
+}
+
 #[test]
 fn a_flag_set_on_the_server_reaches_the_reference() {
     let (_dir, store, folder) = store();

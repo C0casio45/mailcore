@@ -567,6 +567,27 @@ impl<'a> Writer<'a> {
         Ok(self.tx.prepare_cached(&sql)?.execute(params![folder.0])?)
     }
 
+    /// Marque un message qui ne porte aucun PDF à lire — la porte de la moisson, `SCHEMA_V17`.
+    ///
+    /// La moisson a le message analysé sous la main : lui demander s'il porte un PDF ne coûte rien,
+    /// et 98 % des arrivées n'en portent pas. Sans cette porte, chacune lancerait l'enfant
+    /// extracteur pour ne rien y trouver. Seul un message **sans** PDF est marqué ; un message qui
+    /// en porte reste à lire, et la porte d'un import mbox, qui ne lit que les en-têtes, ne marque
+    /// rien.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn mark_without_pdf(&self, id: MessageId) -> Result<()> {
+        self.tx
+            .prepare_cached(
+                "UPDATE messages SET attachments_scanned = 1
+                  WHERE id = ?1 AND attachments_scanned = 0",
+            )?
+            .execute(params![id.0])?;
+        Ok(())
+    }
+
     /// Insère un message, ou rend celui qui porte déjà ce contenu.
     ///
     /// Le booléen rendu est `true` si la ligne a été créée. **C'est la mesure de la dédup**

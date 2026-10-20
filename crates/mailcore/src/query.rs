@@ -1414,6 +1414,54 @@ mod tests {
         );
     }
 
+    /// Le texte d'un PDF rangé par l'enfant extracteur après l'indexation entre dans l'index à la
+    /// passe suivante : le message se trouve par un mot qu'il n'a que là — `SCHEMA_V17`.
+    #[test]
+    fn a_pdf_text_stored_after_indexing_is_found_at_the_next_pass() {
+        let (_dir, mailbox) = mailbox();
+        let store = mailbox.store();
+        crate::index::update(store, &crate::Progress::new()).unwrap();
+        let root = store.root().to_owned();
+        assert!(
+            Mailbox::open(&root)
+                .unwrap()
+                .search("électricité", 10)
+                .unwrap()
+                .is_empty(),
+            "la fixture porte déjà le mot : ce test ne prouve rien"
+        );
+
+        let row = store
+            .unscanned(10)
+            .unwrap()
+            .into_iter()
+            .find(|row| {
+                store
+                    .message(row.id)
+                    .is_ok_and(|m| m.is_some_and(|m| m.subject == "facture"))
+            })
+            .unwrap();
+        let read = crate::store::pdfs::PdfRecord::Read {
+            rank: 0,
+            hash: [7; 32],
+            state: crate::attachtext::PdfState::Text,
+            revision: 1,
+            size: 1_000,
+            text: Some("Relevé électricité, référence 2608".to_owned()),
+        };
+        store.record_scan(row.id, row.blob, &[read]).unwrap();
+
+        let stats = crate::index::update(store, &crate::Progress::new()).unwrap();
+        assert_eq!(stats.indexed, 1, "seul le message au PDF est réindexé");
+        let reopened = Mailbox::open(&root).unwrap();
+        assert_eq!(reopened.search("électricité", 10).unwrap().len(), 1);
+        assert_eq!(
+            reopened.indexed_documents(),
+            Some(2),
+            "le document a été ajouté au lieu d'être remplacé"
+        );
+    }
+
     #[test]
     fn an_index_kept_up_to_date_merges_its_segments() {
         // Chaque passe qui apporte du courrier valide un segment, et une recherche les parcourt

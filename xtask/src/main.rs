@@ -25,6 +25,8 @@ mod inspect;
 mod measure;
 mod merge;
 mod model;
+mod pdf;
+mod pdfcompare;
 mod probe;
 mod profile;
 mod rebind;
@@ -617,6 +619,93 @@ enum Command {
         top: usize,
     },
 
+    /// Recense les PDF du corpus avec la règle de détection livrée : voies, signature, doublons,
+    /// tailles, coût du balayage MIME. Avant d'en lire un seul — `docs/PHASE-4.md`, 2026-10-20.
+    ///
+    /// **Ne fait que lire**, sur une réplique : `Store::open` migrerait le store.
+    PdfCensus {
+        /// Racine du store à recenser.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+    },
+
+    /// La première lecture des PDF d'un store, sur une réplique, par l'enfant livré : durée,
+    /// crête de mémoire, coût en base, et ce que chaque pièce est devenue.
+    PdfCatchUp {
+        /// Racine du store à lire.
+        #[arg(long, default_value = "measurements/store-imap")]
+        store: Utf8PathBuf,
+        /// Combien d'exécutions ; la première est jetée pour les temps.
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+    },
+
+    /// Tire des PDF distincts à graine fixe, les dépose avec un squelette de vérité terrain, pour
+    /// qu'un humain y relève à l'œil les termes qu'il chercherait.
+    ///
+    /// **Écrit des documents réels** : la sortie est refusée dans le dépôt.
+    PdfSample {
+        /// Racine du store à tirer.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Où déposer les PDF et le squelette — hors du dépôt, vide ou absent.
+        #[arg(long)]
+        out: Utf8PathBuf,
+        /// Combien de PDF décident.
+        #[arg(long, default_value_t = 40)]
+        count: usize,
+        /// Combien de plus, pour mettre le banc au point sans toucher aux premiers.
+        #[arg(long, default_value_t = 10)]
+        reserve: usize,
+        /// La graine du tirage.
+        #[arg(long, default_value = "mailcore-pdf-2026-10-20")]
+        seed: String,
+    },
+
+    /// Le banc A2 du PDF : pdf-inspector, pdf-extract et lopdf, un enfant par document, par le
+    /// lecteur hors espace de travail de `tools/pdf-runner`, jugés par la règle gelée en tête du
+    /// fichier de termes.
+    ///
+    /// Refuse de lire le corpus si un contrôle bloquant échoue. N'imprime que des comptes et des
+    /// centiles ; n'écrit rien, ni dans le dépôt ni sous `measurements/`.
+    PdfCompare {
+        /// Racine du store où lire les PDF — sur une réplique.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Le lecteur de candidats : `cd tools/pdf-runner && cargo build --release`.
+        #[arg(long, default_value = pdfcompare::DEFAULT_RUNNER)]
+        runner: Utf8PathBuf,
+        /// La vérité terrain gelée par `pdf-terms`.
+        #[arg(long, default_value = "measurements/pdf-terms.toml")]
+        terms: Utf8PathBuf,
+        /// Combien d'exécutions complètes ; la première est jetée pour les temps.
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        /// `reserve` pour mettre le banc au point, `decision` pour les termes seuls, `corpus` pour
+        /// tous les PDF du store — les conditions dures de la règle ne se jugent que là.
+        #[arg(long, default_value = "corpus")]
+        set: String,
+    },
+
+    /// Gèle la vérité terrain du banc du PDF : verse les relevés dans le squelette du tirage, la
+    /// règle de décision en tête, et imprime l'empreinte à écrire dans le journal.
+    ///
+    /// **Refuse d'écraser** un fichier gelé, et toute sortie dans le dépôt.
+    PdfTerms {
+        /// Le squelette rendu par `pdf-sample`.
+        #[arg(long)]
+        skeleton: Utf8PathBuf,
+        /// Les relevés, en JSON : une liste de `{ id, scan, terms, note }`. Répétable.
+        #[arg(long = "readings", required = true)]
+        readings: Vec<Utf8PathBuf>,
+        /// La règle de décision, recopiée telle quelle en tête du fichier.
+        #[arg(long)]
+        rule: Utf8PathBuf,
+        /// Le fichier gelé, hors du dépôt ; il ne doit pas exister.
+        #[arg(long)]
+        out: Utf8PathBuf,
+    },
+
     /// Sort un échantillon de messages réels, étalé sur toute la période du corpus.
     ///
     /// Sert l'étape 1 de `docs/PHASE-4.md` : écrire des requêtes en français avec la réponse
@@ -899,6 +988,45 @@ fn main() -> Result<()> {
             keep,
         }),
         Command::AttachmentCensus { store, top } => attach::census(&store, top),
+        Command::PdfCensus { store } => pdf::census(&store),
+        Command::PdfCatchUp { store, runs } => pdf::catch_up(&store, runs),
+        Command::PdfCompare {
+            store,
+            runner,
+            terms,
+            runs,
+            set,
+        } => pdfcompare::compare(&pdfcompare::Options {
+            store,
+            runner,
+            terms,
+            runs,
+            set,
+        }),
+        Command::PdfTerms {
+            skeleton,
+            readings,
+            rule,
+            out,
+        } => pdf::freeze(&pdf::FreezeOptions {
+            skeleton,
+            readings,
+            rule,
+            out,
+        }),
+        Command::PdfSample {
+            store,
+            out,
+            count,
+            reserve,
+            seed,
+        } => pdf::sample(&pdf::SampleOptions {
+            store,
+            out,
+            count,
+            reserve,
+            seed,
+        }),
         Command::CorpusSample {
             store,
             count,

@@ -88,7 +88,7 @@ pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
             }
         }
         let mut gained = String::new();
-        mailcore::attachtext::attachment_text(&parsed, &mut gained);
+        mailcore::attachtext::attachment_text(&parsed, &[], &mut gained);
         if !gained.trim().is_empty() {
             gained_messages += 1;
             gained_bytes += gained.len() as u64;
@@ -304,7 +304,7 @@ mod tests {
     fn new_word(raw: &[u8]) -> bool {
         let parsed = mail_parser::MessageParser::default().parse(raw).unwrap();
         let mut gained = String::new();
-        mailcore::attachtext::attachment_text(&parsed, &mut gained);
+        mailcore::attachtext::attachment_text(&parsed, &[], &mut gained);
         assert!(
             !gained.is_empty(),
             "la fixture doit donner du texte de pièce jointe"

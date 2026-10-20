@@ -41,8 +41,33 @@ pub const NO_DATE: i64 = 0;
 /// pauvre plutôt qu'une erreur. **C'est le comportement voulu** — perdre un message parce que
 /// son `Subject` ne décode pas serait perdre du courrier.
 pub fn parse(rfc822: &[u8]) -> Result<NewMessage<'static>> {
-    let parsed = mail_parser::MessageParser::default().parse(rfc822);
+    parse_with_pdf(rfc822).map(|(message, _)| message)
+}
 
+/// [`parse`], et si le message porte un PDF à lire — par la règle de détection livrée,
+/// `mailcore::attachtext::pieces`, la même que l'enfant extracteur appliquera.
+///
+/// La moisson a le message analysé sous la main : lui poser la question ne coûte rien, et un
+/// message neuf sans PDF est marqué « rien à lire » dès son insertion — sans cela, chaque arrivée
+/// lancerait l'enfant pour ne rien trouver. Un message illisible est dit porteur : c'est l'enfant
+/// qui en jugera, pas la moisson.
+///
+/// # Errors
+///
+/// Comme [`parse`] : aucune en pratique.
+pub fn parse_with_pdf(rfc822: &[u8]) -> Result<(NewMessage<'static>, bool)> {
+    let parsed = mail_parser::MessageParser::default().parse(rfc822);
+    let carries_pdf = parsed.as_ref().is_none_or(|it| {
+        mailcore::attachtext::pieces(it)
+            .iter()
+            .any(|piece| piece.verdict.accepted())
+    });
+    let message = describe(rfc822, parsed.as_ref());
+    Ok((message, carries_pdf))
+}
+
+/// La description d'un message déjà analysé.
+fn describe(rfc822: &[u8], parsed: Option<&mail_parser::Message<'_>>) -> NewMessage<'static> {
     let (from_addr, from_name) = parsed
         .as_ref()
         .and_then(|it| it.from())
@@ -85,7 +110,7 @@ pub fn parse(rfc822: &[u8]) -> Result<NewMessage<'static>> {
 
     let has_attachments = parsed.as_ref().is_some_and(|it| it.attachment_count() > 0);
 
-    Ok(NewMessage {
+    NewMessage {
         blob: mailcore::BlobHash::of(rfc822),
         // Les champs textuels sont fuités volontairement : `NewMessage` emprunte, et la
         // moisson les garde le temps d'une transaction. Un `String` par message, libéré au
@@ -97,7 +122,7 @@ pub fn parse(rfc822: &[u8]) -> Result<NewMessage<'static>> {
         subject: leak(subject),
         size: rfc822.len() as u64,
         has_attachments,
-    })
+    }
 }
 
 /// La date d'un message, en secondes Unix, ou [`NO_DATE`].

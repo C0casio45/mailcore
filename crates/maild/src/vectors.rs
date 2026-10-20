@@ -208,6 +208,9 @@ impl Launch {
             Some(f) if f == std::ffi::OsStr::new(crate::semantic::CHILD_FLAG) => {
                 Some(crate::semantic::child::run)
             }
+            Some(f) if f == std::ffi::OsStr::new(crate::attachments::CHILD_FLAG) => {
+                Some(crate::attachments::child::run)
+            }
             _ => None,
         };
         if let Some(serve) = serve {
@@ -415,6 +418,15 @@ struct Shared {
     launched: std::sync::atomic::AtomicU64,
     /// La borne d'un passage de l'enfant : [`mailvec::pass::ROUND`], sauf dans un test.
     round: u64,
+    /// Où en est la lecture des PDF, que ce même fil fait avant chaque passage des vecteurs.
+    attachments: Arc<Mutex<crate::attachments::Status>>,
+    /// Qui prévenir quand des PDF lus ont apporté du texte : le démon met alors l'index à jour
+    /// (`jobs::Kind::Follow`). Posé par [`crate::Service`] ; absent, rien n'est prévenu.
+    follow: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Le crochet de test de l'extracteur, et ses bornes — `None` et les bornes par défaut hors
+    /// des tests.
+    hook: Option<PathBuf>,
+    limits: crate::attachments::Limits,
 }
 
 impl Shared {
@@ -507,7 +519,51 @@ impl Vectoriser {
         delay: Duration,
         round: u64,
     ) -> Self {
-        let initial = if matches!(launch, Launch::Disabled) {
+        Self::start_inner(
+            store,
+            activity,
+            launch,
+            delay,
+            round,
+            None,
+            crate::attachments::Limits::default(),
+        )
+    }
+
+    /// [`Self::start_with_round`], avec le crochet de test de l'extracteur PDF et ses bornes —
+    /// voir [`crate::attachments::Extractor::with_hook`]. **Pour les tests**, jamais pour
+    /// l'utilisateur.
+    #[must_use]
+    pub fn start_with_hook(
+        store: &Utf8Path,
+        activity: Activity,
+        launch: Launch,
+        delay: Duration,
+        hook: &std::path::Path,
+        limits: crate::attachments::Limits,
+    ) -> Self {
+        Self::start_inner(
+            store,
+            activity,
+            launch,
+            delay,
+            mailvec::pass::ROUND,
+            Some(hook.to_path_buf()),
+            limits,
+        )
+    }
+
+    fn start_inner(
+        store: &Utf8Path,
+        activity: Activity,
+        launch: Launch,
+        delay: Duration,
+        round: u64,
+        hook: Option<PathBuf>,
+        limits: crate::attachments::Limits,
+    ) -> Self {
+        let disabled = matches!(launch, Launch::Disabled);
+        let initial = if disabled {
             Status::Disabled
         } else {
             Status::Waiting
@@ -521,6 +577,14 @@ impl Vectoriser {
             delegated: std::sync::atomic::AtomicU64::new(0),
             launched: std::sync::atomic::AtomicU64::new(0),
             round: round.max(1),
+            attachments: Arc::new(Mutex::new(if disabled {
+                crate::attachments::Status::Disabled
+            } else {
+                crate::attachments::Status::Waiting
+            })),
+            follow: Mutex::new(None),
+            hook,
+            limits,
         });
         let Launch::Program(program) = launch else {
             return Self {
@@ -555,6 +619,23 @@ impl Vectoriser {
             .status
             .lock()
             .map_or(Status::Disabled, |status| *status)
+    }
+
+    /// Où en est la lecture des PDF joints, que ce même fil fait — voir [`crate::attachments`].
+    #[must_use]
+    pub fn attachments_status(&self) -> crate::attachments::Status {
+        self.shared
+            .attachments
+            .lock()
+            .map_or(crate::attachments::Status::Disabled, |status| *status)
+    }
+
+    /// Qui prévenir quand des PDF lus ont apporté du texte : l'index plein texte doit les prendre.
+    /// La passe des vecteurs, elle, les prend d'elle-même — c'est ce même fil.
+    pub fn on_follow(&self, follow: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.shared.follow.lock() {
+            *slot = Some(Box::new(follow));
+        }
     }
 
     /// Réveille le fil tout de suite.
@@ -628,8 +709,27 @@ fn run(
     // L'empreinte de l'état qui a rendu un refus durable : tant qu'elle ne change pas, relancer un
     // enfant redonnerait le même refus.
     let mut refused: Option<Fingerprint> = None;
+    // La lecture des PDF, faite par ce même fil : un seul fil de fond, un seul abonné à `Activity`,
+    // et jamais deux enfants lourds ensemble.
+    let mut extractor = crate::attachments::Extractor::new(program)
+        .with_limits(shared.limits)
+        .publishing_to(Arc::clone(&shared.attachments));
+    if let Some(hook) = shared.hook.as_ref() {
+        extractor = extractor.with_hook(hook);
+    }
+    let mut follow = Follow::default();
 
     while !shared.stop.load(Ordering::SeqCst) {
+        // **Un passage de PDF, puis un passage de vecteurs** : un arriéré de PDF ne retient pas les
+        // vecteurs du courrier qui arrive, et inversement.
+        let read = read_pdfs(
+            root,
+            &mut extractor,
+            &mut store,
+            activity,
+            shared,
+            &mut follow,
+        );
         let again = round(
             root,
             program,
@@ -640,11 +740,77 @@ fn run(
             &mut retry_at,
             &mut refused,
         );
-        if !again {
+        if !(read || again) {
             shared.sleep(TICK);
         }
     }
     tracing::info!("passe de fond des vecteurs arrêtée");
+}
+
+/// Ce que la lecture des PDF doit encore dire à l'index.
+#[derive(Debug, Default)]
+struct Follow {
+    /// Des messages ont été remis depuis la dernière mise à jour demandée.
+    owed: bool,
+    /// Quand la dernière a été demandée.
+    last: Option<Instant>,
+}
+
+/// Un passage de lecture des PDF. Rend vrai s'il faut repasser tout de suite.
+///
+/// Les messages remis sont pris par la passe des vecteurs d'elle-même ; l'index, lui, ne bouge que
+/// dans un job. La mise à jour est demandée quand l'arriéré est vide, ou au plus une fois par
+/// [`TICK`] pendant un rattrapage : une par passage ferait un job toutes les quelques secondes, et
+/// la première tout de suite, pour que le courrier le plus récent soit trouvable sans attendre.
+fn read_pdfs(
+    root: &Utf8Path,
+    extractor: &mut crate::attachments::Extractor,
+    store: &mut Option<mailcore::Store>,
+    activity: &Activity,
+    shared: &Shared,
+    follow: &mut Follow,
+) -> bool {
+    if store.is_none() {
+        match mailcore::Store::open(root) {
+            Ok(opened) => *store = Some(opened),
+            Err(error) => {
+                tracing::warn!(%error, "store illisible pour la lecture des PDF");
+                if let Ok(mut slot) = shared.attachments.lock() {
+                    *slot = crate::attachments::Status::Failed(crate::attachments::Failure::Store);
+                }
+                return false;
+            }
+        }
+    }
+    let Some(opened) = store.as_ref() else {
+        return false;
+    };
+    let watch = crate::attachments::Watch {
+        stop: &shared.stop,
+        activity,
+        child: &shared.child,
+    };
+    // L'extracteur publie son état lui-même, avant de lancer un enfant : copié ici après le
+    // passage, il aurait toujours eu un passage de retard.
+    let again = matches!(
+        extractor.pass(opened, &watch),
+        crate::attachments::Passed::Advanced { .. }
+    );
+    // Les remises de **tout** passage, interrompu compris : elles sont validées, et l'index
+    // doit les suivre.
+    follow.owed |= extractor.take_remarked() > 0;
+    let caught_up = !again || opened.unscanned_total().is_ok_and(|left| left == 0);
+    let due = follow.last.is_none_or(|last| last.elapsed() >= TICK);
+    if follow.owed && (caught_up || due) {
+        if let Ok(slot) = shared.follow.lock()
+            && let Some(notify) = slot.as_ref()
+        {
+            notify();
+        }
+        follow.owed = false;
+        follow.last = Some(Instant::now());
+    }
+    again
 }
 
 /// Ce qui, en changeant, peut lever un refus durable : les fichiers du modèle et le magasin.
@@ -881,7 +1047,7 @@ fn spawn_and_wait(
     activity: &Activity,
     shared: &Shared,
 ) -> Waited {
-    let mut command = command(program, root);
+    let mut command = command(program, CHILD_FLAG, root);
     command.env(ROUND_ENV, shared.round.to_string());
     let mut child = match command
         .stdin(Stdio::piped())
@@ -956,8 +1122,19 @@ fn spawn_and_wait(
     )
 }
 
-/// La commande qui relance l'exécutable en passe de fond, en priorité minimale.
-fn command(program: &std::path::Path, root: &Utf8Path) -> Command {
+/// La commande qui relance l'exécutable en enfant de fond — la passe des vecteurs, l'extracteur
+/// PDF —, en priorité minimale.
+///
+/// **Sans le jeton du démon** (`MAILCORE_TOKEN`), depuis le 2026-10-20 : un enfant n'en a aucun
+/// usage, et l'extracteur lit des octets choisis par un inconnu — une faille dans son analyseur ne
+/// doit pas trouver de quoi parler à l'API.
+pub(crate) fn command(program: &std::path::Path, flag: &str, root: &Utf8Path) -> Command {
+    let mut command = idle_command(program, flag, root);
+    command.env_remove(crate::config::TOKEN_VAR);
+    command
+}
+
+fn idle_command(program: &std::path::Path, flag: &str, root: &Utf8Path) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -968,7 +1145,7 @@ fn command(program: &std::path::Path, root: &Utf8Path) -> Command {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut command = Command::new(program);
         command
-            .arg(CHILD_FLAG)
+            .arg(flag)
             .arg(root.as_str())
             .creation_flags(IDLE_PRIORITY_CLASS | CREATE_NO_WINDOW);
         command
@@ -989,7 +1166,7 @@ fn command(program: &std::path::Path, root: &Utf8Path) -> Command {
             }
             None => Command::new(program),
         };
-        command.arg(CHILD_FLAG).arg(root.as_str());
+        command.arg(flag).arg(root.as_str());
         command
     }
 }
@@ -1009,7 +1186,30 @@ mod tests {
             delegated: std::sync::atomic::AtomicU64::new(0),
             launched: std::sync::atomic::AtomicU64::new(0),
             round: mailvec::pass::ROUND,
+            attachments: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::attachments::Status::Waiting,
+            )),
+            follow: std::sync::Mutex::new(None),
+            hook: None,
+            limits: crate::attachments::Limits::default(),
         }
+    }
+
+    /// Aucun enfant de fond n'hérite du jeton du démon : l'extracteur lit des octets choisis par un
+    /// inconnu, et une faille dans son analyseur ne doit pas trouver de quoi parler à l'API.
+    #[test]
+    fn no_background_child_inherits_the_daemon_token() {
+        let command = super::command(
+            std::path::Path::new("programme"),
+            crate::attachments::CHILD_FLAG,
+            camino::Utf8Path::new("racine"),
+        );
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == crate::config::TOKEN_VAR && value.is_none()),
+            "le jeton n'est pas retiré"
+        );
     }
 
     #[test]

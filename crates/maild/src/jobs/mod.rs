@@ -108,6 +108,13 @@ pub enum Kind {
         /// Ne synchroniser que ce compte. `None` pour tous les comptes actifs.
         account: Option<i64>,
     },
+    /// Met l'index plein texte à jour des messages que la lecture des PDF a remis — depuis le
+    /// 2026-10-20.
+    ///
+    /// **Pas lançable par un client** : c'est la passe de fond qui le met en file, par
+    /// [`Jobs::follow`], et jamais deux à la fois. Un job, et pas un travail de la passe de fond,
+    /// parce que l'index n'a qu'un écrivain et que les jobs sont ce qui le sérialise.
+    Follow,
 }
 
 impl Kind {
@@ -120,6 +127,7 @@ impl Kind {
             Self::Thread => "thread",
             Self::Contacts => "contacts",
             Self::Sync { .. } => "sync",
+            Self::Follow => "follow",
         }
     }
 }
@@ -504,6 +512,41 @@ impl Jobs {
         Ok(id)
     }
 
+    /// Met en file une mise à jour de l'index après une lecture de PDF ([`Kind::Follow`]), et rend
+    /// son identifiant — ou `None` si un job **en file** la fera de toute façon.
+    ///
+    /// **En file, et pas en cours** : un job en cours a peut-être déjà passé sa mise à jour de
+    /// l'index, et les messages remis après seraient oubliés jusqu'à la suivante — la leçon de
+    /// `watch::covered`. **Et seulement une réindexation ou une autre mise à jour**, jamais une
+    /// moisson : une moisson dont tous les comptes échouent rend la main avant sa mise à jour de
+    /// l'index (relu le 2026-10-20). Une mise à jour de trop ne coûte qu'un compte sur un index
+    /// partiel. Et le registre ne garde que la dernière mise à jour finie : une par
+    /// passage d'un rattrapage pousserait hors de l'historique le bilan d'un import.
+    pub fn follow(&self) -> Option<u64> {
+        {
+            let mut registry = self.lock();
+            let covered = registry.iter().any(|entry| {
+                entry.snapshot.state == State::Queued
+                    && matches!(entry.snapshot.kind, Kind::Index | Kind::Follow)
+            });
+            if covered {
+                return None;
+            }
+            let last = registry.iter().rposition(|entry| {
+                entry.snapshot.kind == Kind::Follow && entry.snapshot.state.is_final()
+            });
+            let mut index = 0;
+            registry.retain(|entry| {
+                let keep = !(entry.snapshot.kind == Kind::Follow
+                    && entry.snapshot.state.is_final()
+                    && Some(index) != last);
+                index += 1;
+                keep
+            });
+        }
+        self.enqueue(Kind::Follow).ok()
+    }
+
     /// Tous les jobs connus, du plus récent au plus ancien.
     #[must_use]
     pub fn list(&self) -> Vec<Snapshot> {
@@ -704,6 +747,23 @@ impl Worker {
                 Ok(format!(
                     "{} adresses, {} messages envoyés reconnus sur {} parcourus",
                     stats.addresses, stats.outgoing, stats.scanned
+                ))
+            }
+
+            // Le texte des PDF que la passe de fond vient de lire : l'index seul, les vecteurs
+            // suivent d'eux-mêmes.
+            Kind::Follow => {
+                let stats = mailcore::index::update(&store, progress).map_err(|source| {
+                    tracing::error!(%source, "index non mis à jour après la lecture des PDF");
+                    "l'index n'a pas pu prendre le texte des PDF : voir le journal du démon"
+                        .to_owned()
+                })?;
+                if stats.indexed > 0 {
+                    self.reload_search();
+                }
+                Ok(format!(
+                    "{} message(s) indexés avec le texte de leurs PDF",
+                    stats.indexed
                 ))
             }
 
@@ -1020,6 +1080,60 @@ mod tests {
         let root = camino::Utf8Path::from_path(dir.path()).unwrap().to_owned();
         let mailbox = Arc::new(Mutex::new(Mailbox::open(&root).unwrap()));
         (dir, Jobs::start(mailbox, root, sources))
+    }
+
+    /// Quarante mises à jour après lecture de PDF — un long rattrapage — ne poussent pas hors de
+    /// l'historique le bilan d'un import : le registre n'en garde qu'une de finie.
+    #[test]
+    fn many_follows_keep_one_in_the_history_and_push_nothing_out() {
+        let (_dir, jobs) = jobs(Sources::default());
+        let index = jobs.enqueue(Kind::Index).unwrap();
+        wait_final(&jobs, index);
+        for _ in 0..40 {
+            let id = jobs.follow().expect("rien ne couvrait cette mise à jour");
+            wait_final(&jobs, id);
+        }
+        let listed = jobs.list();
+        assert!(
+            listed.iter().any(|job| job.id == index),
+            "le bilan a été évincé"
+        );
+        let follows = listed.iter().filter(|job| job.kind == Kind::Follow).count();
+        assert!(follows <= 2, "{follows} mises à jour gardées");
+    }
+
+    /// Une mise à jour ou une réindexation **en file** couvre la suivante ; en cours, non — elle a
+    /// peut-être déjà lu les messages —, et une moisson jamais.
+    #[test]
+    fn only_a_queued_job_covers_a_follow() {
+        let (_dir, jobs) = jobs(Sources::default());
+        let registry = |state: State, kind: Kind| {
+            let mut registry = jobs.lock();
+            registry.clear();
+            registry.push(Entry {
+                snapshot: Snapshot {
+                    id: 999,
+                    kind,
+                    state,
+                    done: 0,
+                    total: 0,
+                    message: None,
+                    queued_at: 0,
+                    finished_at: None,
+                },
+                progress: None,
+            });
+        };
+        registry(State::Queued, Kind::Index);
+        assert_eq!(jobs.follow(), None);
+        registry(State::Queued, Kind::Follow);
+        assert_eq!(jobs.follow(), None);
+        // Le contrôle inverse : en cours, la même mise à jour ne couvre rien.
+        registry(State::Running, Kind::Follow);
+        assert!(jobs.follow().is_some());
+        // Et une moisson, même en file, ne couvre rien : elle peut échouer avant son index.
+        registry(State::Queued, Kind::Sync { account: None });
+        assert!(jobs.follow().is_some());
     }
 
     #[test]

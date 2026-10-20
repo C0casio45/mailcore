@@ -492,12 +492,32 @@ fn report(r: &Reading) {
     }
 }
 
-/// Copie `index.sqlite` du store vers la racine de travail.
+/// Copie `index.sqlite` du store vers la racine de travail, **avec son journal WAL** s'il en a
+/// un.
+///
+/// ## Pourquoi le journal
+///
+/// En mode WAL, une validation va d'abord dans `index.sqlite-wal`, et n'est reportée dans la base
+/// qu'au point de contrôle — à la fermeture de la dernière connexion, ou passé mille pages. Une
+/// coquille tuée, ou fermée pendant qu'un lecteur tenait la base, laisse donc des validations
+/// **seulement** dans le journal : le store du quotidien en portait huit pages le 2026-10-20,
+/// laissées la veille, et son en-tête disait encore le schéma 15. Copier la base seule donnait une
+/// réplique d'avant ces validations, sans rien en dire. Le journal copié avec elle, SQLite le
+/// rejoue à l'ouverture de la copie ; l'index partagé, `-shm`, n'est **pas** copié : il se
+/// reconstruit, et une copie le rendrait faux.
+///
+/// La copie n'est un instantané que si personne n'écrit pendant : c'est le cas d'un store dont
+/// l'application est fermée, et c'est ce que les bancs supposent déjà.
 pub(crate) fn copy_index(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
     let source = from.join("index.sqlite");
     anyhow::ensure!(source.is_file(), "pas de store à {source}");
     std::fs::copy(&source, to.join("index.sqlite"))
         .with_context(|| format!("copie de {source}"))?;
+    let journal = from.join("index.sqlite-wal");
+    if journal.is_file() {
+        std::fs::copy(&journal, to.join("index.sqlite-wal"))
+            .with_context(|| format!("copie de {journal}"))?;
+    }
     Ok(())
 }
 
@@ -659,11 +679,56 @@ pub(crate) fn copy_tree(from: &Utf8PathBuf, to: &Utf8PathBuf) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::link_blobs;
+    use super::{copy_index, link_blobs};
     use camino::Utf8PathBuf;
 
     fn utf8(dir: &tempfile::TempDir) -> Utf8PathBuf {
         Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap()
+    }
+
+    /// Une validation restée dans le journal WAL — la base, elle, ne la porte pas encore — doit
+    /// se retrouver dans la réplique.
+    #[test]
+    fn a_commit_still_in_the_journal_reaches_the_replica() {
+        let source = tempfile::tempdir().unwrap();
+        let source_root = utf8(&source);
+        // Une connexion **tenue ouverte** : tant qu'elle vit, aucun point de contrôle de
+        // fermeture ne reporte le journal dans la base.
+        let writer = rusqlite::Connection::open(source_root.join("index.sqlite")).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute_batch("CREATE TABLE t(x); INSERT INTO t VALUES (42);")
+            .unwrap();
+        assert!(
+            source_root.join("index.sqlite-wal").is_file(),
+            "la fixture doit laisser un journal"
+        );
+
+        let replica = tempfile::tempdir().unwrap();
+        let replica_root = utf8(&replica);
+        copy_index(&source_root, &replica_root).unwrap();
+        let reader = rusqlite::Connection::open(replica_root.join("index.sqlite")).unwrap();
+        let seen: i64 = reader
+            .query_row("SELECT x FROM t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(seen, 42);
+
+        // Le contrôle inverse : la base seule, sans son journal, ne porte pas la validation —
+        // c'est la réplique que la première version faisait.
+        let bare = tempfile::tempdir().unwrap();
+        let bare_root = utf8(&bare);
+        std::fs::copy(
+            source_root.join("index.sqlite"),
+            bare_root.join("index.sqlite"),
+        )
+        .unwrap();
+        let reader = rusqlite::Connection::open(bare_root.join("index.sqlite")).unwrap();
+        assert!(
+            reader.query_row("SELECT x FROM t", [], |_| Ok(())).is_err(),
+            "la base seule porte déjà la validation : la fixture ne prouve rien"
+        );
+        drop(writer);
     }
 
     #[test]

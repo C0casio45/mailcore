@@ -197,7 +197,115 @@ fn hostile(port: u16) -> Vec<Message> {
                  --r--\r\n"
             ),
         ),
+        // Un PDF joint, depuis le 2026-10-20 : un lien, une action d'ouverture, un script et une
+        // base d'adresses, tous vers le canari. L'extracteur en lit le texte ; il n'en suit rien.
+        message(
+            4,
+            format!(
+                "From: Banque <releve@exemple.fr>\r\n\
+                 To: Marie <marie@exemple.fr>\r\n\
+                 Subject: canari relevé\r\n\
+                 Date: Wed, 2 Sep 2026 12:00:00 +0200\r\n\
+                 Message-ID: <4@exemple.fr>\r\n\
+                 MIME-Version: 1.0\r\n\
+                 Content-Type: multipart/mixed; boundary=\"p\"\r\n\
+                 \r\n\
+                 --p\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 \r\n\
+                 Votre relevé.\r\n\
+                 --p\r\n\
+                 Content-Type: application/pdf; name=\"releve.pdf\"\r\n\
+                 Content-Disposition: attachment; filename=\"releve.pdf\"\r\n\
+                 Content-Transfer-Encoding: base64\r\n\
+                 \r\n\
+                 {}\r\n\
+                 --p--\r\n",
+                base64(&hostile_pdf(&at))
+            ),
+        ),
     ]
+}
+
+/// Un PDF qui désigne le canari de toutes les façons qu'un PDF a de faire sortir une requête quand
+/// une visionneuse l'ouvre : un lien, une base d'adresses, un script à l'ouverture.
+fn hostile_pdf(at: &str) -> Vec<u8> {
+    use lopdf::{Document, Object, Stream, dictionary};
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "Encoding" => "WinAnsiEncoding",
+    });
+    let resources_id = doc.add_object(dictionary! {
+        "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+    });
+    let content = b"BT /F1 12 Tf 72 720 Td (pdfcanari releve de compte bancaire) Tj ET".to_vec();
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+    let link = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+        "A" => dictionary! {
+            "S" => "URI",
+            "URI" => Object::string_literal(format!("http://{at}/pdf-lien")),
+        },
+    });
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => Object::Reference(pages_id),
+        "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        "Resources" => Object::Reference(resources_id),
+        "Contents" => Object::Reference(content_id),
+        "Annots" => vec![Object::Reference(link)],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => Object::Reference(pages_id),
+        "URI" => dictionary! { "Base" => Object::string_literal(format!("http://{at}/pdf-base")) },
+        "OpenAction" => dictionary! {
+            "S" => "JavaScript",
+            "JS" => Object::string_literal(format!("app.launchURL('http://{at}/pdf-js')")),
+        },
+    });
+    doc.trailer.set("Root", Object::Reference(catalog_id));
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    out
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for (index, chunk) in bytes.chunks(3).enumerate() {
+        if index > 0 && index % 19 == 0 {
+            out.push_str("\r\n");
+        }
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= chunk.len() {
+                char::from(ALPHABET[((n >> shift) & 63) as usize])
+            } else {
+                '='
+            });
+        }
+    }
+    out
 }
 
 /// Un store neuf, un compte IMAP, un dossier `INBOX`, et le transformeur minuscule à sa place.
@@ -248,7 +356,7 @@ fn a_harvest_and_a_vectorisation_pass_never_reach_what_the_mail_points_to() {
     let mut client = mailsync::client::Client::greet(stream).unwrap();
     client.login("marie@exemple.fr", "secret").unwrap();
     let report = mailsync::harvest(&mut client, &store, folder, b"INBOX").unwrap();
-    assert_eq!(report.stored, 3, "la moisson n'a pas tout rangé");
+    assert_eq!(report.stored, 4, "la moisson n'a pas tout rangé");
 
     // Les trois passes que le démon fait suivre à une moisson.
     let progress = mailcore::Progress::new();
@@ -261,7 +369,8 @@ fn a_harvest_and_a_vectorisation_pass_never_reach_what_the_mail_points_to() {
         "la moisson a contacté une adresse du courrier"
     );
 
-    // La passe de fond des vecteurs, dans l'exécutable livré relancé en enfant.
+    // La passe de fond — la lecture des PDF puis les vecteurs —, dans l'exécutable livré relancé
+    // en enfant.
     let vectoriser = Vectoriser::start_after(
         &root,
         Activity::default(),
@@ -269,11 +378,15 @@ fn a_harvest_and_a_vectorisation_pass_never_reach_what_the_mail_points_to() {
         Duration::ZERO,
     );
     let deadline = Instant::now() + Duration::from_secs(60);
-    while !(store.unvectorised_total().unwrap() == 0 && vectoriser.status() == Status::Idle) {
+    while !(store.unvectorised_total().unwrap() == 0
+        && store.unscanned_total().unwrap() == 0
+        && vectoriser.status() == Status::Idle)
+    {
         assert!(
             Instant::now() < deadline,
-            "la passe n'a pas fini : {:?}",
-            vectoriser.status()
+            "la passe n'a pas fini : {:?}, PDF {:?}",
+            vectoriser.status(),
+            vectoriser.attachments_status()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -284,18 +397,26 @@ fn a_harvest_and_a_vectorisation_pass_never_reach_what_the_mail_points_to() {
     let summary = mailcore::vectors::summary_of(&store.vectors_path())
         .unwrap()
         .unwrap();
-    assert_eq!(summary.records, 3, "les trois messages ont leur vecteur");
+    assert_eq!(summary.records, 4, "les quatre messages ont leur vecteur");
+    // Le texte du PDF est lu et rangé — l'index le prend à sa mise à jour suivante, que le démon
+    // demande et que ce test fait lui-même.
+    mailcore::index::update(&store, &progress).unwrap();
     let mailbox = mailcore::Mailbox::open(&root).unwrap();
     assert_eq!(
         mailbox.search("canari", 10).unwrap().len(),
-        3,
-        "l'index a lu les trois messages"
+        4,
+        "l'index a lu les quatre messages"
+    );
+    assert_eq!(
+        mailbox.search("pdfcanari", 10).unwrap().len(),
+        1,
+        "le texte du PDF n'a pas été lu"
     );
 
     assert_eq!(
         canary.hits(),
         0,
-        "la passe de vectorisation a contacté une adresse du courrier"
+        "la lecture des PDF ou la vectorisation a contacté une adresse du courrier"
     );
 }
 

@@ -370,6 +370,45 @@ Et une leçon sur les modèles : **la fenêtre du tokeniseur ne dépasse jamais 
 modèle.** Elle était fixée à 256 ; un modèle qui en aurait eu moins échouait sur tout courrier un
 peu long, à chaque passe, sans fin.
 
+**Le texte des PDF joints est lu depuis le 2026-10-20** (`maild::attachments`, `SCHEMA_V17`,
+pdf-inspector retenu par un banc à règle gelée), et quatre règles en sortent, à ne pas défaire :
+
+- **aucun analyseur PDF dans le démon ni dans la coquille.** Un enfant — `--mailcore-attachments`,
+  le même exécutable — lit les blobs, rend du texte, et n'ouvre pas SQLite. Il tourne **sous une
+  borne de mémoire posée par le système avant que sa requête ne lui soit écrite** (`mailbound`,
+  le seul `unsafe` du projet) : la bibliothèque ne borne la décompression qu'au chargement du
+  fichier, et une bombe dans une police passe outre. Un système qui ne sait pas la poser ne lit
+  aucun PDF ;
+- **une mort s'attribue sur la raison posée avant de tuer, et sur rien d'autre**
+  (`Extractor::settle`). Un enfant tué par un job, une recherche, l'arrêt ou le silence n'accuse
+  rien — c'est l'application qui le tue, et Thunderbird ouvert à côté suffit à lancer une
+  moisson. Le délai se compte en **temps processeur**, jamais en temps mural : l'enfant tourne en
+  priorité minimale. Une mort sans cause n'accuse qu'à la **seconde**, le message relu seul ;
+- **la remise se décide sur ce que le store contient** (`Store::record_scans`), et l'index comme
+  les vecteurs marquent `… WHERE attach_rev = ?` avec la révision lue **dans la même
+  instruction** que les textes (`Store::attachment_texts`) : sans ça, un PDF lu pendant une passe
+  laissait un document sans son texte pour toujours ;
+- **le texte ne sort par aucune méthode d'API.** Il compose l'index et les vecteurs, et rien
+  d'autre ne le lit — `docs/PRIVACY.md` §8 bis. Le jeton du démon n'est hérité par aucun enfant.
+
+Deux leçons qui débordent le PDF :
+
+- **un travail en cours ne couvre pas ce qui arrive pendant qu'il tourne.** Une moisson en cours a
+  peut-être déjà lu l'INBOX, ou déjà passé sa mise à jour de l'index : seul un job **en file**
+  couvre une annonce `IDLE` (`watch::covered`) ou une mise à jour après lecture de PDF
+  (`Jobs::follow`). La question s'est posée deux fois en un jour ; toute nouvelle coalescence doit
+  se la poser ;
+- **chaque validation réveille les clients.** `PRAGMA data_version` change à chaque `COMMIT`, donc
+  `store.wait` et la révision de la coquille aussi. Une passe de fond qui écrit message par
+  message fait relire sa liste à l'interface à chaque message : elle groupe ses écritures — deux
+  secondes au plus, pour l'extracteur.
+
+Et une leçon de méthode, payée le même jour : **un contrôle négatif qui ne fait rien tomber doit
+d'abord prouver que le test a tourné.** Quatre contrôles sont passés « verts » parce que le filtre
+de noms passé à `cargo test` excluait les tests d'intégration — leurs noms ne contiennent pas celui
+du module. Un contrôle se lit sur la ligne `test result` : `0 filtered out`, ou le nom du test
+attendu parmi les échecs.
+
 ## Règles absolues
 
 1. **Ne jamais écrire dans le profil Thunderbird.** Il est en production, l'utilisateur

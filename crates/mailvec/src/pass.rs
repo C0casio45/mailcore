@@ -745,20 +745,22 @@ pub fn compose(
     budget: crate::text::Budget,
 ) -> Result<Composed> {
     compose_with(store, row, &mail_parser::MessageParser::default(), budget)
+        .map(|(composed, _)| composed)
 }
 
-/// [`compose`] avec un analyseur déjà construit, pour la boucle.
+/// [`compose`] avec un analyseur déjà construit, pour la boucle — et la révision des pièces jointes
+/// que le texte composé porte, celle que le marquage redonnera.
 fn compose_with(
     store: &Store,
     row: &mailcore::store::read::VectorRow,
     parser: &mail_parser::MessageParser,
     budget: crate::text::Budget,
-) -> Result<Composed> {
+) -> Result<(Composed, i64)> {
     // Les premiers [`crate::text::MESSAGE_CAP`] octets, lus en flux : `mail-parser` décode tout ce
     // qu'on lui donne, et un message de 124 Mio coûtait 209 Mio le temps de sa lecture.
     let mut reader = match store.blobs().open(row.blob) {
         Ok(reader) => reader,
-        Err(mailcore::Error::BlobNotFound(_)) => return Ok(Composed::Missing),
+        Err(mailcore::Error::BlobNotFound(_)) => return Ok((Composed::Missing, row.attach_rev)),
         Err(other) => return Err(other.into()),
     };
     let mut raw = Vec::new();
@@ -773,14 +775,23 @@ fn compose_with(
             source,
         })
     })?;
-    Ok(Composed::Text(match parser.parse(&raw) {
-        Some(parsed) => {
-            crate::text::from_message(&parsed, &row.subject, row.from_name.as_deref(), budget)
-        }
+    // Le texte des PDF rangé par l'enfant extracteur, et sa révision, lus ensemble — la même porte
+    // que l'index plein texte, `Store::attachment_texts`. Le plafond est la part qui revient aux
+    // pièces dans le budget : décompresser 256 Kio pour en garder mille octets ne servirait à rien.
+    let (revision, stored) = store.attachment_texts(row.id, budget.body / 2)?;
+    let composed = Composed::Text(match parser.parse(&raw) {
+        Some(parsed) => crate::text::from_message(
+            &parsed,
+            &stored,
+            &row.subject,
+            row.from_name.as_deref(),
+            budget,
+        ),
         // En-têtes illisibles : on vectorise sur ce que SQLite sait déjà. Un message
         // introuvable serait pire qu'un message mal placé.
         None => crate::text::compose(&row.subject, row.from_name.as_deref(), ""),
-    }))
+    });
+    Ok((composed, revision))
 }
 
 /// La boucle partagée par [`update`] et [`rebuild`].
@@ -829,14 +840,16 @@ fn advance(
                 cancelled = true;
                 break;
             }
-            match compose_with(store, row, &parser, budget).unwrap_or_else(|error| {
-                tracing::warn!(%error, id = row.id.0, "blob illisible, message non vectorisé");
-                Composed::Unreadable
-            }) {
+            let (composed, revision) =
+                compose_with(store, row, &parser, budget).unwrap_or_else(|error| {
+                    tracing::warn!(%error, id = row.id.0, "blob illisible, message non vectorisé");
+                    (Composed::Unreadable, row.attach_rev)
+                });
+            match composed {
                 Composed::Unreadable => {
                     stats.unreadable += 1;
                     absent += 1;
-                    ids.push(row.id);
+                    ids.push((row.id, revision));
                     texts.push(String::new());
                 }
                 Composed::Missing => {
@@ -849,14 +862,14 @@ fn advance(
                     // et `unvectorised_total` ne retombe jamais à zéro : la passe la moins chère
                     // du projet redeviendrait la plus chère, et le raccourci du haut ne servirait
                     // plus jamais. Un blob qui réapparaît est un cas pour une reconstruction.
-                    ids.push(row.id);
+                    ids.push((row.id, revision));
                     texts.push(String::new());
                 }
                 Composed::Text(text) => {
                     if text.trim().is_empty() {
                         stats.empty += 1;
                     }
-                    ids.push(row.id);
+                    ids.push((row.id, revision));
                     texts.push(text);
                 }
             }
@@ -864,7 +877,7 @@ fn advance(
         }
 
         if !ids.is_empty() {
-            for (id, vector) in ids.iter().zip(model.encode(&texts)?) {
+            for ((id, _), vector) in ids.iter().zip(model.encode(&texts)?) {
                 writer.append(*id, &vector)?;
             }
             // **Durable, puis marqué.** L'ordre est ce qui rend la reprise sûre ; l'inverse
@@ -1341,6 +1354,34 @@ mod tests {
         assert_eq!(store.unvectorised_total().unwrap(), 0);
     }
 
+    /// Le texte d'un PDF rangé par l'enfant extracteur entre dans le vecteur, par la même porte que
+    /// l'index — `Store::attachment_texts` —, et la passe marque le message avec la révision qu'elle
+    /// a composée.
+    #[test]
+    fn a_stored_pdf_text_enters_the_vector_and_the_pass_marks_its_revision() {
+        let (_dir, store) = corpus(1);
+        let row = store.unvectorised(1).unwrap().remove(0);
+        let read = mailcore::store::pdfs::PdfRecord::Read {
+            rank: 0,
+            hash: [7; 32],
+            state: mailcore::attachtext::PdfState::Text,
+            revision: 1,
+            size: 1_000,
+            text: Some("Relevé électricité référence 2608".to_owned()),
+        };
+        store.record_scan(row.id, row.blob, &[read]).unwrap();
+        match compose(&store, &row, budget()).unwrap() {
+            Composed::Text(text) => assert!(text.contains("électricité"), "{text}"),
+            Composed::Missing | Composed::Unreadable => panic!("le blob est là"),
+        }
+        update_with(&store, &Fake::new(8), budget(), &Progress::new()).unwrap();
+        assert_eq!(
+            store.unvectorised_total().unwrap(),
+            0,
+            "la passe n'a pas marqué avec la révision qu'elle a composée"
+        );
+    }
+
     /// Un message plus long que la borne de lecture arrive **tronqué** à `mail-parser` : c'est une
     /// entrée malformée, et le corps, qui la précède, doit en sortir intact.
     #[test]
@@ -1370,6 +1411,7 @@ mod tests {
             blob,
             subject: "devis".to_owned(),
             from_name: None,
+            attach_rev: 0,
         };
         match compose(&store, &row, budget()).unwrap() {
             Composed::Text(text) => assert!(text.contains("chaudiere"), "{text}"),

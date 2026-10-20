@@ -329,6 +329,45 @@ noté que par son genre ; et le nettoyage des vieux fichiers, qui jugeait l'âge
 fichiers suivants. Chaque fichier est maintenant daté de sa création, et un fichier effacé sous
 une coquille qui écrit est remplacé à la ligne suivante.
 
+## 8 bis. Le texte des PDF joints — 2026-10-20
+
+Depuis le 2026-10-20, le texte des PDF joints entre dans la recherche, par les mots et par le
+sens. Lire un PDF, c'est faire tourner un analyseur sur des octets choisis par l'expéditeur : la
+lecture est donc faite à part, et voici ce qui la tient.
+
+- **Aucun analyseur PDF ne tourne dans le démon ni dans la coquille.** Un enfant — le même
+  exécutable, relancé avec `--mailcore-attachments` — lit les blobs lui-même et ne rend que du
+  texte, sur une ligne JSON par fait. Le parent ne voit jamais les octets d'un PDF : il envoie des
+  empreintes de blobs et reçoit des textes. L'enfant n'ouvre pas SQLite ; c'est le parent qui range.
+- **Aucune requête réseau.** Le crate qui lit les PDF (`mailpdf`) et celui qui borne la mémoire de
+  l'enfant (`mailbound`) sont dans la liste des crates livrés de `xtask/tests/reseau.rs` ; aucun
+  client HTTP dans leurs dépendances — les fonctions de pdf-inspector qui téléchargent un modèle
+  ne sont pas compilées. Le canari du critère 6 porte un PDF qui le désigne par un lien, une base
+  d'adresses et un script d'ouverture : le texte du PDF est lu et trouvé, le canari n'entend rien.
+- **Aucune lecture de fichier pilotée par le PDF.** pdf-inspector sait charger des tables de
+  caractères depuis un répertoire désigné par une variable d'environnement : posée, un nom écrit
+  dans le PDF deviendrait un chemin — absolu, `..`, ou UNC, donc une connexion SMB vers un hôte que
+  l'expéditeur choisit. Le parent retire de l'environnement de l'enfant **toutes** les variables
+  que la bibliothèque lit (`mailpdf::ENVIRONMENT`), et l'extraction refuse de tourner si celle-là
+  est posée quand même.
+- **Aucun document décodé sur disque.** Les octets d'une pièce vivent en mémoire le temps de sa
+  lecture. Le texte vit dans `index.sqlite` (`message_pdfs`, compressé, plafonné), et il part avec
+  son message.
+- **Le jeton du démon n'est plus hérité par aucun enfant** — ni l'extracteur, ni la passe des
+  vecteurs, ni la recherche par le sens. Aucun n'en a l'usage, et une faille dans un analyseur ne
+  doit pas trouver de quoi parler à l'API.
+- **Le journal.** Les deux bibliothèques PDF y sont muettes : leurs avertissements citent des
+  objets du document. Une pièce abandonnée y est notée par l'identifiant interne du message, son
+  rang et son état — jamais un nom de fichier, une empreinte ou un extrait. Ce que l'enfant écrit
+  sur sa sortie d'erreur est recopié coupé à deux kilo-octets la ligne, deux cents lignes par
+  minute au plus.
+- **Le texte ne sort par aucune méthode d'API.** Il ne sert qu'à composer le document de l'index
+  et le texte vectorisé ; l'index ne range que des identifiants, donc aucun extrait n'en revient.
+
+Ce qui est **écrit pour ne pas le croire absent** : un texte invisible dans un PDF — blanc sur
+blanc, hors de la page — peut faire remonter un message dans une recherche, comme un texte caché
+dans un HTML aujourd'hui. Il ne montre rien à personne, mais il classe.
+
 ## Test de non-régression obligatoire
 
 Un test d'intégration qui rend un message HTML contenant un pixel espion, une image

@@ -143,6 +143,14 @@ impl Api {
             .map(|vectoriser| vectoriser.status())
     }
 
+    /// Où en est la lecture des PDF joints, que la même passe de fond fait.
+    #[must_use]
+    pub fn attachments_status(&self) -> Option<crate::attachments::Status> {
+        self.vectoriser
+            .as_ref()
+            .map(|vectoriser| vectoriser.attachments_status())
+    }
+
     /// Traite un message et rend la réponse à écrire, s'il y en a une.
     ///
     /// `None` veut dire « ne rien renvoyer » : le message était une notification. Une
@@ -380,7 +388,7 @@ impl Api {
     ) -> Option<mailapi::dto::Semantic> {
         let engine = self.semantic.as_ref()?;
         let failure = asked.unwrap_or_else(|| engine.standing());
-        Some(crate::semantic::describe(&crate::semantic::Facts {
+        let mut said = crate::semantic::describe(&crate::semantic::Facts {
             enabled: engine.enabled(),
             model_installed: engine.model_installed(),
             vectors_present: engine.vectors_present(),
@@ -388,7 +396,9 @@ impl Api {
             failure,
             asked: asked.is_some(),
             operators,
-        }))
+        });
+        said.attachments = self.attachments_status().map(crate::attachments::describe);
+        Some(said)
     }
 
     /// `search.query` quand la recherche par le sens est montée : les deux moteurs, fusionnés.

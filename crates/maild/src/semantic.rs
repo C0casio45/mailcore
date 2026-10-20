@@ -198,6 +198,7 @@ pub fn describe(facts: &Facts) -> mailapi::dto::Semantic {
         state,
         sentence,
         gesture: gesture.map(str::to_owned),
+        attachments: None,
     };
 
     if !facts.enabled || facts.failure == Some(Unavailable::Disabled) {
@@ -357,7 +358,7 @@ pub fn describe(facts: &Facts) -> mailapi::dto::Semantic {
 }
 
 /// « 1 message », « 3 messages ».
-fn messages(count: u64) -> String {
+pub(crate) fn messages(count: u64) -> String {
     if count > 1 {
         format!("{count} messages")
     } else {
@@ -425,12 +426,14 @@ pub(crate) mod child {
     /// la même raison — une séquence d'échappement n'a rien à faire dans un fichier. Et une
     /// panique n'y laisse que son emplacement (`crate::panics`). Les mêmes bruits retirés que
     /// chez le parent : `html5ever` avertit à chaque tableau mal formé, `tantivy` écrit des chemins.
+    /// Et les deux bibliothèques PDF se taisent tout à fait : leurs avertissements citent des
+    /// objets du document, donc des octets choisis par l'expéditeur.
     pub(crate) fn journal() {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_ansi(false)
             .with_env_filter(tracing_subscriber::EnvFilter::new(
-                "info,html5ever=error,tantivy=warn",
+                "info,html5ever=error,tantivy=warn,lopdf=off,pdf_inspector=off",
             ))
             .try_init();
         crate::panics::install();
@@ -920,7 +923,9 @@ fn spawn(
     held: crate::jobs::Held,
 ) -> Result<Running, Unavailable> {
     let mut command = Command::new(program);
+    // Sans le jeton du démon, comme tous les enfants : voir `crate::vectors::command`.
     command
+        .env_remove(crate::config::TOKEN_VAR)
         .arg(CHILD_FLAG)
         .arg(root.as_str())
         .stdin(Stdio::piped())

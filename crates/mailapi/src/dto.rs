@@ -75,6 +75,43 @@ pub struct Semantic {
     /// La commande qui répare, s'il y en a une.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gesture: Option<String>,
+    /// La lecture du texte des PDF joints, que la même passe de fond fait avant les vecteurs —
+    /// depuis le 2026-10-20. Absente d'un démon plus ancien, ou qui ne la monte pas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Attachments>,
+}
+
+/// Où en est la lecture des PDF joints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentsState {
+    /// Tout est lu.
+    Idle,
+    /// La lecture commence peu après le démarrage.
+    Waiting,
+    /// Des messages sont en cours de lecture.
+    Working,
+    /// Une tâche ou la recherche par le sens occupe la machine : la lecture attend.
+    Paused,
+    /// Un autre processus lit les PDF de ce store.
+    Busy,
+    /// La lecture ne tourne pas sur ce système, ou a échoué ; le démon dit pourquoi.
+    Unavailable,
+    /// Ce démon ne la monte pas.
+    Disabled,
+}
+
+/// La lecture des PDF joints : son état, ce qui reste, et une phrase composée par le démon —
+/// sans chemin ni nom de pièce.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachments {
+    /// L'état, pour décider.
+    pub state: AttachmentsState,
+    /// Combien de messages restent à lire, quand le démon le sait.
+    #[serde(default)]
+    pub pending: u64,
+    /// Une phrase, pour l'afficher.
+    pub sentence: String,
 }
 
 /// Ce que le démon dit de lui-même, en un aller-retour.///

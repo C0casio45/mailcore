@@ -31,6 +31,13 @@ mailmcp.workspace            = true
 # relancé en processus enfant, qui charge le modèle et la fait. D'où la dépendance, et d'où le
 # fait que `candle` est compilé dans les coquilles : elles lancent leur propre exécutable.
 mailvec.workspace            = true
+# L'extracteur PDF : le même exécutable, relancé en enfant (`attachments`). Le démon décide et
+# range ; seul l'enfant analyse un PDF, sous la borne de mémoire de `mailbound` et sous un budget
+# de temps processeur relevé par `sysinfo`.
+mailpdf.workspace            = true
+mailbound.workspace          = true
+mail-parser.workspace        = true
+sysinfo.workspace            = true
 rmcp.workspace               = true
 tokio.workspace              = true
 serde.workspace              = true
@@ -65,6 +72,9 @@ mailfake.workspace = true
 # La passe de fond se teste contre un vrai `Bert::load`, sur le transformeur minuscule des tests de
 # `mailvec`.
 mailvec = { workspace = true, features = ["test-support"] }
+
+# Les PDF des tests de l'extracteur sont fabriqués par l'écriture de lopdf — déjà là, par `mailpdf`.
+lopdf.workspace = true
 
 
 [lints]

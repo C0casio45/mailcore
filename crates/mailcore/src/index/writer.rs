@@ -228,7 +228,7 @@ fn advance(
             Some(writer) => writer,
             None => writer.insert(index.writer(WRITER_HEAP)?),
         };
-        let mut done: Vec<crate::MessageId> = Vec::with_capacity(rows.len());
+        let mut done: Vec<(crate::MessageId, i64)> = Vec::with_capacity(rows.len());
 
         for row in &rows {
             if progress.is_cancelled() {
@@ -236,8 +236,8 @@ fn advance(
                 cancelled = true;
                 break;
             }
-            index_one(store, writer, fields, &parser, row, &mut text, &mut stats)?;
-            done.push(row.id);
+            let revision = index_one(store, writer, fields, &parser, row, &mut text, &mut stats)?;
+            done.push((row.id, revision));
             progress.advance(1);
 
             if stats.indexed % PROGRESS_EVERY == 0 && stats.indexed > 0 {
@@ -345,7 +345,7 @@ fn index_one(
     row: &crate::store::read::IndexRow,
     text: &mut String,
     stats: &mut IndexStats,
-) -> Result<()> {
+) -> Result<i64> {
     let raw = match store.blobs().read(row.blob) {
         Ok(bytes) => bytes,
         Err(crate::Error::BlobNotFound(hash)) => {
@@ -353,17 +353,22 @@ fn index_one(
             // quoi interrompre une indexation de 73 000 messages.
             tracing::warn!(%hash, id = row.id.0, "blob absent, message non indexé");
             stats.missing_blobs += 1;
-            return Ok(());
+            return Ok(row.attach_rev);
         }
         Err(other) => return Err(other),
     };
+
+    // Le texte des PDF que l'enfant extracteur a rangé, et la révision qui va avec, **lus
+    // ensemble** : c'est cette révision que le marquage redonne, donc celle du texte réellement
+    // écrit dans le document — `SCHEMA_V17`.
+    let (revision, stored) = store.attachment_texts(row.id, crate::attachtext::BUDGET)?;
 
     text.clear();
     let mut recipients = String::new();
 
     match parser.parse(&raw) {
         Some(parsed) => {
-            body_text(&parsed, text);
+            body_text(&parsed, &stored, text);
             addresses(parsed.to(), &mut recipients);
             addresses(parsed.cc(), &mut recipients);
         }
@@ -398,7 +403,7 @@ fn index_one(
         fields.date => row.date,
     ))?;
     stats.indexed += 1;
-    Ok(())
+    Ok(revision)
 }
 
 /// Aplatit le corps du message en texte indexable.
@@ -410,7 +415,7 @@ fn index_one(
 /// même contenu deux fois, donc on indexe deux fois les mêmes mots — sans conséquence pour
 /// un moteur de recherche, et bien moins risqué que de choisir la « bonne » partie et de
 /// rater le seul endroit où un mot apparaît.
-fn body_text(parsed: &mail_parser::Message<'_>, out: &mut String) {
+fn body_text(parsed: &mail_parser::Message<'_>, stored: &[String], out: &mut String) {
     for index in 0..parsed.text_body_count() {
         if let Some(part) = parsed.body_text(index) {
             if !out.is_empty() {
@@ -428,7 +433,7 @@ fn body_text(parsed: &mail_parser::Message<'_>, out: &mut String) {
     // trouvait pas par le nom de son lieu, et le contenu d'une pièce jointe n'entrait dans aucun
     // des deux index — voir [`crate::attachtext`], qui est **partagé** avec la vectorisation
     // pour que les deux voient exactement le même texte.
-    crate::attachtext::attachment_text(parsed, out);
+    crate::attachtext::attachment_text(parsed, stored, out);
 }
 
 /// Ajoute les adresses et les noms d'un en-tête à `out`.

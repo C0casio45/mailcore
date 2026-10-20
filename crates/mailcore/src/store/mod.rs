@@ -24,6 +24,7 @@ pub mod drafts;
 pub mod flags;
 pub mod migrations;
 pub mod outbox;
+pub mod pdfs;
 pub mod read;
 pub mod threads;
 pub mod write;

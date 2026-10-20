@@ -76,6 +76,15 @@ pub const BUDGET: usize = 2_000;
 /// | 1 | sujet, expéditeur, corps sans citation (2026-09-21) |
 /// | 2 | le texte des pièces jointes s'y ajoute, avant le corps (2026-09-23) |
 /// | 3 | le message lu est borné à [`MESSAGE_CAP`], la source du corps à [`BODY_SOURCE_CAP`] (2026-09-25) |
+///
+/// **Le texte des PDF, le 2026-10-20, ne monte pas la révision**, et c'est une décision écrite, pas
+/// un oubli. La règle n'a pas changé — le texte des pièces avant le corps, au plus la moitié de la
+/// place — ; ce qui change est ce que les pièces apportent. Et chaque changement d'apport remet à
+/// vectoriser **les seuls messages touchés** : `attach_rev` monte, `vectorised` repasse à 0
+/// (`SCHEMA_V17`). Monter la révision aurait rendu tout le magasin périmé pour un millier de
+/// messages, donc demandé une passe complète d'une heure par un geste de l'utilisateur — un
+/// effacement déguisé en mise à jour. Le jour où la **règle** de composition changera pour le PDF,
+/// la révision montera.
 pub const REVISION: u32 = 3;
 
 /// Ce qu'on lit d'un message pour en composer le texte : ses seize premiers mébioctets.
@@ -205,6 +214,7 @@ fn push_part(out: &mut String, part: &str) {
 #[must_use]
 pub fn from_message(
     parsed: &mail_parser::Message<'_>,
+    stored: &[String],
     subject: &str,
     from_name: Option<&str>,
     budget: Budget,
@@ -228,7 +238,7 @@ pub fn from_message(
     compose_with(
         subject,
         from_name,
-        &attachments(parsed, budget),
+        &attachments(parsed, stored, budget),
         &body(&html, budget),
     )
 }
@@ -250,13 +260,13 @@ pub fn from_message(
 /// message garde toujours de quoi être lui-même, quoi que l'expéditeur y ait accroché. C'est la
 /// même forme que le plafond de [`mailcore::attachtext::BUDGET`], un cran plus bas : là-bas il
 /// borne ce qu'un expéditeur fait consommer, ici il borne ce qu'il fait **oublier**.
-fn attachments(parsed: &mail_parser::Message<'_>, budget: Budget) -> String {
+fn attachments(parsed: &mail_parser::Message<'_>, stored: &[String], budget: Budget) -> String {
     let room = budget.body / 2;
     if room == 0 {
         return String::new();
     }
     let mut text = String::new();
-    mailcore::attachtext::attachment_text(parsed, &mut text);
+    mailcore::attachtext::attachment_text(parsed, stored, &mut text);
     truncate(text, room)
 }
 
@@ -390,12 +400,14 @@ mod tests {
         let small = html_message("", &"mot ".repeat(1_000));
         let from_big = from_message(
             &parser.parse(&big).unwrap(),
+            &[],
             "nouvelles",
             None,
             Budget::default(),
         );
         let from_small = from_message(
             &parser.parse(&small).unwrap(),
+            &[],
             "nouvelles",
             None,
             Budget::default(),
@@ -412,6 +424,7 @@ mod tests {
         let raw = html_message(&filler, "chaudiere");
         let found = from_message(
             &parser.parse(&raw).unwrap(),
+            &[],
             "nouvelles",
             None,
             Budget::default(),
@@ -421,6 +434,7 @@ mod tests {
         let raw = html_message("<!-- court -->", "chaudiere");
         let found = from_message(
             &parser.parse(&raw).unwrap(),
+            &[],
             "nouvelles",
             None,
             Budget::default(),
@@ -442,6 +456,7 @@ mod tests {
         let parsed = parser.parse(raw.as_slice()).unwrap();
         let found = from_message(
             &parsed,
+            &[],
             "Re: chaudiere",
             Some("Plomberie Martin"),
             Budget::default(),
@@ -468,7 +483,7 @@ mod tests {
                     Voici le devis pour la chaudiere.\r\n";
         let parser = mail_parser::MessageParser::default();
         let parsed = parser.parse(raw.as_slice()).unwrap();
-        let found = from_message(&parsed, "chaudiere", None, Budget::default());
+        let found = from_message(&parsed, &[], "chaudiere", None, Budget::default());
         assert!(
             found.contains("devis"),
             "le texte légitime a disparu : {found}"
@@ -609,7 +624,7 @@ mod tests {
     fn composed(raw: &[u8], budget: Budget) -> String {
         let parser = mail_parser::MessageParser::default();
         let parsed = parser.parse(raw).unwrap();
-        from_message(&parsed, "Invitation", Some("Le notaire"), budget)
+        from_message(&parsed, &[], "Invitation", Some("Le notaire"), budget)
     }
 
     #[test]
@@ -630,6 +645,44 @@ mod tests {
         let notaire = found.find("Signature chez le notaire").expect("présent");
         let corps = found.find("invite a un evenement").expect("présent");
         assert!(notaire < corps, "la pièce jointe est passée après le corps");
+    }
+
+    /// Le texte d'un PDF rangé par l'enfant extracteur suit la même règle que les formats
+    /// gratuits — après eux, avant le corps, dans la même moitié de la place —, et une pièce PDF
+    /// bavarde ne chasse pas le corps non plus.
+    #[test]
+    fn a_stored_pdf_text_follows_the_attachment_rule() {
+        let parser = mail_parser::MessageParser::default();
+        let raw = with_invitation();
+        let parsed = parser.parse(raw.as_slice()).unwrap();
+        let stored = vec!["Relevé électricité référence 2608".to_owned()];
+        let found = from_message(
+            &parsed,
+            &stored,
+            "Invitation",
+            Some("Le notaire"),
+            Budget::default(),
+        );
+        let notaire = found.find("Signature chez le notaire").expect("présent");
+        let pdf = found.find("électricité").expect("le texte du PDF manque");
+        let corps = found.find("invite a un evenement").expect("présent");
+        assert!(
+            notaire < pdf && pdf < corps,
+            "l'ordre des pièces a changé : {found}"
+        );
+
+        let talkative = vec!["électricité ".repeat(5_000)];
+        let found = from_message(
+            &parsed,
+            &talkative,
+            "Invitation",
+            Some("Le notaire"),
+            Budget::default(),
+        );
+        assert!(
+            found.contains("invite a un evenement"),
+            "un PDF bavard a chassé le corps : {found}"
+        );
     }
 
     /// Et le contrôle inverse : une pièce jointe bavarde ne chasse pas le message.

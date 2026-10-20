@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// La version de schéma que ce binaire sait lire et écrire.
-pub const SCHEMA_VERSION: u32 = 16;
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Le schéma initial.
 ///
@@ -742,6 +742,55 @@ const SCHEMA_V15: &str = r"
 ALTER TABLE flag_pushes ADD COLUMN seen INTEGER NOT NULL DEFAULT 1;
 ";
 
+/// v17 — le texte des PDF joints, et ce qu'il faut pour le suivre sans rien perdre.
+///
+/// ## Pourquoi, depuis le 2026-10-20
+///
+/// Un PDF joint n'entrait dans aucun des deux index. Le lire est de l'analyse d'entrée hostile, qui
+/// n'aura lieu que dans un processus enfant : son texte doit donc être **rangé** quelque part, puis
+/// relu au même point par l'index plein texte et par la composition du texte vectorisé — la règle
+/// « les deux index voient le même texte » passe du code partagé à la donnée partagée.
+///
+/// ## Une table par pièce de message, dans `index.sqlite`
+///
+/// `message_pdfs` porte, pour chaque PDF d'un message, son empreinte (BLAKE3 des octets décodés),
+/// son état — un texte, ou la raison de son absence —, la révision de la règle d'extraction qui l'a
+/// produit, et le texte compressé, plafonné à `attachtext::BUDGET`. Une seule table et non deux —
+/// textes par empreinte, liens par message : la cascade emporte le texte avec son message, sans
+/// orphelin à purger, et un PDF reçu dans plusieurs messages voit son texte recopié depuis la
+/// première ligne de même empreinte plutôt que relu (`message_pdfs_by_hash`). Dans `index.sqlite`
+/// et non dans `blobs/` ni dans un fichier à part : le texte et les drapeaux changent dans la même
+/// transaction, `data_version` voit l'écriture, et les répliques des bancs le copient. Le principe
+/// « rien de volumineux dans SQLite » est tenu par le plafond et la compression : 836 Mio de PDF
+/// distincts sur le corpus de mesure, dont on garde au plus 256 Kio de texte chacun.
+///
+/// ## Deux colonnes sur `messages`
+///
+/// - `attachments_scanned` : 0 à lire, 1 lu, 2 l'analyse du message a tué l'enfant deux fois, 3 trop
+///   gros pour être analysé. Un drapeau par ligne, pas un filigrane — la leçon du carnet sur les
+///   `rowid` réutilisés. La moisson écrit 1 d'emblée pour un message sans PDF ; la migration ne
+///   présume rien des messages existants, que le premier passage lira tous.
+/// - `attach_rev` : monte chaque fois que le texte des pièces d'un message change. L'index et la
+///   passe des vecteurs le relisent avec leur ligne et ne marquent un message fait **que s'il n'a
+///   pas bougé entre-temps** — sinon un texte rangé pendant une passe serait couvert par un
+///   marquage écrit avec l'ancien, et le message garderait pour toujours un document sans son PDF.
+const SCHEMA_V17: &str = r"
+CREATE TABLE message_pdfs (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    rank       INTEGER NOT NULL,
+    hash       BLOB    NOT NULL,
+    state      INTEGER NOT NULL,
+    revision   INTEGER NOT NULL,
+    size       INTEGER NOT NULL,
+    text       BLOB,
+    PRIMARY KEY (message_id, rank)
+);
+CREATE INDEX message_pdfs_by_hash ON message_pdfs (hash);
+ALTER TABLE messages ADD COLUMN attachments_scanned INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN attach_rev INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX messages_unscanned ON messages (id) WHERE attachments_scanned = 0;
+";
+
 /// v16 — `outbox.id` en `AUTOINCREMENT` : un numéro d'envoi ne désigne qu'un seul message, pour
 /// toujours.
 ///
@@ -814,7 +863,24 @@ pub fn apply(conn: &Connection) -> Result<()> {
     }
 
     // Une seule transaction : un schéma à moitié appliqué serait pire qu'aucun schéma.
-    let tx = conn.unchecked_transaction()?;
+    //
+    // **Immédiate, et la version relue dedans.** Deux processus qui ouvrent le même store au même
+    // instant — la coquille et `mail`, ou la coquille ouverte deux fois — lisaient tous deux
+    // l'ancienne version hors de toute transaction, puis appliquaient tous deux la migration : le
+    // second échouait sur « duplicate column name », et son ouverture avec. Une transaction
+    // immédiate prend le verrou d'écriture d'emblée — le second attend le premier, dans la limite
+    // de `busy_timeout` —, et la version relue sous ce verrou est celle que le premier a laissée.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let current = user_version(&tx)?;
+    if current == SCHEMA_VERSION {
+        return Ok(());
+    }
+    if current > SCHEMA_VERSION {
+        return Err(Error::UnsupportedSchema {
+            found: current,
+            supported: SCHEMA_VERSION,
+        });
+    }
     if current < 1 {
         tx.execute_batch(SCHEMA_V1)?;
     }
@@ -862,6 +928,9 @@ pub fn apply(conn: &Connection) -> Result<()> {
     }
     if current < 16 {
         tx.execute_batch(SCHEMA_V16)?;
+    }
+    if current < 17 {
+        tx.execute_batch(SCHEMA_V17)?;
     }
     // `PRAGMA` ne se paramètre pas ; la valeur interpolée est une constante de compilation.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -1638,5 +1707,130 @@ mod tests {
             seen,
             "une marque « lu » d'avant la migration est devenue « non lu »"
         );
+    }
+
+    /// Les migrations jusqu'à `upto` comprise, sur une base neuve.
+    fn migrated_to(conn: &Connection, upto: u32) {
+        let steps = [
+            SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+            SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
+            SCHEMA_V16,
+        ];
+        for step in steps.iter().take(upto as usize) {
+            conn.execute_batch(step).unwrap();
+        }
+        conn.pragma_update(None, "user_version", upto).unwrap();
+    }
+
+    /// Un store du quotidien, au schéma 16 : ses messages restent, chacun « à lire » et à la
+    /// révision 0 de ses pièces, et le texte d'un PDF part avec son message.
+    #[test]
+    fn a_store_at_v16_gains_the_pdf_text_without_losing_a_message() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::apply_pragmas(&conn).unwrap();
+        migrated_to(&conn, 16);
+        fixture(&conn);
+        conn.execute(
+            "INSERT INTO messages (id, blob_hash, date, from_addr, subject, size, has_attachments,
+                                   indexed, vectorised)
+             VALUES (1, x'01', 42, 'a@b', 'facture', 10, 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.query_row("SELECT attachments_scanned FROM messages", [], |r| r
+                .get::<_, i64>(0))
+                .is_err(),
+            "la colonne existe déjà : ce test ne mesure pas la migration"
+        );
+
+        apply(&conn).unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), SCHEMA_VERSION);
+        let (scanned, rev, indexed, vectorised): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT attachments_scanned, attach_rev, indexed, vectorised FROM messages",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (scanned, rev),
+            (0, 0),
+            "un message existant doit être lu une fois"
+        );
+        // La migration ne remet rien à indexer ni à vectoriser : c'est la lecture d'un PDF qui le
+        // fera, message par message, et seulement si elle trouve un texte.
+        assert_eq!((indexed, vectorised), (1, 1));
+
+        conn.execute(
+            "INSERT INTO message_pdfs (message_id, rank, hash, state, revision, size)
+             VALUES (1, 0, x'02', 0, 1, 100)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM messages WHERE id = 1", [])
+            .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT count(*) FROM message_pdfs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            left, 0,
+            "le texte d'un PDF a survécu à son message : un orphelin en clair"
+        );
+    }
+
+    /// La requête des messages à lire passe par son index partiel, sans balayer la table.
+    #[test]
+    fn the_unscanned_query_uses_its_partial_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::apply_pragmas(&conn).unwrap();
+        apply(&conn).unwrap();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE attachments_scanned = 0
+                  ORDER BY id DESC LIMIT 200",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("messages_unscanned"), "{plan}");
+    }
+
+    /// Deux ouvertures du même store au même instant : la seconde attend la première et trouve le
+    /// schéma à jour, au lieu de rejouer la migration et d'échouer sur une table déjà créée.
+    #[test]
+    fn two_openings_at_once_migrate_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            db::apply_pragmas(&conn).unwrap();
+            migrated_to(&conn, 16);
+        }
+        // La première ouverture tient le verrou d'écriture pendant qu'elle migre — fabriquée à la
+        // main, pour que la seconde arrive **pendant**, à coup sûr.
+        let (taken, wait) = std::sync::mpsc::channel();
+        let first_path = path.clone();
+        let first = std::thread::spawn(move || {
+            let conn = Connection::open(&first_path).unwrap();
+            db::apply_pragmas(&conn).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            conn.execute_batch(SCHEMA_V17).unwrap();
+            conn.pragma_update(None, "user_version", 17_u32).unwrap();
+            taken.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        wait.recv().unwrap();
+        let second = Connection::open(&path).unwrap();
+        db::apply_pragmas(&second).unwrap();
+        let outcome = apply(&second);
+        first.join().unwrap();
+        assert!(
+            outcome.is_ok(),
+            "la seconde ouverture a rejoué la migration : {outcome:?}"
+        );
+        assert_eq!(user_version(&second).unwrap(), 17);
     }
 }

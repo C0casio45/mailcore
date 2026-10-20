@@ -18,6 +18,9 @@ clap.workspace       = true
 blake3.workspace     = true
 tracing.workspace    = true
 mailcore.workspace   = true
+# L'analyseur du champ `body`, tel que le schéma livré le déclare : le banc du PDF compte les termes
+# retrouvés comme l'index les verrait.
+tantivy.workspace    = true
 # Le lecteur d'invitations, mesuré par `measure-invitations` sur le corpus réel.
 mailcal.workspace    = true
 # Le parcours MIME, pour trouver les pièces `text/calendar` là où elles sont.

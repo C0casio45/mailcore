@@ -1,0 +1,53 @@
+[package]
+name         = "pdf-runner"
+description  = "Le lecteur de candidats du banc A2 du PDF de mailcore."
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.96"
+license      = "MIT OR Apache-2.0"
+publish      = false
+
+# Un espace de travail à lui, vide : ce crate est **hors** de celui du dépôt (la racine l'exclut),
+# avec son propre `Cargo.lock`. Les bibliothèques qui perdront le comparatif n'entrent donc ni dans
+# le verrou du dépôt ni dans la CI ; le gagnant y entrera seul, dans `mailpdf`.
+[workspace]
+
+[[bin]]
+name = "pdf-runner"
+path = "src/main.rs"
+
+[dependencies]
+# Les trois candidats, épinglés à la version près : un banc qui compare des versions flottantes
+# compare ce que l'index de crates.io servait ce jour-là.
+#
+# `pdf-inspector` avec ses fonctions par défaut, qui sont vides : ni `model-download` (qui tire
+# `ureq`, donc du réseau), ni OCR, ni modèle. Vérifié par `cargo tree -i ureq`, qui ne trouve rien.
+pdf-inspector = "=1.25.2"
+# `pdf-extract` 0.12.1 tire **sa** version de lopdf, la 0.42 : c'est elle qui lit pour lui, et elle
+# coexiste avec la 0.45 ci-dessous.
+pdf-extract   = "=0.12.1"
+# L'extracteur brut de référence, le comptage de pages de pdf-inspector quand il échoue sur le
+# document entier, et l'API d'écriture des PDF fabriqués : la version que pdf-inspector lit.
+lopdf         = "=0.45.0"
+serde         = { version = "1.0", features = ["derive"] }
+serde_json    = "1.0"
+blake3        = "1.8"
+# Le temps processeur du processus, relevé autour de l'appel seul.
+sysinfo       = { version = "0.39", default-features = false, features = ["system"] }
+
+# Les règles de l'espace de travail, recopiées : ce crate n'en hérite pas.
+[lints.rust]
+unsafe_code                   = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+# Le profil de l'espace de travail. `panic` reste à `unwind` — la valeur par défaut, écrite pour
+# qu'on ne la change pas : une panique de candidat est rattrapée par `catch_unwind` et devient une
+# issue, `abort` en ferait une mort.
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+panic         = "unwind"

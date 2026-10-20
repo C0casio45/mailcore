@@ -57,6 +57,10 @@ pub struct IndexRow {
     pub date: i64,
     /// Les chemins des dossiers qui référencent ce message, séparés par une espace.
     pub folders: String,
+    /// La révision du texte des pièces jointes au moment de la lecture — `SCHEMA_V17`. Le
+    /// marquage la redonne : un texte de PDF rangé pendant la passe la fait monter, et le message
+    /// reste à refaire au lieu d'être marqué avec un document qui ne le porte pas.
+    pub attach_rev: i64,
 }
 
 /// Les deux comptes que le contrôle du critère 9 compare, lus ensemble — voir
@@ -105,6 +109,20 @@ pub struct VectorRow {
     /// qui dilue la moyenne du message — c'est exactement ce que la fenêtre courte interdit de
     /// se permettre.
     pub from_name: Option<String>,
+    /// La révision du texte des pièces jointes — voir [`IndexRow::attach_rev`].
+    pub attach_rev: i64,
+}
+
+/// Un message dont les pièces jointes sont à lire — `SCHEMA_V17`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanRow {
+    /// Identifiant interne.
+    pub id: MessageId,
+    /// L'identité du contenu : c'est elle que l'enfant relit, et elle que l'écriture du résultat
+    /// redonne, pour qu'un identifiant réutilisé ne reçoive jamais les pièces d'un autre message.
+    pub blob: BlobHash,
+    /// Taille du message stocké, pour écarter avant analyse un message trop gros.
+    pub size: u64,
 }
 
 /// Ce dont la passe de threading a besoin pour un message.
@@ -283,7 +301,7 @@ impl Store {
         // différents de ceux d'une reconstruction.
         let mut statement = self.connection().prepare_cached(
             "SELECT m.id, m.blob_hash, m.subject, m.from_addr, m.from_name, m.date,
-                    COALESCE(GROUP_CONCAT(f.path, ' '), '')
+                    COALESCE(GROUP_CONCAT(f.path, ' '), ''), m.attach_rev
              FROM messages m
              LEFT JOIN refs r ON r.message_id = m.id
              LEFT JOIN folders f ON f.id = r.folder_id
@@ -335,20 +353,30 @@ impl Store {
     /// remplaçant le document par son identifiant — alors qu'un lot marqué puis non indexé
     /// serait introuvable pour toujours.
     ///
+    /// **Conditionnel à la révision des pièces lue avec la ligne** — `SCHEMA_V17`. Un texte de PDF
+    /// rangé pendant la passe fait monter `attach_rev` et remet le message à indexer ; un marquage
+    /// inconditionnel l'effacerait, et le message garderait pour toujours un document sans son PDF.
+    /// Une ligne qui ne correspond plus n'est pas marquée : elle revient à la passe suivante, qui la
+    /// refait — sans effet de bord, le document étant remplacé par son identifiant.
+    ///
+    /// Rend combien de messages ont été marqués.
+    ///
     /// # Errors
     ///
     /// [`crate::Error::Sqlite`].
-    pub fn mark_indexed(&self, ids: &[MessageId]) -> Result<()> {
+    pub fn mark_indexed(&self, done: &[(MessageId, i64)]) -> Result<usize> {
         let tx = self.connection().unchecked_transaction()?;
+        let mut marked = 0;
         {
-            let mut statement =
-                tx.prepare_cached("UPDATE messages SET indexed = 1 WHERE id = ?1")?;
-            for id in ids {
-                statement.execute([id.0])?;
+            let mut statement = tx.prepare_cached(
+                "UPDATE messages SET indexed = 1 WHERE id = ?1 AND attach_rev = ?2",
+            )?;
+            for (id, revision) in done {
+                marked += statement.execute(params![id.0, revision])?;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(marked)
     }
 
     /// Remet tous les messages à « pas encore indexé ».
@@ -401,7 +429,7 @@ impl Store {
     /// [`crate::Error::Sqlite`].
     pub fn unvectorised(&self, limit: usize) -> Result<Vec<VectorRow>> {
         let mut statement = self.connection().prepare_cached(
-            "SELECT id, blob_hash, subject, from_name
+            "SELECT id, blob_hash, subject, from_name, attach_rev
              FROM messages
              WHERE vectorised = 0
              ORDER BY id
@@ -483,20 +511,117 @@ impl Store {
     /// fait rien. L'ordre inverse laisserait un message sans vecteur, marqué comme en ayant un,
     /// et il ne sortirait plus jamais d'une recherche sémantique.
     ///
+    /// **Conditionnel à la révision des pièces**, pour la raison écrite à [`Self::mark_indexed`] :
+    /// le texte d'un PDF rangé pendant la passe — ou pendant un lot confié à l'enfant de la
+    /// recherche — remet le message à vectoriser, et ce marquage-ci ne doit pas l'effacer.
+    ///
+    /// Rend combien de messages ont été marqués.
+    ///
     /// # Errors
     ///
     /// [`crate::Error::Sqlite`].
-    pub fn mark_vectorised(&self, ids: &[MessageId]) -> Result<()> {
+    pub fn mark_vectorised(&self, done: &[(MessageId, i64)]) -> Result<usize> {
         let tx = self.connection().unchecked_transaction()?;
+        let mut marked = 0;
         {
-            let mut statement =
-                tx.prepare_cached("UPDATE messages SET vectorised = 1 WHERE id = ?1")?;
-            for id in ids {
-                statement.execute([id.0])?;
+            let mut statement = tx.prepare_cached(
+                "UPDATE messages SET vectorised = 1 WHERE id = ?1 AND attach_rev = ?2",
+            )?;
+            for (id, revision) in done {
+                marked += statement.execute(params![id.0, revision])?;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(marked)
+    }
+
+    /// Le texte des PDF joints d'un message, dans l'ordre de ses pièces, et la révision qui va
+    /// avec — **lus dans une même instruction**, donc un même instantané.
+    ///
+    /// C'est l'unique porte par laquelle l'index plein texte et la composition du texte vectorisé
+    /// voient ce texte : la règle « les deux index voient le même texte » tient par cette fonction.
+    /// La révision rendue est celle des textes rendus, et c'est elle que le marquage redonne.
+    ///
+    /// Les textes se décompressent **un à la fois**, et s'arrêtent au plafond : un message qui
+    /// porte neuf PDF ne coûte jamais neuf fois 256 Kio quand on n'en gardera que la moitié de
+    /// deux mille caractères. Un texte illisible — compression abîmée — est sauté, pas une erreur :
+    /// il ne doit pas empêcher le message d'être indexé.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn attachment_texts(&self, id: MessageId, ceiling: usize) -> Result<(i64, Vec<String>)> {
+        let mut statement = self.connection().prepare_cached(
+            "SELECT m.attach_rev, p.text
+             FROM messages m
+             LEFT JOIN message_pdfs p
+                    ON p.message_id = m.id AND p.state = ?2 AND p.text IS NOT NULL
+             WHERE m.id = ?1
+             ORDER BY p.rank",
+        )?;
+        let mut rows = statement.query(params![id.0, crate::attachtext::PdfState::Text as i64])?;
+        let mut revision = 0;
+        let mut texts = Vec::new();
+        let mut used = 0usize;
+        while let Some(row) = rows.next()? {
+            revision = row.get(0)?;
+            let Some(compressed) = row.get::<_, Option<Vec<u8>>>(1)? else {
+                continue;
+            };
+            if used >= ceiling {
+                continue;
+            }
+            let Some(text) = crate::attachtext::unpack(&compressed) else {
+                tracing::warn!(id = id.0, "texte de PDF rangé illisible, sauté");
+                continue;
+            };
+            used = used.saturating_add(text.len());
+            texts.push(text);
+        }
+        Ok((revision, texts))
+    }
+
+    /// Les messages dont les pièces jointes n'ont pas encore été lues, **les plus récents
+    /// d'abord**, au plus `limit`.
+    ///
+    /// Les plus récents d'abord : pendant le premier passage sur un store existant — des dizaines
+    /// de milliers de messages anciens —, le courrier qui arrive passe devant, au lieu d'attendre
+    /// derrière tout l'arriéré.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn unscanned(&self, limit: usize) -> Result<Vec<ScanRow>> {
+        let mut statement = self.connection().prepare_cached(
+            "SELECT id, blob_hash, size FROM messages
+             WHERE attachments_scanned = 0
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = statement.query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+            let hash: Vec<u8> = row.get(1)?;
+            Ok(ScanRow {
+                id: MessageId(row.get(0)?),
+                blob: blob_hash(&hash),
+                size: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+            })
+        })?;
+        collect(rows)
+    }
+
+    /// Combien de messages restent à lire pour leurs pièces jointes — la question la moins chère,
+    /// posée avant toute autre.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Sqlite`].
+    pub fn unscanned_total(&self) -> Result<u64> {
+        let count: i64 = self.connection().query_row(
+            "SELECT COUNT(*) FROM messages WHERE attachments_scanned = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     /// Remet tous les messages à « pas encore vectorisé ».
@@ -1155,7 +1280,7 @@ impl Store {
     pub fn all_for_indexing(&self) -> Result<Vec<IndexRow>> {
         let mut statement = self.connection().prepare(
             "SELECT m.id, m.blob_hash, m.subject, m.from_addr, m.from_name, m.date,
-                    COALESCE(GROUP_CONCAT(f.path, ' '), '')
+                    COALESCE(GROUP_CONCAT(f.path, ' '), ''), m.attach_rev
              FROM messages m
              LEFT JOIN refs r ON r.message_id = m.id
              LEFT JOIN folders f ON f.id = r.folder_id
@@ -1350,6 +1475,7 @@ fn index_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexRow> {
         from_name: row.get(4)?,
         date: row.get(5)?,
         folders: row.get(6)?,
+        attach_rev: row.get(7)?,
     })
 }
 
@@ -1366,6 +1492,7 @@ fn vector_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<VectorRow> {
         blob: blob_hash(&hash),
         subject: row.get(2)?,
         from_name: row.get(3)?,
+        attach_rev: row.get(4)?,
     })
 }
 

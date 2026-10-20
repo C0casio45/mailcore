@@ -50,6 +50,11 @@ const SHIPPED: &[&str] = &[
     "mailsmtp",
     "mailcal",
     "mailvec",
+    // Le texte des PDF joints, depuis le 2026-10-20 : l'extracteur et la borne de mémoire de son
+    // enfant. Le premier lit des octets choisis par un inconnu — c'est lui, plus que tout autre,
+    // qui ne doit rien pouvoir ouvrir.
+    "mailpdf",
+    "mailbound",
 ];
 
 /// Les seuls fichiers livrés autorisés à ouvrir une connexion sortante.
