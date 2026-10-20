@@ -94,7 +94,7 @@ pub fn check(
 ) -> Result<()> {
     let full = Bert::load(model).context("modèle d'origine")?;
     let small = Bert::load(trimmed).context("modèle taillé")?;
-    let store = Store::open(store).context("ouverture du store")?;
+    let store = crate::guard::open_store(store).context("ouverture du store")?;
     let rows = store.all_for_indexing().context("lecture des messages")?;
     let budget = mailvec::text::Budget::default();
 

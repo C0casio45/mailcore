@@ -171,11 +171,14 @@ pub fn measure(
         "{queries} ne contient aucune requête"
     );
 
-    let mailbox =
-        Mailbox::open(store_root).with_context(|| format!("ouverture de la boîte {store_root}"))?;
+    let mailbox = crate::guard::open_mailbox(store_root)
+        .with_context(|| format!("ouverture de la boîte {store_root}"))?;
 
     // L'index doit couvrir le store, sinon ce banc ment sans le dire — voir `check_coverage`.
     check_coverage(&mailbox, store_root)?;
+    // Et rien ne doit attendre une passe : un texte de PDF lu mais pas indexé laisse l'ancien
+    // document en place, et la couverture ne le voit pas.
+    crate::guard::settled(mailbox.store(), true, model.is_some())?;
 
     // **Toute la profondeur, sauf demande contraire.** Un rang coupé n'est pas une absence, et le
     // relevé les confondait : la valeur par défaut de 50 rendait « absente » chez les trois

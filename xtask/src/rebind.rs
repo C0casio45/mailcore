@@ -29,7 +29,6 @@
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use mailcore::Store;
 
 /// Ce que l'outil lit du jeu, sans rien supposer du reste.
 ///
@@ -65,7 +64,8 @@ pub fn run(
     let raw = std::fs::read_to_string(queries)
         .with_context(|| format!("lecture du jeu de requêtes {queries}"))?;
     let ground: Ground = toml::from_str(&raw).with_context(|| format!("analyse de {queries}"))?;
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
 
     let rows = store
         .all_for_indexing()

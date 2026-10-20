@@ -27,7 +27,6 @@
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use mail_parser::MessageParser;
-use mailcore::Store;
 use mailsmtp::compose::{Address, Draft};
 use std::collections::BTreeMap;
 
@@ -78,7 +77,8 @@ struct Verdict {
 ///
 /// Si le store est illisible.
 pub fn measure(store_root: &Utf8PathBuf, limit: usize) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     let rows = store.all_for_indexing()?;
     anyhow::ensure!(!rows.is_empty(), "store vide");
 

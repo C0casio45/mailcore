@@ -24,7 +24,6 @@
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use mailcore::Mailbox;
 use mailcore::store::read::IndexRow;
 
 /// Ce qu'on demande à l'outil.
@@ -58,7 +57,7 @@ pub fn run(options: &Options) -> Result<()> {
         "soit --sample, soit --subject et/ou --from : un tirage filtré choisirait déjà ses cibles"
     );
 
-    let mailbox = Mailbox::open(&options.store)
+    let mailbox = crate::guard::open_mailbox(&options.store)
         .with_context(|| format!("ouverture de la boîte {}", options.store))?;
     let rows = mailbox
         .store()

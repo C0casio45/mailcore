@@ -145,7 +145,7 @@ pub fn run(inputs: &Inputs) -> Result<()> {
     inside(&a_root, &base)?;
     println!(
         "Réplique          {a_root}  (schéma {} copié)",
-        schema_of(&a_root.join("index.sqlite"))?
+        crate::guard::schema_of(&a_root.join("index.sqlite"))?.unwrap_or(0)
     );
     let opened = Instant::now();
     let store_a = Store::open(&a_root).context("ouverture de la réplique")?;
@@ -636,19 +636,6 @@ fn inside(root: &Utf8Path, base: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
-/// La version de schéma d'une base, lue dans son en-tête — sans ouvrir SQLite, qui créerait un
-/// journal à côté.
-fn schema_of(path: &Utf8Path) -> Result<u32> {
-    use std::io::Read;
-    let mut header = [0u8; 64];
-    std::fs::File::open(path.as_std_path())
-        .and_then(|mut file| file.read_exact(&mut header))
-        .with_context(|| format!("lecture de l'en-tête de {path}"))?;
-    Ok(u32::from_be_bytes([
-        header[60], header[61], header[62], header[63],
-    ]))
-}
-
 /// L'état d'avant, vérifié : aucun PDF lu, rien à indexer ni à vectoriser, un index qui couvre le
 /// store, et des vecteurs **de ce modèle** — le seul contrôle qui voit des vecteurs d'un autre
 /// modèle sous le bon nombre de dimensions.
@@ -884,21 +871,6 @@ mod tests {
             "v5"
         );
         assert_eq!(set_name(Utf8Path::new("phase4-queries-v3.toml")), "v3");
-    }
-
-    #[test]
-    fn the_schema_is_read_from_the_header_without_opening_sqlite() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = Utf8PathBuf::from_path_buf(dir.path().join("index.sqlite")).unwrap();
-        {
-            let connection = rusqlite::Connection::open(path.as_std_path()).unwrap();
-            connection.pragma_update(None, "user_version", 15).unwrap();
-            connection.execute_batch("CREATE TABLE t(x)").unwrap();
-        }
-        let before: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
-        assert_eq!(schema_of(&path).unwrap(), 15);
-        let after: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
-        assert_eq!(before.len(), after.len(), "la lecture a créé un fichier");
     }
 
     /// Le verdict suit la règle : chaque condition, à sa limite.

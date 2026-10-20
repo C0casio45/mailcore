@@ -4400,3 +4400,23 @@ ses vecteurs à enfant froid ; deux candidats sur dix-huit étaient des scans, s
 pas mesuré : l'ordonnancement du démon — la mise à jour de l'index pour le texte d'un PDF est un
 job, mis en file au plus une fois par tic de dix minutes pendant un rattrapage, mais tout de suite
 pour une arrivée isolée.
+
+**Les gardes des bancs, posées le même soir** (`xtask/src/guard.rs`), parce que le schéma 17 rend
+deux dangers concrets :
+
+- **ouvrir le corpus le migre en place.** `mailcore` n'a pas d'ouverture en lecture seule, et vingt
+  bancs ouvraient leur `--store` directement — `measure-recall`, `measure-search`, `model-*`,
+  `corpus-*`, `queries-*`, `attachment-census`, celui des secrets sur le store du quotidien… Tous
+  passent maintenant par `guard::open_store` et `guard::open_mailbox`, qui refusent un store hors de
+  `target/` que l'ouverture ferait monter de schéma, en lisant la version dans l'en-tête du fichier
+  sans ouvrir SQLite. L'import seul ouvre sans garde : il écrit par définition. Test et contrôle
+  négatif ;
+- **un démon lancé par un banc lisait les PDF du store mesuré.** `measure-api` lance `maild` sur le
+  corpus lui-même, et sa passe de fond — depuis ce jour — lit les PDF soixante secondes après le
+  démarrage : elle aurait écrit `message_pdfs`, remis des drapeaux et réindexé le corpus pendant la
+  mesure. `measure-api` et `measure-ui` posent maintenant `MAILCORE_VECTORS_DELAY_MS` à un jour sur
+  le processus qu'ils lancent.
+
+Et `measure-recall` et `measure-search` refusent un store où des messages attendent l'index — ou
+leurs vecteurs, quand un modèle est donné —, et disent où en est la lecture des PDF : un texte lu
+mais pas indexé laisse l'ancien document en place, et la vérification de couverture ne le voit pas.

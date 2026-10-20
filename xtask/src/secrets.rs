@@ -112,7 +112,8 @@ pub fn audit(store_root: &Utf8PathBuf, only: Option<i64>) -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)
         .context("un abonné tracing était déjà posé")?;
 
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     let accounts: Vec<mailcore::Account> = store
         .full_accounts()?
         .into_iter()

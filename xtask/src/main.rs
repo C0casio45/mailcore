@@ -21,6 +21,7 @@ mod client;
 mod corpus;
 mod findq;
 mod followup;
+mod guard;
 mod inspect;
 mod measure;
 mod merge;

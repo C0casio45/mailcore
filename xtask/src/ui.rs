@@ -1060,6 +1060,9 @@ fn once(
     let mut child = command
         .env("MAILCORE_STORE", store_root.as_str())
         .env("MAILCORE_UI_BENCH", bench)
+        // Pas de passe de fond — vecteurs ni PDF — pendant la mesure, quoi que dise
+        // l'environnement hérité : voir `guard::NO_BACKGROUND_MS`.
+        .env(maild::vectors::DELAY_ENV, crate::guard::NO_BACKGROUND_MS)
         // Les traces de l'application sortent sur l'erreur standard, et c'est par là que le
         // relevé arrive. `info` suffit ; le reste brouillerait la lecture.
         .env("RUST_LOG", "info,html5ever=error")
@@ -1418,8 +1421,8 @@ fn during_real_sync(store_root: &Utf8PathBuf, account: Option<i64>, runs: usize)
 /// synchronisent ». `--account` reste là pour isoler un fournisseur quand on cherche à
 /// comprendre lequel écrit vite, et pour ne pas dépenser la bande passante des autres.
 fn pick(store_root: &Utf8PathBuf, account: Option<i64>) -> Result<Vec<mailcore::Account>> {
-    let store =
-        mailcore::Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     let active: Vec<mailcore::Account> = store
         .full_accounts()?
         .into_iter()

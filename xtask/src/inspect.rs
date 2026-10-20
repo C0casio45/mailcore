@@ -29,7 +29,7 @@ use camino::Utf8Path;
 /// Si le store est illisible.
 pub fn folders(root: &Utf8Path, min: u64) -> Result<()> {
     let mailbox =
-        mailcore::Mailbox::open(root).with_context(|| format!("ouverture du store {root}"))?;
+        crate::guard::open_mailbox(root).with_context(|| format!("ouverture du store {root}"))?;
     let folders = mailbox.folders().context("liste des dossiers")?;
 
     let mut shown = 0_usize;

@@ -266,7 +266,9 @@ fn human(bytes: u64) -> String {
 /// **puis relire les métadonnées de chaque résultat dans SQLite**. C'est cette dernière
 /// partie que le critère 4 inclut et qu'une mesure du seul index oublierait.
 pub fn search(store_root: &Utf8PathBuf, repeats: usize) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
+    crate::guard::settled(&store, true, false)?;
     let (index, _) = mailcore::index::open_or_create(&store).context("ouverture de l'index")?;
     let searcher = mailcore::index::Searcher::open(&index).context("chercheur")?;
 
@@ -368,7 +370,8 @@ const SUGGESTIONS: usize = 8;
 /// Si le store est illisible, ou si le carnet est vide — auquel cas il n'y a rien à mesurer et
 /// le dire vaut mieux qu'un p95 de zéro.
 pub fn complete(store_root: &Utf8PathBuf, repeats: usize) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     let known = store.contact_count().context("carnet")?;
     if known == 0 {
         anyhow::bail!(
@@ -572,7 +575,8 @@ const INCREMENTAL_BUDGET: Duration = Duration::from_secs(5);
 ///
 /// Si le store est illisible, ou si le binaire `mail` ne peut pas être lancé.
 pub fn sync(store_root: &Utf8PathBuf, passes: usize, release: bool) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     let accounts: Vec<(i64, String)> = store
         .full_accounts()?
         .into_iter()
@@ -721,8 +725,8 @@ pub fn harvest_rss(store_root: &Utf8PathBuf, account: i64, messages: u64) -> Res
     anyhow::ensure!(messages > 0, "il faut au moins un message à moissonner");
 
     let target = {
-        let store =
-            Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+        let store = crate::guard::open_store(store_root)
+            .with_context(|| format!("ouverture de {store_root}"))?;
         store
             .full_accounts()?
             .into_iter()
@@ -913,7 +917,8 @@ pub fn attachment(megabytes: u64) -> Result<()> {
     let dir = tempfile::tempdir().context("répertoire temporaire")?;
     let store_root = camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf())
         .map_err(|path| anyhow::anyhow!("chemin temporaire non UTF-8 : {}", path.display()))?;
-    let store = Store::open(&store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(&store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     // Un compte, pour que la mise en file ait une clé étrangère valide.
     {
         let writer = store.writer().context("écriture")?;

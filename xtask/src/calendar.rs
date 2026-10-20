@@ -24,7 +24,6 @@
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use mailcore::Store;
 use std::collections::BTreeMap;
 
 /// Ce qu'une pièce de calendrier trouvée dans le corpus a comme forme.
@@ -68,7 +67,8 @@ struct Shapes {
 ///
 /// Si le store est illisible.
 pub fn survey(store_root: &Utf8PathBuf) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     let rows = store.all_for_indexing()?;
     anyhow::ensure!(!rows.is_empty(), "store vide");
 
@@ -310,7 +310,8 @@ struct Verdict {
 ///
 /// Si le store est illisible.
 pub fn measure(store_root: &Utf8PathBuf, show_gaps: bool) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
     let rows = store.all_for_indexing()?;
     anyhow::ensure!(!rows.is_empty(), "store vide");
 

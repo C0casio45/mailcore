@@ -42,7 +42,6 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use mailcore::{Mailbox, Store};
 use safetensors::tensor::{Dtype, TensorView};
 
 /// Taille le vocabulaire du modèle sur ce que le corpus emploie réellement.
@@ -65,8 +64,10 @@ pub fn trim(store_root: &Utf8PathBuf, model: &Utf8PathBuf, out: &Utf8PathBuf) ->
 
     // --- Ce que le corpus emploie ------------------------------------------------------------
 
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
-    let mailbox = Mailbox::open(store_root).with_context(|| format!("boîte {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
+    let mailbox =
+        crate::guard::open_mailbox(store_root).with_context(|| format!("boîte {store_root}"))?;
     let rows = store.all_for_indexing()?;
     anyhow::ensure!(!rows.is_empty(), "aucun message dans {store_root}");
 
@@ -342,8 +343,10 @@ pub fn check(
     trimmed: &Utf8PathBuf,
     count: usize,
 ) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
-    let mailbox = Mailbox::open(store_root).with_context(|| format!("boîte {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
+    let mailbox =
+        crate::guard::open_mailbox(store_root).with_context(|| format!("boîte {store_root}"))?;
     let rows = store.all_for_indexing()?;
     anyhow::ensure!(!rows.is_empty(), "aucun message dans {store_root}");
 
@@ -439,8 +442,10 @@ pub fn bench(
     // que le modèle taillé coûte quinze fois sa taille.
     let at_start = current_rss();
 
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
-    let mailbox = Mailbox::open(store_root).with_context(|| format!("boîte {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
+    let mailbox =
+        crate::guard::open_mailbox(store_root).with_context(|| format!("boîte {store_root}"))?;
     let at_store = current_rss();
 
     let rows = store.all_for_indexing()?;

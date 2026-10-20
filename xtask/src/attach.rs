@@ -23,7 +23,6 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use mail_parser::MimeHeaders;
-use mailcore::Store;
 
 use crate::words::words;
 
@@ -44,8 +43,8 @@ struct Tally {
 ///
 /// Si le store n'est pas lisible.
 pub fn census(store_root: &Utf8PathBuf, top: usize) -> Result<()> {
-    let store =
-        Store::open(store_root).with_context(|| format!("ouverture du store {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture du store {store_root}"))?;
     let rows = store
         .all_for_indexing()
         .context("lecture des messages du store")?;

@@ -23,7 +23,6 @@
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
-use mailcore::Store;
 
 /// Ce qu'une écriture demande au moteur de texte, du plus simple au plus exigeant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -93,7 +92,8 @@ impl Need {
 
 /// Compte ce que le corpus exige d'un moteur de texte.
 pub fn scripts(store_root: &Utf8PathBuf) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
 
     // La même lecture que celle de l'indexation : sujets, expéditeurs, jamais de corps.
     let rows = store.all_for_indexing()?;
@@ -209,8 +209,9 @@ pub fn sample(
     everything: bool,
     max_from: usize,
 ) -> Result<()> {
-    let store = Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
-    let mailbox = mailcore::Mailbox::open(store_root)
+    let store = crate::guard::open_store(store_root)
+        .with_context(|| format!("ouverture de {store_root}"))?;
+    let mailbox = crate::guard::open_mailbox(store_root)
         .with_context(|| format!("ouverture de la boîte {store_root}"))?;
 
     let mut rows = store.all_for_indexing()?;

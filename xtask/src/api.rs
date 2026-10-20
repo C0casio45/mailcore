@@ -36,7 +36,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use camino::Utf8PathBuf;
-use mailcore::Store;
 use serde_json::json;
 
 use crate::client::Client;
@@ -85,8 +84,8 @@ pub fn measure(store_root: &Utf8PathBuf, repeats: usize) -> Result<()> {
     // directement : c'est la même fonction que `measure-search`, donc les deux relevés
     // portent sur les mêmes requêtes et leur différence est le transport.
     let queries = {
-        let store =
-            Store::open(store_root).with_context(|| format!("ouverture de {store_root}"))?;
+        let store = crate::guard::open_store(store_root)
+            .with_context(|| format!("ouverture de {store_root}"))?;
         crate::measure::build_queries(&store)?
     };
 
@@ -332,6 +331,10 @@ pub(crate) fn spawn(store_root: &Utf8PathBuf) -> Result<Daemon> {
             &address.to_string(),
         ])
         .env("MAILCORE_TOKEN", TOKEN)
+        // **Pas de passe de fond pendant la mesure** : depuis le 2026-10-20, elle lit les PDF du
+        // store qu'on lui donne, soixante secondes après le démarrage — elle y écrirait, et l'index
+        // bougerait sous la mesure.
+        .env(maild::vectors::DELAY_ENV, crate::guard::NO_BACKGROUND_MS)
         // Les traces du démon partent sur la sortie d'erreur et brouilleraient le relevé.
         .env("RUST_LOG", "warn,html5ever=error")
         .stdout(std::process::Stdio::null())
