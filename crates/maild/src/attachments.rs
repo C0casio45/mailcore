@@ -1450,8 +1450,10 @@ impl<'a> Supervision<'a> {
                 Launched::Failed(Failure::Spawn)
             })?;
 
-        // **La borne avant la requête** : l'enfant n'a encore rien lu d'hostile.
-        let bound = match mailbound::bound(&child, launch.limits.memory) {
+        // **La borne avant la requête** : l'enfant n'a encore rien lu d'hostile. Tenue jusqu'à la fin de
+        // la fonction, donc au-delà de la sortie de l'enfant : sous Windows, la lâcher fermerait
+        // l'objet de travail, ce qui le tuerait.
+        let _bound = match mailbound::bound(&child, launch.limits.memory) {
             Ok(bound) => bound,
             Err(error) => {
                 let _ = child.kill();
@@ -1612,7 +1614,6 @@ impl<'a> Supervision<'a> {
         let _ = reader.join();
         let _ = journal.join();
         drop(stdin);
-        drop(bound);
         flush(store, &mut batch, &mut ended);
 
         // L'arrêt du démon tue l'enfant sans passer par ici : il se lit sur le drapeau.
