@@ -389,7 +389,11 @@ pdf-inspector retenu par un banc à règle gelée), et quatre règles en sortent
   instruction** que les textes (`Store::attachment_texts`) : sans ça, un PDF lu pendant une passe
   laissait un document sans son texte pour toujours ;
 - **le texte ne sort par aucune méthode d'API.** Il compose l'index et les vecteurs, et rien
-  d'autre ne le lit — `docs/PRIVACY.md` §8 bis. Le jeton du démon n'est hérité par aucun enfant.
+  d'autre ne le lit — `docs/PRIVACY.md` §8 bis. Le jeton du démon n'est hérité par aucun enfant ;
+- **un banc qui lance `maild` ou la coquille sur un store pose `MAILCORE_VECTORS_DELAY_MS`**
+  (`guard::NO_BACKGROUND_MS`) : sinon la passe de fond lit les PDF du store mesuré au bout de
+  soixante secondes, et l'écrit pendant la mesure. Et un banc ouvre son `--store` par
+  `guard::open_store`, qui refuse de migrer un store hors de `target/`.
 
 Deux leçons qui débordent le PDF :
 
