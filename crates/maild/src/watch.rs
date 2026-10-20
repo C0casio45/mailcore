@@ -417,7 +417,7 @@ where
 /// jobs qui feraient dix fois le même travail, dont neuf sur un store déjà à jour.
 fn trigger(id: i64, jobs: &Jobs) {
     if covered(&jobs.list(), id) {
-        tracing::debug!(compte = id, "synchronisation déjà en cours ou en file");
+        tracing::debug!(compte = id, "synchronisation déjà en file");
         return;
     }
     match jobs.enqueue(Kind::Sync { account: Some(id) }) {
@@ -426,7 +426,14 @@ fn trigger(id: i64, jobs: &Jobs) {
     }
 }
 
-/// Vrai si un job encore vivant va déjà synchroniser ce compte. **Fonction pure.**
+/// Vrai si un job **en file** va synchroniser ce compte. **Fonction pure.**
+///
+/// **En file, et pas en cours** — depuis le 2026-10-20. Une synchronisation en cours a peut-être
+/// déjà lu l'`INBOX` : l'annonce d'un message arrivé pendant qu'elle tourne était avalée, et le
+/// message attendait la synchronisation suivante — l'échéance de vingt-quatre minutes, ou la
+/// prochaine annonce. Une synchronisation en file, elle, n'a encore rien lu : elle verra le
+/// message. Trouvé en relisant la conception du texte des PDF, qui avait la même question à se
+/// poser pour l'index (`jobs::Jobs::follow`).
 ///
 /// Séparée de [`trigger`] pour être testable : décider en même temps qu'on met en file
 /// demanderait de faire tourner le fil de travail, donc de courser un job qui échoue vite — et
@@ -436,7 +443,7 @@ fn trigger(id: i64, jobs: &Jobs) {
 /// en ajouter un pour un compte particulier ferait refaire ce qu'il va faire de toute façon.
 fn covered(pending: &[crate::jobs::Snapshot], account: i64) -> bool {
     pending.iter().any(|it| {
-        !it.state.is_final()
+        it.state == crate::jobs::State::Queued
             && matches!(it.kind, Kind::Sync { account: only } if only.is_none_or(|it| it == account))
     })
 }
@@ -491,9 +498,22 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_of_this_account_covers_it() {
-        let pending = [job(Kind::Sync { account: Some(4) }, State::Running)];
+    fn a_queued_sync_of_this_account_covers_it() {
+        let pending = [job(Kind::Sync { account: Some(4) }, State::Queued)];
         assert!(covered(&pending, 4));
+    }
+
+    /// Le défaut corrigé le 2026-10-20 : une synchronisation **en cours** a peut-être déjà lu
+    /// l'`INBOX`, et l'annonce d'un message arrivé pendant ne doit pas être avalée.
+    #[test]
+    fn a_running_sync_does_not_cover_what_arrives_while_it_runs() {
+        for kind in [
+            Kind::Sync { account: Some(4) },
+            Kind::Sync { account: None },
+        ] {
+            let pending = [job(kind, State::Running)];
+            assert!(!covered(&pending, 4), "{kind:?}");
+        }
     }
 
     #[test]
@@ -506,7 +526,7 @@ mod tests {
 
     #[test]
     fn a_sync_of_another_account_does_not_cover_this_one() {
-        let pending = [job(Kind::Sync { account: Some(2) }, State::Running)];
+        let pending = [job(Kind::Sync { account: Some(2) }, State::Queued)];
         assert!(!covered(&pending, 4));
     }
 
