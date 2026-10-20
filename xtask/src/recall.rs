@@ -580,6 +580,192 @@ pub fn compare_models(base: &Utf8PathBuf, candidate: &Utf8PathBuf, primary: &str
     Ok(())
 }
 
+/// Ce que [`compare_states`] rend à la règle déclarée de `pdf-effect` : le verdict du bras primaire
+/// et ce qu'il faut pour la seconde condition, sans réimprimer quoi que ce soit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StateComparison {
+    /// La base est-elle **significativement** meilleure sur le bras primaire ?
+    pub(crate) base_better: bool,
+    /// Le candidat l'est-il ?
+    pub(crate) candidate_better: bool,
+    /// Combien de requêtes ont leur cible dans les dix premiers, base puis candidat, bras primaire.
+    pub(crate) top10: (usize, usize),
+    /// Combien de rangs ont changé, par bras : plein texte, sens, hybride.
+    pub(crate) changed: [usize; 3],
+}
+
+/// Compare deux relevés du même jeu **sur deux états d'un même store** — avant et après la lecture
+/// des PDF, ou un témoin et son double —, bras par bras, **le plein texte compris**.
+///
+/// [`compare_models`] ne le peut pas, et c'est voulu : il compare deux modèles sur un même index, et
+/// refuse deux relevés dont le rang plein texte ou le mot commun diffèrent. Ici, c'est l'index qui
+/// change : le texte d'un PDF déplace des rangs plein texte et des fréquences de mots, et c'est ce
+/// qu'on mesure. Ce qui doit rester le même l'est toujours : le jeu, dans le même ordre, la langue
+/// des cibles — calculée sur le corps, sans les PDF —, la provenance des vecteurs, les réglages.
+///
+/// Le comptage est **celui de [`compare_models`]** : [`paired_ranks`], [`report_paired`] et
+/// [`verdict`] — une seule règle, la leçon du 2026-09-10. Le bras primaire est l'hybride sur tout le
+/// jeu ; les sous-ensembles se lisent sur la base.
+///
+/// # Errors
+///
+/// Si un fichier est illisible, ou si les deux relevés ne portent pas le même jeu avec les mêmes
+/// vecteurs et les mêmes réglages.
+pub(crate) fn compare_states(
+    base: &Utf8PathBuf,
+    candidate: &Utf8PathBuf,
+    names: (&str, &str),
+) -> Result<StateComparison> {
+    let a = read_ranks(base)?;
+    let b = read_ranks(candidate)?;
+    same_queries(&a, &b)?;
+    let (left, right) = names;
+
+    println!(
+        "Jeu de requêtes    {}  ({} requêtes)",
+        a.queries,
+        a.rows.len()
+    );
+    println!(
+        "Vecteurs           {}",
+        a.provenance.as_deref().unwrap_or("provenance inconnue")
+    );
+    println!("Fusion             K = {}, profondeur {}", a.k, a.depth);
+    println!(
+        "Une victoire est une requête où « {left} » met la première réponse acceptable plus haut \
+         que « {right} » ; une défaite, l'inverse.\n"
+    );
+
+    let subsets = model_subsets(&a.rows);
+    let all = subsets[0].1.clone();
+    println!(
+        "=== COMPARAISON PRIMAIRE — bras hybride, tout le jeu, {} requêtes ===",
+        all.len()
+    );
+    let primary = paired_ranks(model_pairs(&a, &b, Engine::Hybrid, &all).into_iter());
+    report_paired(left, right, all.len(), &primary);
+
+    let top10 = |ranked: &Ranked, engine: Engine| {
+        ranked
+            .rows
+            .iter()
+            .filter(|row| row.rank(engine).is_some_and(|rank| rank <= 10))
+            .count()
+    };
+    let mut changed = [0usize; 3];
+    println!("=== PAR BRAS — rangs déplacés, dans les dix premiers ===");
+    for (slot, engine) in [Engine::FullText, Engine::Semantic, Engine::Hybrid]
+        .into_iter()
+        .enumerate()
+    {
+        let (mut up, mut down) = (0usize, 0usize);
+        for (x, y) in a.rows.iter().zip(&b.rows) {
+            match (x.rank(engine), y.rank(engine)) {
+                (before, after) if before == after => {}
+                (Some(before), Some(after)) if after < before => up += 1,
+                (None, Some(_)) => up += 1,
+                _ => down += 1,
+            }
+        }
+        changed[slot] = up + down;
+        println!(
+            "  {:<10} {up} montent, {down} descendent ; dans les dix premiers : {} pour « {left} », \
+             {} pour « {right} »",
+            short_label(engine),
+            top10(&a, engine),
+            top10(&b, engine)
+        );
+    }
+    println!();
+
+    let mut tracks = Vec::new();
+    for engine in [Engine::Hybrid, Engine::Semantic, Engine::FullText] {
+        for (index, (label, indexes)) in subsets.iter().enumerate() {
+            if engine == Engine::Hybrid && index == 0 {
+                continue;
+            }
+            tracks.push((engine, *label, indexes.clone()));
+        }
+    }
+    println!(
+        "=== COMPARAISONS EXPLORATOIRES — {} pistes à 5 %, donc jusqu'à {} % de chances qu'au \
+         moins une sorte « significative » par hasard ===\n",
+        tracks.len(),
+        (tracks.len() * 5).min(100)
+    );
+    for (engine, label, indexes) in &tracks {
+        println!(
+            "--- bras {}, {label} — {} requêtes ---",
+            short_label(*engine),
+            indexes.len()
+        );
+        report_paired(
+            left,
+            right,
+            indexes.len(),
+            &paired_ranks(model_pairs(&a, &b, *engine, indexes).into_iter()),
+        );
+    }
+
+    let decided = verdict(&primary);
+    Ok(StateComparison {
+        base_better: decided == Verdict::Left,
+        candidate_better: decided == Verdict::Right,
+        top10: (top10(&a, Engine::Hybrid), top10(&b, Engine::Hybrid)),
+        changed,
+    })
+}
+
+/// Deux relevés gardés ont-ils exactement les mêmes lignes — mêmes requêtes, mêmes rangs dans les
+/// trois bras ? C'est la preuve qu'un relevé se reproduit : sans elle, un écart entre deux états du
+/// store pourrait venir du relevé lui-même.
+///
+/// # Errors
+///
+/// Si un fichier est illisible.
+pub(crate) fn same_rows(a: &Utf8PathBuf, b: &Utf8PathBuf) -> Result<bool> {
+    Ok(read_ranks(a)?.rows == read_ranks(b)?.rows)
+}
+
+/// Les deux relevés portent-ils le même jeu, avec les mêmes vecteurs et les mêmes réglages ? Le
+/// rang plein texte et le mot commun, eux, ont le droit de différer — voir [`compare_states`].
+fn same_queries(a: &Ranked, b: &Ranked) -> Result<()> {
+    anyhow::ensure!(
+        a.provenance.is_some() && a.provenance == b.provenance,
+        "provenances des vecteurs différentes ou absentes — {:?} contre {:?} : l'écart viendrait \
+         des vecteurs, pas de l'état du store",
+        a.provenance,
+        b.provenance
+    );
+    anyhow::ensure!(
+        a.k.to_bits() == b.k.to_bits() && a.depth == b.depth,
+        "réglages différents — K {} contre {}, profondeur {} contre {}",
+        a.k,
+        b.k,
+        a.depth,
+        b.depth
+    );
+    anyhow::ensure!(
+        !a.truncated && !b.truncated,
+        "un relevé à profondeur coupée : une absence y voudrait dire « classée au-delà »"
+    );
+    anyhow::ensure!(
+        a.rows.len() == b.rows.len(),
+        "{} requêtes contre {} : ce ne sont pas deux relevés du même jeu",
+        a.rows.len(),
+        b.rows.len()
+    );
+    for (x, y) in a.rows.iter().zip(&b.rows) {
+        anyhow::ensure!(
+            x.text == y.text && x.lang == y.lang,
+            "« {} » contre « {} » : requêtes, ordre ou langue de cible différents",
+            x.text,
+            y.text
+        );
+    }
+    Ok(())
+}
+
 /// Les noms des deux côtés. Le même modèle avec d'autres réglages donnerait « X contre X », et le
 /// verdict « X est meilleur que X » : le rôle s'ajoute alors au nom.
 fn labels(a: &Ranked, b: &Ranked) -> (String, String) {
@@ -835,7 +1021,7 @@ fn language_of(detail: &mailcore::MessageDetail) -> Lang {
 /// # Errors
 ///
 /// Si l'index est illisible, ou s'il ne porte pas exactement un document par message indexable.
-fn check_coverage(mailbox: &Mailbox, store_root: &Utf8PathBuf) -> Result<u64> {
+pub(crate) fn check_coverage(mailbox: &Mailbox, store_root: &Utf8PathBuf) -> Result<u64> {
     let coverage = mailbox
         .index_coverage()
         .context("état de l'index plein texte")?
@@ -1810,6 +1996,75 @@ mod tests {
             truncated: false,
             rows,
         }
+    }
+
+    /// Deux états d'un même store se comparent quand le plein texte et le mot commun diffèrent —
+    /// c'est ce que la lecture des PDF déplace —, et jamais quand le jeu, la langue, les vecteurs ou
+    /// les réglages diffèrent.
+    #[test]
+    fn two_states_compare_across_full_text_but_not_across_vectors() {
+        let base = ranked(
+            "granite-latin",
+            vec![row("a", None, Some(1)), row("b", Some(40), Some(2))],
+        );
+        let mut moved = row("a", Some(3), Some(1));
+        moved.fulltext = Some(7);
+        let after = Ranked {
+            rows: vec![moved, row("b", Some(41), Some(2))],
+            ..base.clone()
+        };
+        same_queries(&base, &after).unwrap();
+        // Le contrôle inverse de l'ancienne règle : `same_set` refuse ce même couple.
+        assert!(same_set(&base, &after).is_err());
+
+        let refused = |other: Ranked, why: &str| {
+            assert!(same_queries(&base, &other).is_err(), "accepté : {why}");
+        };
+        refused(ranked("e5", base.rows.clone()), "d'autres vecteurs");
+        refused(
+            Ranked {
+                provenance: None,
+                ..base.clone()
+            },
+            "sans provenance",
+        );
+        refused(
+            Ranked {
+                rows: vec![row("b", Some(40), Some(2)), row("a", None, Some(1))],
+                ..base.clone()
+            },
+            "requêtes dans un autre ordre",
+        );
+        let mut english = row("a", None, Some(1));
+        english.lang = "en".to_owned();
+        refused(
+            Ranked {
+                rows: vec![english, row("b", Some(40), Some(2))],
+                ..base.clone()
+            },
+            "une autre langue de cible",
+        );
+        refused(
+            Ranked {
+                k: 30.0,
+                ..base.clone()
+            },
+            "un autre K",
+        );
+        refused(
+            Ranked {
+                depth: 50,
+                ..base.clone()
+            },
+            "une autre profondeur",
+        );
+        refused(
+            Ranked {
+                truncated: true,
+                ..base.clone()
+            },
+            "une profondeur coupée",
+        );
     }
 
     #[test]

@@ -40,10 +40,13 @@ use crate::semantic::{percentile, query_texts, release_only};
 use crate::vectors::{copy_index, copy_tree, link_blobs, work_dir_in};
 
 /// Ce qu'un index dit de ses segments : leur nombre, et combien sont petits.
-struct Segments {
-    count: usize,
-    small: usize,
-    documents: u64,
+pub(crate) struct Segments {
+    pub(crate) count: usize,
+    pub(crate) small: usize,
+    pub(crate) documents: u64,
+    /// Les documents retirés que les segments portent encore — une réindexation en laisse un par
+    /// message repris, jusqu'à la fusion suivante.
+    pub(crate) deleted: u64,
 }
 
 /// En dessous, un segment est « petit » : c'est la taille d'un paquet de l'indexation.
@@ -62,7 +65,7 @@ fn replica(store: &Utf8PathBuf, dir: &std::path::Path) -> Result<Utf8PathBuf> {
     Ok(root)
 }
 
-fn segments(store: &Store) -> Result<Segments> {
+pub(crate) fn segments(store: &Store) -> Result<Segments> {
     let (index, _) = mailcore::index::open_or_create(store).context("ouverture de l'index")?;
     let metas = index
         .searchable_segment_metas()
@@ -71,6 +74,10 @@ fn segments(store: &Store) -> Result<Segments> {
         count: metas.len(),
         small: metas.iter().filter(|meta| meta.max_doc() < SMALL).count(),
         documents: metas.iter().map(|meta| u64::from(meta.num_docs())).sum(),
+        deleted: metas
+            .iter()
+            .map(|meta| u64::from(meta.num_deleted_docs()))
+            .sum(),
     })
 }
 
@@ -83,13 +90,70 @@ fn files(root: &Utf8PathBuf) -> Result<usize> {
 }
 
 /// Ce que `Mailbox::open` et `Mailbox::reload_search` font de l'index, et rien d'autre.
-fn open_searcher(store: &Store) -> Result<Duration> {
+pub(crate) fn open_searcher(store: &Store) -> Result<Duration> {
     let at = Instant::now();
     let (index, _) = mailcore::index::open_or_create(store).context("ouverture de l'index")?;
     let searcher = mailcore::index::Searcher::open(&index).context("ouverture du chercheur")?;
     let elapsed = at.elapsed();
     drop(searcher);
     Ok(elapsed)
+}
+
+/// Fusionne tout l'index en **un seul segment sans document retiré**, et attend que les fichiers
+/// des anciens segments soient effacés : c'est l'état où deux index se comparent — à
+/// fragmentation égale —, et ce que deux relevés d'un même index ne garantissent pas.
+///
+/// **Aucun lecteur ne doit être ouvert** sur cet index : sous Windows, un fichier projeté par un
+/// `Searcher` vivant ne s'efface pas, et la taille mesurée compterait des segments morts.
+pub(crate) fn merge_to_one(store: &Store) -> Result<()> {
+    let (index, _) = mailcore::index::open_or_create(store).context("ouverture de l'index")?;
+    let before = segments(store)?;
+    if before.count > 1 || before.deleted > 0 {
+        let ids = index
+            .searchable_segment_ids()
+            .context("segments de l'index")?;
+        let mut writer: tantivy::IndexWriter = index
+            .writer(128 * 1024 * 1024)
+            .context("écrivain de l'index")?;
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        writer.merge(&ids).wait().context("fusion des segments")?;
+        writer
+            .garbage_collect_files()
+            .wait()
+            .context("effacement des anciens segments")?;
+        writer.wait_merging_threads().context("fin des fusions")?;
+    }
+    let after = segments(store)?;
+    anyhow::ensure!(
+        after.count == 1 && after.deleted == 0 && after.documents == before.documents,
+        "fusion incomplète : {} segments, {} documents retirés, {} documents contre {} avant",
+        after.count,
+        after.deleted,
+        after.documents,
+        before.documents
+    );
+    Ok(())
+}
+
+/// La taille de l'index plein texte, comptée sur **les fichiers que ses segments vivants
+/// déclarent** et sur `meta.json` — jamais en parcourant le répertoire, où un segment mort qui n'a
+/// pas pu être effacé compterait.
+pub(crate) fn index_size(store: &Store) -> Result<u64> {
+    let (index, _) = mailcore::index::open_or_create(store).context("ouverture de l'index")?;
+    let dir = store.root().join("search");
+    let size = |name: &std::path::Path| {
+        std::fs::metadata(dir.as_std_path().join(name)).map_or(0, |meta| meta.len())
+    };
+    let mut total = size(std::path::Path::new("meta.json"));
+    for meta in index
+        .searchable_segment_metas()
+        .context("segments de l'index")?
+    {
+        for file in meta.list_files() {
+            total += size(&file);
+        }
+    }
+    Ok(total)
 }
 
 /// Point d'entrée de `measure-merge`.
@@ -274,6 +338,8 @@ pub fn measure(
         repeats,
         all: usize::try_from(found.documents)?.saturating_add(arrivals),
         segments: [found.count, settled.count],
+        names: ["avant", "après"],
+        expect_gains: false,
     };
     compared.run("mots tirés des sujets", &build_queries(&before)?);
     // Les mots seuls sont le cas le moins cher : un terme, une liste de postings. Ce qu'on tape
@@ -286,23 +352,31 @@ pub fn measure(
 }
 
 /// Deux index ouverts côte à côte, et de quoi comparer une recherche sur l'un et sur l'autre.
-struct Compared<'a> {
-    stores: [&'a Store; 2],
-    searchers: &'a [mailcore::index::Searcher; 2],
-    repeats: usize,
+pub(crate) struct Compared<'a> {
+    pub(crate) stores: [&'a Store; 2],
+    pub(crate) searchers: &'a [mailcore::index::Searcher; 2],
+    pub(crate) repeats: usize,
     /// Assez pour qu'aucune requête ne soit coupée.
-    all: usize,
-    segments: [usize; 2],
+    pub(crate) all: usize,
+    pub(crate) segments: [usize; 2],
+    /// Le nom de chaque côté.
+    pub(crate) names: [&'a str; 2],
+    /// Le second côté **doit** rendre au moins autant de résultats que le premier — du texte
+    /// ajouté —, et seuls les comptes sont imprimés, jamais les requêtes. Faux : les deux côtés
+    /// doivent rendre autant, et chaque écart est imprimé.
+    pub(crate) expect_gains: bool,
 }
 
 impl Compared<'_> {
-    fn run(&self, label: &str, queries: &[String]) {
+    pub(crate) fn run(&self, label: &str, queries: &[String]) -> [Duration; 2] {
         let Self {
             stores,
             searchers,
             repeats,
             all,
             segments,
+            names,
+            expect_gains,
         } = self;
         println!(
             "\nRecherche, {label}  {} requêtes × {repeats} tours, le premier jeté, l'ordre alterné",
@@ -313,22 +387,38 @@ impl Compared<'_> {
         // rend cinquante, et une requête fréquente y serait égale des deux côtés quoi que la
         // fusion ait perdu. Hors chronomètre.
         let mut differing = Vec::new();
+        let (mut gained, mut lost, mut negated) = (0usize, 0usize, 0usize);
         let mut refused = 0usize;
         for query in queries {
             let counts = searchers
                 .each_ref()
                 .map(|searcher| searcher.search(query, *all).map(|hits| hits.len()).ok());
+            // Une exclusion — `facture -spam` — peut perdre des résultats quand du texte s'ajoute :
+            // le mot exclu peut y être. Elle ne dit donc rien de la règle « rien ne se perd ».
+            let excludes = query.starts_with('-') || query.contains(" -") || query.contains("NOT ");
             match counts {
                 [None, None] => refused += 1,
-                [before, after] if before != after => {
-                    differing.push(format!("{query} : {before:?} avant, {after:?} après"));
+                [Some(_), Some(_)] if *expect_gains && excludes => negated += 1,
+                [Some(first), Some(second)] if *expect_gains && second > first => gained += 1,
+                [Some(first), Some(second)] if *expect_gains && second < first => lost += 1,
+                [first, second] if first != second => {
+                    if *expect_gains {
+                        lost += 1;
+                    } else {
+                        differing.push(format!(
+                            "{query} : {first:?} {}, {second:?} {}",
+                            names[0], names[1]
+                        ));
+                    }
                 }
                 _ => {}
             }
         }
 
-        let mut latencies: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
+        // Les latences **par tour**, pour lire la dispersion avant la médiane.
+        let mut rounds: [Vec<Vec<Duration>>; 2] = [Vec::new(), Vec::new()];
         for round in 0..*repeats {
+            let mut this: [Vec<Duration>; 2] = [Vec::new(), Vec::new()];
             for (index, query) in queries.iter().enumerate() {
                 let order = if (index + round) % 2 == 0 {
                     [0, 1]
@@ -340,15 +430,38 @@ impl Compared<'_> {
                     // Une requête refusée l'est des deux côtés — comptée plus haut — et n'entre
                     // pas dans les latences, comme dans `measure-search`.
                     let answered = run_once(stores[side], &searchers[side], query).is_ok();
-                    if answered && round > 0 {
-                        latencies[side].push(at.elapsed());
+                    if answered {
+                        this[side].push(at.elapsed());
                     }
                 }
             }
+            if round > 0 {
+                for side in 0..2 {
+                    rounds[side].push(std::mem::take(&mut this[side]));
+                }
+            }
         }
+        let latencies: [Vec<Duration>; 2] = rounds
+            .each_ref()
+            .map(|kept| kept.iter().flatten().copied().collect());
+        let spread = |kept: &[Vec<Duration>]| {
+            let p95s: Vec<f64> = kept
+                .iter()
+                .map(|round| ms(percentile(round, 0.95)))
+                .collect();
+            let (low, high) = p95s
+                .iter()
+                .fold((f64::MAX, 0.0_f64), |(l, h), x| (l.min(*x), h.max(*x)));
+            if high > 0.0 { (high - low) / high } else { 0.0 }
+        };
         println!(
-            "                  avant ({} segments)   après ({})",
-            segments[0], segments[1]
+            "                  {} ({} segments)   {} ({})",
+            names[0], segments[0], names[1], segments[1]
+        );
+        println!(
+            "  dispersion p95   {:>8.2}             {:>8.2}      (max − min) / max entre tours",
+            spread(&rounds[0]),
+            spread(&rounds[1])
         );
         for (label, q) in [("p50", 0.5), ("p95", 0.95), ("max", 1.0)] {
             println!(
@@ -360,7 +473,22 @@ impl Compared<'_> {
         if refused > 0 {
             println!("  {refused} requêtes refusées des deux côtés — leur syntaxe, pas l'index");
         }
-        if differing.is_empty() {
+        if *expect_gains {
+            println!(
+                "  {gained} requêtes rendent plus de résultats côté « {} », {lost} en rendent moins{}{}",
+                names[1],
+                if negated > 0 {
+                    format!(" ; {negated} à exclusion, hors de ce compte")
+                } else {
+                    String::new()
+                },
+                if lost > 0 {
+                    " — ANOMALIE : du texte ajouté ne retire aucun document"
+                } else {
+                    ""
+                }
+            );
+        } else if differing.is_empty() {
             println!(
                 "  mêmes nombres de résultats des deux côtés, sans plafond, pour chaque requête"
             );
@@ -373,6 +501,10 @@ impl Compared<'_> {
                 println!("    {line}");
             }
         }
+        [
+            percentile(&latencies[0], 0.95),
+            percentile(&latencies[1], 0.95),
+        ]
     }
 }
 

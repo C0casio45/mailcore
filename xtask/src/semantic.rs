@@ -62,14 +62,14 @@ pub struct Sources {
 
 /// Une réplique jetable. Le lien des blobs est déclaré **avant** le répertoire, donc retiré avant
 /// lui : voir [`Linked`].
-struct Replica {
+pub(crate) struct Replica {
     _linked: Linked,
-    root: Utf8PathBuf,
+    pub(crate) root: Utf8PathBuf,
     _work: tempfile::TempDir,
 }
 
 impl Replica {
-    fn build(sources: &Sources, base: &str, with_search: bool) -> Result<Self> {
+    pub(crate) fn build(sources: &Sources, base: &str, with_search: bool) -> Result<Self> {
         for (what, path) in [
             ("le store", sources.store.join("index.sqlite")),
             ("le magasin de vecteurs", sources.vectors.clone()),

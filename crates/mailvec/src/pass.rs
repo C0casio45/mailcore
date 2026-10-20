@@ -172,7 +172,10 @@ pub struct Stats {
     pub vectorised: u64,
     /// Combien ont été sautés parce que leur blob est absent.
     pub missing_blobs: u64,
-    /// Combien ont été sautés parce qu'il n'en restait aucun texte.
+    /// Combien n'avaient aucun texte. **Encodés quand même, et comptés aussi dans `vectorised`** :
+    /// le magasin garde un vecteur pour chaque message marqué — relu le 2026-10-20, ce champ se
+    /// disait « sautés », et un banc qui l'additionnait à `vectorised` comptait ces messages deux
+    /// fois.
     ///
     /// Compté et non ignoré : un corpus où ce nombre est grand a un problème d'extraction, et
     /// sans le chiffre on l'attribuerait au modèle. Un message vide de texte existe pour de bon

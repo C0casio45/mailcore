@@ -403,8 +403,13 @@ Deux leçons qui débordent le PDF :
   message fait relire sa liste à l'interface à chaque message : elle groupe ses écritures — deux
   secondes au plus, pour l'extracteur.
 
-Et une leçon de méthode, payée le même jour : **un contrôle négatif qui ne fait rien tomber doit
-d'abord prouver que le test a tourné.** Quatre contrôles sont passés « verts » parce que le filtre
+Et deux leçons de méthode, payées le même jour. **Un témoin se fait par le même chemin que ce qu'il
+contrôle.** Réindexer un document n'est pas neutre dans tantivy : une fusion de segment qui porte
+des retraits **estime** le nombre de mots du champ sur des longueurs quantifiées — 4 % de moins sur
+le corpus —, et BM25 s'en sert pour normaliser les longueurs. Un « avant » reconstruit d'un coup
+comparé à un témoin réindexé a invalidé deux relevés de `pdf-effect` ; deux témoins faits à
+l'identique mesurent le vrai bruit — zéro rang déplacé. Et **un contrôle négatif qui ne fait rien
+tomber doit d'abord prouver que le test a tourné.** Quatre contrôles sont passés « verts » parce que le filtre
 de noms passé à `cargo test` excluait les tests d'intégration — leurs noms ne contiennent pas celui
 du module. Un contrôle se lit sur la ligne `test result` : `0 filtered out`, ou le nom du test
 attendu parmi les échecs.

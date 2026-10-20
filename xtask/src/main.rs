@@ -27,6 +27,7 @@ mod merge;
 mod model;
 mod pdf;
 mod pdfcompare;
+mod pdfeffect;
 mod probe;
 mod profile;
 mod rebind;
@@ -629,6 +630,25 @@ enum Command {
         store: Utf8PathBuf,
     },
 
+    /// L'effet du texte des PDF sur la recherche, sur une réplique du corpus : le critère 1 — un
+    /// témoin contre l'après, selon une règle déclarée avant le premier relevé —, la taille et la
+    /// latence de l'index à fragmentation égale, la mise à jour de l'index et la revectorisation.
+    /// **Ne compile pas** : compiler d'abord, laisser la machine retomber.
+    PdfEffect {
+        /// Le corpus. Lu, jamais écrit.
+        #[arg(long, default_value = "measurements/store")]
+        store: Utf8PathBuf,
+        /// Ses vecteurs.
+        #[arg(long, default_value = "measurements/vectors-granite-latin.bin")]
+        vectors: Utf8PathBuf,
+        /// Le modèle qui les a écrits.
+        #[arg(long, default_value = "measurements/models/granite-latin")]
+        model: Utf8PathBuf,
+        /// L'exécutable `maild` qui lit les PDF. Par défaut, celui de `target/release`.
+        #[arg(long)]
+        maild: Option<Utf8PathBuf>,
+    },
+
     /// La première lecture des PDF d'un store, sur une réplique, par l'enfant livré : durée,
     /// crête de mémoire, coût en base, et ce que chaque pièce est devenue.
     PdfCatchUp {
@@ -990,6 +1010,23 @@ fn main() -> Result<()> {
         Command::AttachmentCensus { store, top } => attach::census(&store, top),
         Command::PdfCensus { store } => pdf::census(&store),
         Command::PdfCatchUp { store, runs } => pdf::catch_up(&store, runs),
+        Command::PdfEffect {
+            store,
+            vectors,
+            model,
+            maild,
+        } => pdfeffect::run(&pdfeffect::Inputs {
+            store,
+            vectors,
+            model,
+            primary: Utf8PathBuf::from("measurements/phase4-queries-v5.toml"),
+            others: vec![
+                Utf8PathBuf::from("measurements/phase4-queries-v4.toml"),
+                Utf8PathBuf::from("measurements/phase4-queries-v3.toml"),
+            ],
+            phrases: Utf8PathBuf::from("measurements/phase4-queries.toml"),
+            maild,
+        }),
         Command::PdfCompare {
             store,
             runner,

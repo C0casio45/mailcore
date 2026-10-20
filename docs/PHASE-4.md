@@ -4236,3 +4236,146 @@ démarrage de la coquille, qui attend toujours le lancement de l'utilisateur. La
 n'est d'ailleurs **pas** recompilée : son prochain lancement doit d'abord vérifier le correctif du
 démarrage avec le binaire qui l'apporte, sans qu'une migration et une première lecture de PDF
 viennent se mêler à la mesure.
+
+### 2026-10-20 (nuit) — la règle du banc `pdf-effect`, écrite avant son premier relevé
+
+**En clair d'abord.** Le texte des PDF change les documents de 1 330 messages du corpus. Le jeu de
+requêtes du critère 1 ne vise aucune pièce jointe : il ne peut pas montrer un gain, mais il peut
+montrer une perte — un document qui grossit peut en faire descendre un autre. Le banc
+`cargo xtask pdf-effect` le vérifie, et chiffre ce que coûtent l'index, sa mise à jour, la
+revectorisation et la latence. Cette entrée est écrite **avant** son premier relevé, pour que la
+règle ne puisse pas ressembler au résultat.
+
+**Un témoin, pas seulement un avant.** Comparer avant et après mêlerait l'effet du texte et celui
+d'une réindexation et d'une revectorisation des mêmes messages. Le banc fait deux répliques au même
+état : l'une lit les PDF, l'autre — le témoin — reprend exactement les mêmes messages par le même
+code, sans leur texte. `recall-models` refuse ce couple par construction — il compare deux modèles
+sur un même index, et exige le même rang plein texte ; `recall::compare_states` relâche cette seule
+condition et garde le même comptage.
+
+**La règle**, imprimée en tête de chaque exécution :
+
+- **comparaison primaire** : jeu v5 (30 requêtes), bras hybride, tout le jeu ; base = témoin,
+  candidat = après ;
+- le critère 1 **n'est pas régressé** si (P1) le témoin n'est pas significativement meilleur — test
+  de signe exact bilatéral, p < 0,05, au moins neuf requêtes décidées — **et** (P2) l'après a au
+  plus une requête de moins que le témoin dans les dix premiers du bras hybride. Un verdict indécis
+  ne prouve pas l'équivalence : il se dit « pas montré pire » ;
+- **relevé invalide**, et non verdict, si le relevé d'avant ne se reproduit pas à l'identique, ou si
+  avant → témoin déplace plus de trois rangs du bras sens ou hybride, ou y rend un verdict décidé ;
+- **latence**, à fragmentation égale — un segment des deux côtés : p95 après ÷ p95 témoin ≤ 1,25 sur
+  chacun des trois jeux, et p95 après sous 50 ms ;
+- **exploratoire**, rien n'y est décidé : le bras plein texte, les sous-ensembles, v3 et v4,
+  avant → après ; la taille de l'index, rapportée sans seuil.
+
+**Relu avant de tourner.** Trois angles — rien sous `measurements/` n'est jamais écrit, la
+comparaison mesure ce que la règle dit, le code est juste —, chaque remarque soumise à un
+contradicteur. Le premier n'a rien trouvé : chaque écriture, chaque effacement, chaque ouverture de
+store passe par une racine sous `target/`. Les deux autres ont trouvé sept défauts réels, corrigés
+avant le premier relevé :
+
+- **un message sans texte était compté deux fois** par la revectorisation : la passe l'encode quand
+  même et le compte dans `vectorised`, et le banc ajoutait `empty`. Le premier message vide —
+  probable : un courrier qui n'est qu'un PDF — aurait fait refuser le témoin après une demi-heure de
+  travail. La documentation de `mailvec::pass::Stats`, qui disait ces messages « sautés », est
+  corrigée avec ;
+- **la taille de la base comptait le journal WAL**, qui garde la longueur de sa plus haute marée :
+  elle se mesure maintenant après un point de contrôle qui le vide. **Les +9,6 Mio publiés plus haut
+  pour `pdf-catch-up` le comptaient aussi** ; le chiffre juste est celui de ce banc ;
+- une requête d'exclusion — `facture -spam` — pouvait perdre légitimement des résultats et faire
+  crier à l'anomalie : elle est comptée à part ;
+- le verdict s'imprimait après les comparaisons exploratoires, qu'une erreur aurait pu interrompre ;
+  il passe juste après la primaire, et les rangs d'avant des jeux exploratoires, jamais lus, ne sont
+  plus calculés ;
+- la vérification que `maild` est plus récent que ses sources ignorait les manifestes et le verrou —
+  exactement là où vivrait une montée de pdf-inspector ;
+- deux mises en forme et un ordre d'importation, que `cargo fmt --check` aurait refusés.
+
+**Un bruit reste, écrit pour ne pas le croire absent** : deux documents de score exactement égal —
+un même message reçu sur deux comptes — peuvent s'inverser d'une réplique à l'autre, parce que
+l'indexation répartit les documents entre ses fils au gré de leur disponibilité. Un rang en bouge
+d'un cran sans que le texte des PDF y soit pour rien ; la tolérance du contrôle l'absorbe, et le
+corriger demanderait de changer le produit pour le banc.
+
+**Premier relevé : invalide, et c'est le contrôle qui l'a dit.** Le témoin — les 1 166 messages
+remis par la lecture des PDF, réindexés **sans** leur texte — devait ne rien déplacer. Il a déplacé
+vingt-trois rangs du bras plein texte et treize du bras hybride ; aucun du bras sens. Les
+fréquences des mots des requêtes, elles, étaient identiques : les mêmes documents contenaient les
+mêmes mots, mais leurs longueurs avaient changé. La cause supposée ce soir-là — **et réfutée au
+relevé suivant**, voir plus bas — : l'index du corpus date du 2026-09-23 à 00 h 56, d'avant la règle
+des formats gratuits et sa correction le même jour, et les messages qui portent un PDF sont ceux
+qui portent des pièces. Le banc reconstruit depuis l'index de la réplique avant de relever
+l'« avant » — c'est resté, parce qu'un « avant » doit venir du code mesuré. Mais l'index copié et
+l'index reconstruit donnent **les mêmes rangs à un ou deux crans près, sur six requêtes sur
+trente** : le corollaire écrit ici d'abord — « tout relevé du critère 1 depuis le 2026-09-23 est
+fait sur un index d'un autre code » — était faux en pratique, et il est retiré.
+
+Ce que le premier relevé dit quand même, parce qu'il ne dépend pas du contrôle : la lecture des
+PDF du corpus — 73 658 messages, **1 166 remis**, 1 522 pièces en texte, 261 sans texte, 4
+chiffrées, 2 illisibles — a pris 455 s, crête 206 Mio ; la base passe de 45,1 à 51,0 Mio, l'index
+de 96,6 à 102,5 Mio pour 18,4 Mio de texte indexé de plus. La latence, à un segment de chaque côté,
+**ne tient pas la règle sur les mots seuls** : p95 0,92 → 1,30 ms, ×1,41, dispersion 0,03 et 0,07 —
+357 des 408 requêtes d'un mot rendent plus de résultats, donc parcourent plus de listes. Elle tient
+sur les phrases (×1,14) et sur le jeu primaire (×1,08). Ce sont des millisecondes, sous le seuil de
+50 ms d'un facteur quarante ; mais la règle disait ×1,25, et elle est écrite pour être tenue, pas
+pour être relue après coup.
+
+**Deuxième relevé : invalide aussi, et l'hypothèse réfutée.** L'index de la réplique reconstruit par
+le code d'aujourd'hui — 73 658 messages en 42 s —, le témoin déplace **encore** vingt-trois rangs
+plein texte et quatorze hybrides, toujours aucun du bras sens. L'index périmé n'était donc pas la
+cause, et le paragraphe précédent l'affirmait trop vite. La cause est dans tantivy, relue dans ses
+sources (0.26.1, `indexer/merger.rs`) : **réindexer un document n'est pas neutre**. Une fusion de
+segment qui porte des documents retirés n'additionne plus le nombre exact de mots du champ : elle
+l'**estime** sur les longueurs quantifiées des documents — un octet chacune —, et ce nombre règle la
+normalisation par la longueur de BM25 ; et un document repris passe en fin d'index, ce qui retourne
+ses égalités de score. L'« avant », reconstruit d'un coup, a le compte exact ; le témoin et l'après,
+qui ont repris les mêmes 1 166 documents, ont tous deux le même compte estimé sur le même grand
+segment. La condition de validité comparait donc deux régimes de l'index, et non deux contenus.
+
+**L'amendement, écrit avant le troisième relevé — et après avoir vu le résultat primaire des deux
+premiers**, ce qu'il faut dire puisque la règle se veut écrite à l'aveugle : témoin contre après,
+v5, bras hybride, **12 victoires du témoin, 5 de l'après, p = 0,14** ; dans les dix premiers, 8 et 8.
+Seule la condition de validité change : le relevé est invalide si **deux témoins faits par le même
+chemin** — témoin et témoin-bis, copiés au même instant, remis, réindexés et revectorisés à
+l'identique — se départagent sur le bras hybride, ou si l'avant ne se reproduit pas. Ces deux
+témoins mesurent le bruit d'une réplique à l'autre ; « avant contre témoin » reste imprimé, comme
+diagnostic de ce que coûte une réindexation. P1, P2 et la latence ne changent pas. Et le banc
+imprime désormais le nombre de mots que chaque index croit porter, pour que l'explication se lise
+dans le relevé au lieu de se croire.
+
+**Troisième relevé : valide.** Les deux témoins ne se départagent pas — aucun rang plein texte ni
+sens déplacé, un seul rang hybride, aucun verdict. L'explication se lit dans le relevé : le corps
+de l'« avant » compte **39 343 738 mots, exactement** ; celui de chacun des deux témoins, au même
+contenu, **37 735 967, estimés** à la fusion — 4 % de moins, à l'identique des deux côtés.
+
+| selon la règle | |
+|---|---|
+| (P1) témoin significativement meilleur ? | **non** — 12 requêtes pour le témoin, 5 pour l'après, 13 ex æquo, p = 0,14 |
+| (P2) dans les dix premiers, bras hybride | **8 et 8** |
+| **critère 1** | **pas montré pire** — indécis, donc pas une preuve d'équivalence |
+| rang moyen de l'après ÷ témoin | ×1,02, sur les 30 requêtes |
+
+Le sens de l'écart est noté parce qu'il se lit : sur v5, les rangs de l'après sont un peu plus bas,
+et c'est attendu — 1 166 documents gagnent 18,4 Mio de mots, donc des concurrents pour les mots des
+requêtes. **Exploratoire, rien n'y est décidé** : sur v4, 3 contre 9 **pour l'après** (p = 0,15) ; sur
+v3, 8 contre 23 **pour l'après** (p = 0,011, sans correction pour les pistes multiples). Aucun jeu ne vise une pièce
+jointe ; le gain que le PDF est venu chercher ne se mesure pas encore.
+
+**Les coûts, sur le corpus** (73 658 messages, 1 166 remis, 1 522 pièces en texte) :
+
+| | |
+|---|---|
+| lecture des PDF | 455 s à froid (premier relevé), 145 s à chaud ; crête d'un enfant 207 Mio |
+| base SQLite | 45,4 → 50,9 Mio (+5,5 Mio, journal vidé) |
+| index plein texte, un segment | 95,7 → 101,8 Mio (+6,1 Mio pour 18,4 Mio de texte) |
+| mise à jour de l'index (`Kind::Follow`) | 1 166 messages en 5,0 s, contre 4,8 s sans le texte ; +104 Mio de mémoire |
+| revectorisation | 103 s (11 messages/s), contre 63 s sans le texte |
+| ouverture de l'index | p50 0,69 → 0,70 ms |
+
+**La latence ne se reproduit pas, et c'est écrit comme tel.** Sur les mots seuls, p95 après ÷
+témoin vaut ×1,41 au premier relevé, ×1,39 au deuxième — la règle n'y tient pas —, et ×1,00 au
+troisième, où l'après rend **exactement** les latences du témoin, au centième près, alors qu'il rend
+plus de résultats pour 357 requêtes sur 408. Les phrases et le jeu primaire tiennent dans les trois
+(×0,99 à ×1,17). Trois relevés dont deux disent non et un dit oui ne font pas un « tenue » ; la cause
+de l'écart n'est pas trouvée, et la mesure est à refaire seule, au repos. En valeur absolue, tout
+est sous 9 ms, pour un seuil de 50.

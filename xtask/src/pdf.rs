@@ -747,13 +747,8 @@ pub fn catch_up(store: &Utf8PathBuf, runs: usize) -> Result<()> {
     for run in 1..=runs {
         let measured = with_replica(store, |replica| {
             let root = replica.root().to_owned();
-            let size = |root: &Utf8Path| {
-                ["index.sqlite", "index.sqlite-wal"]
-                    .iter()
-                    .filter_map(|name| std::fs::metadata(root.join(name).as_std_path()).ok())
-                    .map(|meta| meta.len())
-                    .sum::<u64>()
-            };
+            // Après un point de contrôle : voir `pdfeffect::sqlite_size`.
+            let size = |root: &Utf8Path| crate::pdfeffect::sqlite_size(root);
             let before = size(&root);
             let pending = replica.unscanned_total()?;
             let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -821,7 +816,10 @@ pub fn catch_up(store: &Utf8PathBuf, runs: usize) -> Result<()> {
 }
 
 /// La plus grande mémoire résidente d'un enfant de ce processus, relevée jusqu'à `done`.
-fn children_peak(peak: &std::sync::atomic::AtomicU64, done: &std::sync::atomic::AtomicBool) {
+pub(crate) fn children_peak(
+    peak: &std::sync::atomic::AtomicU64,
+    done: &std::sync::atomic::AtomicBool,
+) {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let me = Pid::from_u32(std::process::id());
     let mut system = System::new();
