@@ -197,11 +197,11 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let bound = limit.map(|limit| super::bound(&child, limit).unwrap());
+        // Tenue jusqu'à la fin de la fonction, donc au-delà de la sortie de l'enfant. Pas de
+        // `drop` explicite : sous Linux, la borne ne porte rien.
+        let _bound = limit.map(|limit| super::bound(&child, limit).unwrap());
         child.stdin.take().unwrap().write_all(b"go\n").unwrap();
-        let status = child.wait().unwrap();
-        drop(bound);
-        status.success()
+        child.wait().unwrap().success()
     }
 
     /// Au-delà de la borne, l'allocation échoue et l'enfant meurt.
