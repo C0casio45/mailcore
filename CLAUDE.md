@@ -358,6 +358,14 @@ leçon de méthode : **un contrôle négatif doit fabriquer la fuite qu'il cherc
 de la panique s'appuyait sur une citation que Rust 1.96 ne fait plus ; il passait avec la règle
 retirée.
 
+**Le veilleur relève le courrier à chaque connexion** — depuis le 2026-10-20 (`maild::watch`).
+`IDLE` n'annonce que ce qui arrive pendant qu'on écoute : sans une synchronisation à la
+connexion, le courrier reçu application fermée attendait l'échéance de vingt-quatre minutes, et
+le store du quotidien n'a reçu que cinq messages en une semaine. Effet de bord trouvé par le
+journal : son index restait en 149 segments, faute d'arrivée pour déclencher la fusion — 4,2 s
+d'ouverture à froid. **Une** synchronisation par connexion, jamais par tranche d'attente ; et
+quand un test interdit un comportement, relire si son motif le couvre vraiment.
+
 Et une leçon sur les modèles : **la fenêtre du tokeniseur ne dépasse jamais les positions du
 modèle.** Elle était fixée à 256 ; un modèle qui en aurait eu moins échouait sur tout courrier un
 peu long, à chaque passe, sans fin.
