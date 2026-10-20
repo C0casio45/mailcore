@@ -4379,3 +4379,24 @@ plus de résultats pour 357 requêtes sur 408. Les phrases et le jeu primaire ti
 (×0,99 à ×1,17). Trois relevés dont deux disent non et un dit oui ne font pas un « tenue » ; la cause
 de l'écart n'est pas trouvée, et la mesure est à refaire seule, au repos. En valeur absolue, tout
 est sous 9 ms, pour un seuil de 50.
+
+**Ce que coûte un message qui arrive avec un PDF** (`cargo xtask measure-arrival --pdf`, réplique du
+corpus, un seul message en attente à chaque tour, six arrivées dont la première jetée, deux
+exécutions). La dispersion d'abord : entre les tours, 0,27 à 0,36 sur l'extraction et le suivi —
+chaque tour lit un autre PDF, ce n'est pas du bruit ; **entre les deux exécutions, les médianes
+s'accordent à 2 % près**.
+
+| | exécution 1 | exécution 2 |
+|---|---|---|
+| mise à jour de l'index de la moisson — toute arrivée la paie | 28–67 ms | 23–69 ms |
+| enfant extracteur, lancement compris | **158 ms** | **159 ms** |
+| crête de l'extracteur | 12–21 Mio | 10–21 Mio |
+| mise à jour de l'index pour le texte rendu (`Kind::Follow`) | 33 ms | 30 ms |
+| **ce que le PDF ajoute à une arrivée** | **189 ms** | **186 ms** |
+| enfant des vecteurs, froid | 501 ms | 469 ms |
+
+Le PDF ajoute donc **environ 190 ms**, en fond, à une arrivée qui en coûtait déjà environ 500 pour
+ses vecteurs à enfant froid ; deux candidats sur dix-huit étaient des scans, sautés. Ce qui n'est
+pas mesuré : l'ordonnancement du démon — la mise à jour de l'index pour le texte d'un PDF est un
+job, mis en file au plus une fois par tic de dix minutes pendant un rattrapage, mais tout de suite
+pour une arrivée isolée.

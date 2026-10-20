@@ -602,6 +602,10 @@ enum Command {
         /// Combien d'arrivées ; la première est jetée.
         #[arg(long, default_value_t = 4)]
         arrivals: usize,
+        /// Le bras PDF : un message qui arrive avec un PDF — l'extracteur et la seconde mise à
+        /// jour de l'index en plus de l'enfant des vecteurs.
+        #[arg(long)]
+        pdf: bool,
     },
 
     /// Recense les pièces jointes du corpus : types, nombres, volumes.
@@ -1118,15 +1122,20 @@ fn main() -> Result<()> {
             model,
             maild,
             arrivals,
-        } => semantic::measure_arrival(
-            &semantic::Sources {
+            pdf,
+        } => {
+            let sources = semantic::Sources {
                 store,
                 vectors,
                 model,
                 maild,
-            },
-            arrivals,
-        ),
+            };
+            if pdf {
+                semantic::measure_arrival_pdf(&sources, arrivals)
+            } else {
+                semantic::measure_arrival(&sources, arrivals)
+            }
+        }
         Command::SchemaCheck { db, work } => schema::check(&db, &work),
         Command::StoreFolders { store, min } => inspect::folders(&store, min),
         Command::BrowserProbe { length, wait } => {

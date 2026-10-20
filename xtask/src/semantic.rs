@@ -766,3 +766,225 @@ fn warm_rounds(
     }
     Ok(out)
 }
+
+/// Le bras PDF du critère 4 : ce que coûte un message qui arrive **avec un PDF** — `--pdf`.
+///
+/// Une arrivée ordinaire paie la mise à jour de l'index de sa moisson, puis l'enfant des vecteurs.
+/// Une arrivée qui porte un PDF paie en plus l'enfant extracteur et une seconde mise à jour de
+/// l'index — `Kind::Follow` — pour le texte qu'il a rendu. Les quatre se chronomètrent à part, sur
+/// une réplique où **un seul** message attend à chaque tour : `message_pdfs` est vidé pour que le
+/// PDF ne soit jamais « connu », et les drapeaux remis à la main sur la copie. L'ordonnancement du
+/// démon — les dix minutes du tic, la course entre un `Follow` qui démarre et un enfant qui tourne —
+/// n'est pas mesuré.
+///
+/// # Errors
+///
+/// Si la réplique ne se construit pas, si aucun message du corpus ne porte de PDF à texte, ou si
+/// un enfant ne fait pas ce que le protocole prévoit.
+#[allow(clippy::too_many_lines)]
+pub fn measure_arrival_pdf(sources: &Sources, arrivals: usize) -> Result<()> {
+    struct PdfRound {
+        sync_index: Duration,
+        extraction: Duration,
+        extraction_peak: u64,
+        follow: Duration,
+        vectors: Round,
+    }
+
+    release_only("measure-arrival")?;
+    anyhow::ensure!(
+        arrivals >= 2,
+        "au moins deux arrivées : la première est jetée, toujours"
+    );
+    let program = program(sources)?;
+    let replica = Replica::build(sources, "target/measure-arrival-pdf", true)?;
+    let root = replica.root.clone();
+    let store = Store::open(&root).context("ouverture de la réplique")?;
+    anyhow::ensure!(
+        store.pdf_counts()?.is_empty() && store.unindexed_total()? == 0,
+        "la réplique doit partir sans PDF lu et sans rien à indexer"
+    );
+    // Un segment d'abord : la première mise à jour fusionnerait sinon tout l'arriéré du corpus.
+    crate::merge::merge_to_one(&store)?;
+
+    // Les candidats : les plus récents qui portent une pièce PDF retenue par la règle de l'enfant.
+    let parser = mail_parser::MessageParser::default();
+    let mut candidates = Vec::new();
+    for row in store.unscanned(usize::MAX)? {
+        if candidates.len() >= arrivals * 3 {
+            break;
+        }
+        if row.size > maild::attachments::MESSAGE_LIMIT {
+            continue;
+        }
+        let Ok(raw) = store.blobs().read(row.blob) else {
+            continue;
+        };
+        let carries = parser.parse(&raw).is_some_and(|parsed| {
+            mailcore::attachtext::pieces(&parsed)
+                .iter()
+                .any(|piece| piece.verdict.accepted())
+        });
+        if carries {
+            candidates.push(row.id);
+        }
+    }
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "aucun message du corpus ne porte de PDF"
+    );
+    println!(
+        "Store             {} — {} candidats à PDF, les plus récents",
+        sources.store,
+        candidates.len()
+    );
+
+    let reset = |target: MessageId| -> Result<()> {
+        // Sur la copie seulement : `root` est sous `target/`, et le lien des blobs n'est pas touché.
+        let connection = rusqlite::Connection::open(root.join("index.sqlite").as_std_path())?;
+        connection.execute("DELETE FROM message_pdfs", [])?;
+        connection.execute(
+            "UPDATE messages SET attachments_scanned = (id <> ?1), indexed = (id <> ?1)",
+            [target.0],
+        )?;
+        drop(connection);
+        store.reset_vectorised()?;
+        let others: Vec<(MessageId, i64)> = store
+            .unvectorised(usize::MAX)?
+            .into_iter()
+            .filter(|row| row.id != target)
+            .map(|row| (row.id, row.attach_rev))
+            .collect();
+        store.mark_vectorised(&others)?;
+        anyhow::ensure!(
+            store.unscanned_total()? == 1
+                && store.unindexed_total()? == 1
+                && store.unvectorised_total()? == 1,
+            "un seul message doit attendre"
+        );
+        Ok(())
+    };
+
+    let mut rounds = Vec::new();
+    let mut without_text = 0usize;
+    for target in candidates {
+        if rounds.len() >= arrivals {
+            break;
+        }
+        reset(target)?;
+        // (a0) La mise à jour de l'index que toute moisson fait suivre.
+        let at = Instant::now();
+        let indexed = mailcore::index::update(&store, &mailcore::Progress::new())?;
+        let sync_index = at.elapsed();
+        anyhow::ensure!(indexed.indexed == 1, "la moisson devait indexer un message");
+
+        // (a) L'enfant extracteur, lancé comme le démon le lance.
+        let stop = AtomicBool::new(false);
+        let activity = maild::jobs::Activity::default();
+        let child = Mutex::new(None);
+        let watch = maild::attachments::Watch {
+            stop: &stop,
+            activity: &activity,
+            child: &child,
+        };
+        let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let sampler = {
+            let (peak, done) = (Arc::clone(&peak), Arc::clone(&done));
+            std::thread::spawn(move || crate::pdf::children_peak(&peak, &done))
+        };
+        let mut extractor = maild::attachments::Extractor::new(program.as_std_path());
+        let at = Instant::now();
+        let passed = extractor.pass(&store, &watch);
+        let extraction = at.elapsed();
+        done.store(true, Ordering::SeqCst);
+        let _ = sampler.join();
+        match passed {
+            maild::attachments::Passed::Advanced {
+                marked: 1,
+                remarked: 1,
+            } => {}
+            maild::attachments::Passed::Advanced {
+                marked: 1,
+                remarked: 0,
+            } => {
+                // Un PDF sans texte — un scan : rien à suivre, ce n'est pas l'arrivée mesurée.
+                without_text += 1;
+                continue;
+            }
+            other => anyhow::bail!("l'extracteur devait lire un message : {other:?}"),
+        }
+
+        // (b) La mise à jour de l'index pour le texte rendu — `Kind::Follow`.
+        let at = Instant::now();
+        let followed = mailcore::index::update(&store, &mailcore::Progress::new())?;
+        let follow = at.elapsed();
+        anyhow::ensure!(followed.indexed == 1, "le texte du PDF devait être indexé");
+
+        // (d) L'enfant des vecteurs, sur un texte qui porte maintenant le PDF.
+        let vectors = run_child(&program, &root)?;
+        anyhow::ensure!(
+            vectors.line == "done 1 0",
+            "l'enfant devait vectoriser un message : « {} »",
+            vectors.line
+        );
+        rounds.push(PdfRound {
+            sync_index,
+            extraction,
+            extraction_peak: peak.load(Ordering::SeqCst),
+            follow,
+            vectors,
+        });
+    }
+    anyhow::ensure!(
+        rounds.len() >= 2,
+        "trop peu de messages à PDF lisible parmi les candidats ({without_text} sans texte)"
+    );
+
+    println!(
+        "\nUne arrivée à PDF   index (moisson)   extraction   crête       index (suivi)   vecteurs"
+    );
+    for (index, round) in rounds.iter().enumerate() {
+        println!(
+            "  {}{}  {:>12}   {:>10}   {:>9}   {:>12}   {:>10}",
+            index + 1,
+            if index == 0 { " (jetée)" } else { "        " },
+            ms(round.sync_index),
+            ms(round.extraction),
+            mib(round.extraction_peak),
+            ms(round.follow),
+            ms(round.vectors.to_exit)
+        );
+    }
+    let kept = &rounds[1..];
+    let median = |pick: &dyn Fn(&PdfRound) -> Duration| {
+        percentile(&kept.iter().map(pick).collect::<Vec<_>>(), 0.5)
+    };
+    let spread = |pick: &dyn Fn(&PdfRound) -> Duration| {
+        let values: Vec<f64> = kept.iter().map(|round| pick(round).as_secs_f64()).collect();
+        let (low, high) = values
+            .iter()
+            .fold((f64::MAX, 0.0_f64), |(l, h), x| (l.min(*x), h.max(*x)));
+        if high > 0.0 { (high - low) / high } else { 0.0 }
+    };
+    println!(
+        "\nDispersion        extraction {:.2}, suivi {:.2}, vecteurs {:.2}  ((max − min) / max)",
+        spread(&|round| round.extraction),
+        spread(&|round| round.follow),
+        spread(&|round| round.vectors.to_exit)
+    );
+    println!(
+        "Médianes          extraction {}, suivi {}, vecteurs {} ; ce que le PDF ajoute à une \
+         arrivée : {}",
+        ms(median(&|round| round.extraction)),
+        ms(median(&|round| round.follow)),
+        ms(median(&|round| round.vectors.to_exit)),
+        ms(median(&|round| round.extraction + round.follow))
+    );
+    if without_text > 0 {
+        println!("({without_text} candidats sans texte sautés — des scans)");
+    }
+    drop(store);
+    drop(replica);
+    Ok(())
+}
