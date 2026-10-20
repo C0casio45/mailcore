@@ -1082,6 +1082,15 @@ impl Shell {
                     if !self.background_unsupported {
                         self.worker.ask(Request::SemanticStatus);
                     }
+                    // Et la présentation, tant que l'index s'ouvrait quand elle a été donnée : la fin
+                    // de l'ouverture est un changement, et c'est elle qui dit si l'index répond.
+                    if self
+                        .hello
+                        .as_ref()
+                        .is_some_and(|hello| hello.search_opening)
+                    {
+                        self.worker.ask(Request::Hello);
+                    }
                     if let Some(id) = self.current {
                         self.reload_folder(id);
                     }
@@ -1469,7 +1478,9 @@ impl Shell {
                     ui.weak(format!(
                         "{} messages{}",
                         hello.messages,
-                        if hello.search_available {
+                        if hello.search_opening {
+                            " — index en cours d'ouverture"
+                        } else if hello.search_available {
                             ""
                         } else {
                             " — sans index"

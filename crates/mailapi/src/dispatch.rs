@@ -551,6 +551,7 @@ pub fn call(mailbox: &Mailbox, method: &str, params: Value) -> Result<Value, Err
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 protocol: crate::PROTOCOL,
                 search_available: mailbox.search_available(),
+                search_opening: mailbox.search_state() == mailcore::SearchState::Opening,
                 revision: mailbox.revision().map_err(opaque)?,
                 messages: stats.messages,
                 semantic: None,

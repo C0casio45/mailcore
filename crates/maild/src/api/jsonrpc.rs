@@ -184,8 +184,12 @@ impl Api {
         } else if request.method == mailapi::method::SEARCH_QUERY
             && let Some(engine) = self.semantic.clone()
         {
+            self.index_ready().await;
             self.hybrid_search(engine, request.params.clone()).await
         } else {
+            if request.method == mailapi::method::SEARCH_QUERY {
+                self.index_ready().await;
+            }
             let method = request.method.clone();
             let params = request.params.clone();
             let outcome = self
@@ -510,6 +514,19 @@ impl Api {
             rows,
             semantic: self.describe_semantic((!operators).then_some(failure), operators),
         })
+    }
+
+    /// Attend que l'index plein texte soit ouvert, **sans tenir la boîte** — voir
+    /// `Mailbox::open_in_background`. Une recherche qui arrive pendant l'ouverture attendrait
+    /// sinon sous le verrou, et toutes les autres lectures avec elle : la liste d'un dossier,
+    /// l'abonnement d'une coquille. La règle du sens, ci-dessus, appliquée au plein texte.
+    async fn index_ready(&self) {
+        let ready = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .search_ready();
+        let _ = tokio::task::spawn_blocking(move || ready.wait()).await;
     }
 
     /// Exécute une lecture sur la boîte, hors du fil du runtime.

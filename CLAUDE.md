@@ -370,6 +370,13 @@ journal : son index restait en 149 segments, faute d'arrivée pour déclencher l
 d'ouverture à froid. **Une** synchronisation par connexion, jamais par tranche d'attente ; et
 quand un test interdit un comportement, relire si son motif le couvre vraiment.
 
+**La première image n'attend que SQLite** — depuis le 2026-10-20 (`Mailbox::open_in_background`).
+La coquille attend le service avant de dessiner, et ouvrir la boîte montait aussi chaque segment de
+l'index plein texte : 4,3 s sur le store du quotidien, fragmenté et froid. L'index s'ouvre dans un
+fil ; une recherche qui arrive pendant **attend l'index hors du verrou de la boîte**
+(`search_ready`), et `server.hello` dit `search_opening` au lieu de promettre. Toute ouverture
+nouvelle sur le chemin du démarrage se demande : *la liste en a-t-elle besoin ?*
+
 Et une leçon sur les modèles : **la fenêtre du tokeniseur ne dépasse jamais les positions du
 modèle.** Elle était fixée à 256 ; un modèle qui en aurait eu moins échouait sur tout courrier un
 peu long, à chaque passe, sans fin.

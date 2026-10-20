@@ -108,19 +108,19 @@ impl Service {
         profiles: Vec<camino::Utf8PathBuf>,
         launch: vectors::Launch,
     ) -> Result<Self> {
-        let mailbox =
-            Mailbox::open(store).with_context(|| format!("ouverture du store {store}"))?;
-        let search = mailbox.search_available();
+        // **L'index plein texte s'ouvre dans un fil**, depuis le 2026-10-20 : la coquille embarquée
+        // attend cette ouverture avant sa première image, et un index fragmenté et froid y mettait
+        // 4,3 s — voir `Mailbox::open_in_background`. Un index illisible le dit dans le journal,
+        // depuis ce fil, et la boîte répond sans recherche.
+        let mailbox = Mailbox::open_in_background(store)
+            .with_context(|| format!("ouverture du store {store}"))?;
 
         // **Pas de compte de messages ici.** Il y en avait un, pour cette seule ligne de journal :
         // 20 ms sur 73 658 messages, payées **avant la fenêtre** de la coquille embarquée, donc
         // sur le seuil de démarrage de 225 ms — mesuré le 2026-10-09, il faisait passer la
         // coquille de 220 à 240 ms. `server.hello` rend le même compte, sur le fil du service,
         // une fois la fenêtre ouverte.
-        tracing::info!(store = %store, recherche = search, "boîte ouverte");
-        if !search {
-            tracing::warn!("index plein texte absent : la recherche rendra une liste vide");
-        }
+        tracing::info!(store = %store, "boîte ouverte, index plein texte en cours d'ouverture");
 
         // Une seule boîte pour toutes les surfaces : ouvrir le store deux fois donnerait deux
         // `Searcher` et deux connexions SQLite pour lire les mêmes octets.

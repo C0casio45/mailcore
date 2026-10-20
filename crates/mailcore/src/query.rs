@@ -21,6 +21,8 @@
 //! inconnu. Le HTML fidèle est l'affaire du front, qui le rend dans une `<iframe>` sous CSP
 //! (`docs/PRIVACY.md`).
 
+use std::sync::{Arc, OnceLock};
+
 use camino::Utf8Path;
 use mail_parser::{MessageParser, MimeHeaders};
 
@@ -88,12 +90,17 @@ pub const MAX_BODY_HTML: usize = 2 * 1024 * 1024;
 #[derive(Debug)]
 pub struct Mailbox {
     store: Store,
-    /// `None` quand l'index plein texte est absent ou illisible.
+    /// Le chercheur plein texte — `None` quand l'index est absent ou illisible.
     ///
     /// Volontairement optionnel : un store fraîchement importé mais pas encore indexé doit
     /// répondre à tout le reste. Faire échouer l'ouverture entière parce que la recherche
     /// n'est pas prête violerait le critère 1.
-    searcher: Option<Searcher>,
+    ///
+    /// **Peut être encore en cours d'ouverture**, depuis le 2026-10-20 : voir
+    /// [`Self::open_in_background`]. Tout accès passe par [`Self::searcher`], qui attend la fin de
+    /// l'ouverture — une recherche faite pendant attend, elle ne rend jamais une liste vide comme
+    /// si l'index n'existait pas.
+    search: Arc<OnceLock<Option<Searcher>>>,
 }
 /// Un dossier et ses compteurs.
 #[derive(Debug, Clone)]
@@ -202,6 +209,51 @@ pub struct MessageDetail {
     pub invitation: Option<mailcal::Invitation>,
 }
 
+/// Où en est l'index plein texte d'une boîte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchState {
+    /// Il s'ouvre dans un fil — voir [`Mailbox::open_in_background`].
+    Opening,
+    /// Il répond.
+    Ready,
+    /// Absent ou illisible : tout répond sauf la recherche.
+    Absent,
+}
+
+/// De quoi attendre l'ouverture de l'index sans tenir la boîte — [`Mailbox::search_ready`].
+#[derive(Debug, Clone)]
+pub struct SearchReady(Arc<OnceLock<Option<Searcher>>>);
+
+impl SearchReady {
+    /// Attend la fin de l'ouverture, quelle qu'en soit l'issue.
+    pub fn wait(&self) {
+        let _ = self.0.wait();
+    }
+}
+
+/// La place du chercheur, **toujours remplie quand elle est lâchée** : une panique dans tantivy
+/// pendant l'ouverture laisserait sinon chaque recherche attendre pour toujours un index qui ne
+/// viendra pas. Lâchée sans valeur — l'ouverture a paniqué —, elle dit « pas d'index ».
+struct Filled(Arc<OnceLock<Option<Searcher>>>);
+
+impl Drop for Filled {
+    fn drop(&mut self) {
+        let _ = self.0.set(None);
+    }
+}
+
+/// Le chercheur d'un index, ou `None` s'il ne s'ouvre pas — l'arbitrage de [`Mailbox::open`] : un
+/// index illisible laisse la boîte sans recherche, il ne la casse pas.
+fn open_searcher(dir: &Utf8Path) -> Option<Searcher> {
+    match index::open_or_create_in(dir).and_then(|(index, _)| Searcher::open(&index)) {
+        Ok(searcher) => Some(searcher),
+        Err(source) => {
+            tracing::warn!(%source, "index plein texte indisponible, recherche désactivée");
+            None
+        }
+    }
+}
+
 impl Mailbox {
     /// Ouvre une boîte mail.
     ///
@@ -212,15 +264,81 @@ impl Mailbox {
     /// [`crate::Error::Io`] ou [`crate::Error::Sqlite`] si le store est inutilisable.
     pub fn open(root: impl AsRef<Utf8Path>) -> Result<Self> {
         let store = Store::open(root)?;
-        let searcher = match index::open_or_create(&store).and_then(|(idx, _)| Searcher::open(&idx))
-        {
-            Ok(searcher) => Some(searcher),
-            Err(source) => {
-                tracing::warn!(%source, "index plein texte indisponible, recherche désactivée");
-                None
-            }
-        };
-        Ok(Self { store, searcher })
+        let search = Arc::new(OnceLock::from(open_searcher(&store.search_dir())));
+        Ok(Self { store, search })
+    }
+
+    /// [`Self::open`], **l'index plein texte ouvert dans un fil** : la boîte rend la main dès que
+    /// SQLite est ouvert.
+    ///
+    /// ## Pourquoi
+    ///
+    /// Ouvrir l'index monte chacun de ses segments. Fusionné et dans le cache du système, c'est
+    /// une milliseconde ; fragmenté et froid, c'est des secondes — **4,3 s** sur le store du
+    /// quotidien le 2026-10-20, en 149 segments, au premier lancement de la journée. Or la
+    /// coquille attend la boîte avant sa première image : l'utilisateur regardait une fenêtre
+    /// vide pendant que tantivy lisait des fichiers dont la liste des messages n'a aucun besoin —
+    /// elle vient de SQLite.
+    ///
+    /// La recherche qui arrive pendant l'ouverture **attend** l'index ([`Self::searcher`]) : elle
+    /// ne rend pas une liste vide comme si l'index manquait, et [`Self::search_available`] ne dit
+    /// pas « absent » tant qu'on ne sait pas.
+    ///
+    /// # Errors
+    ///
+    /// Comme [`Self::open`], pour SQLite seulement : un index illisible laisse la boîte sans
+    /// recherche, comme à l'ouverture ordinaire.
+    pub fn open_in_background(root: impl AsRef<Utf8Path>) -> Result<Self> {
+        let store = Store::open(root)?;
+        let search = Arc::new(OnceLock::new());
+        let slot = Arc::clone(&search);
+        let dir = store.search_dir();
+        let spawned = std::thread::Builder::new()
+            .name("mailcore-index-ouverture".to_owned())
+            .spawn(move || {
+                // La garde **dans** le fil : un fil refusé ne lâche alors qu'un `Arc`, et le repli
+                // ci-dessous remplit la place. Construite avant, elle aurait été lâchée avec la
+                // fermeture refusée — « pas d'index » posé avant le repli, qui l'aurait perdu.
+                let slot = Filled(slot);
+                let started = std::time::Instant::now();
+                let opened = open_searcher(&dir);
+                // Ce que l'étape `store` du démarrage comptait jusqu'ici, et qu'elle ne voit plus.
+                tracing::info!(
+                    ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    disponible = opened.is_some(),
+                    "index plein texte ouvert"
+                );
+                let _ = slot.0.set(opened);
+            });
+        if spawned.is_err() {
+            // Pas de fil : l'ouverture se fait ici, comme avant.
+            let _ = search.set(open_searcher(&store.search_dir()));
+        }
+        Ok(Self { store, search })
+    }
+
+    /// Le chercheur, **en attendant la fin de son ouverture** si elle se fait encore dans un fil.
+    fn searcher(&self) -> Option<&Searcher> {
+        self.search.wait().as_ref()
+    }
+
+    /// De quoi attendre l'index **sans tenir la boîte** : une recherche qui arrive pendant
+    /// l'ouverture attendrait sinon sous le verrou de la boîte, et toutes les autres lectures —
+    /// la liste d'un dossier, l'abonnement — avec elle. Le démon attend sur ceci, puis prend le
+    /// verrou.
+    #[must_use]
+    pub fn search_ready(&self) -> SearchReady {
+        SearchReady(Arc::clone(&self.search))
+    }
+
+    /// Où en est l'index plein texte. Ne bloque jamais.
+    #[must_use]
+    pub fn search_state(&self) -> SearchState {
+        match self.search.get() {
+            None => SearchState::Opening,
+            Some(Some(_)) => SearchState::Ready,
+            Some(None) => SearchState::Absent,
+        }
     }
 
     /// Le store sous-jacent, pour ce que la boîte ne sait pas faire.
@@ -260,21 +378,18 @@ impl Mailbox {
     /// même arbitrage qu'à l'ouverture, critère 1. La valeur rendue dit si la recherche est
     /// disponible après l'opération.
     pub fn reload_search(&mut self) -> bool {
-        self.searcher =
-            match index::open_or_create(&self.store).and_then(|(idx, _)| Searcher::open(&idx)) {
-                Ok(searcher) => Some(searcher),
-                Err(source) => {
-                    tracing::warn!(%source, "index plein texte indisponible après rechargement");
-                    None
-                }
-            };
-        self.searcher.is_some()
+        let reopened = open_searcher(&self.store.search_dir());
+        let available = reopened.is_some();
+        self.search = Arc::new(OnceLock::from(reopened));
+        available
     }
 
-    /// Vrai si la recherche plein texte est disponible.
+    /// Vrai si la recherche plein texte est disponible — **ou en train de s'ouvrir** : tant que
+    /// l'ouverture n'a pas dit non, rien ne permet de dire « absente », et une coquille qui
+    /// afficherait « sans index » à chaque démarrage mentirait. Ne bloque jamais.
     #[must_use]
-    pub const fn search_available(&self) -> bool {
-        self.searcher.is_some()
+    pub fn search_available(&self) -> bool {
+        self.search_state() != SearchState::Absent
     }
 
     /// L'état du store.
@@ -345,7 +460,16 @@ impl Mailbox {
         // vaut « aucune », sans journal : cette fonction tourne quatre fois par seconde.
         let moving = self.store.in_flight().ok().flatten().map_or(0, |id| id.0);
 
-        Ok(format!("{data}.{mine}.{search}.{moving}"))
+        // **L'index qui finit de s'ouvrir**, depuis le 2026-10-20 : sans ce terme, un client qui a
+        // demandé `server.hello` pendant l'ouverture ne saurait jamais qu'elle a échoué — rien
+        // d'autre ne bouge à ce moment-là.
+        let opening = match self.search_state() {
+            SearchState::Opening => 0,
+            SearchState::Ready => 1,
+            SearchState::Absent => 2,
+        };
+
+        Ok(format!("{data}.{mine}.{search}.{moving}.{opening}"))
     }
 
     /// Tous les dossiers, avec leurs compteurs.
@@ -436,7 +560,7 @@ impl Mailbox {
     ///
     /// [`crate::Error::Tantivy`] si l'index est illisible.
     pub fn doc_freq(&self, word: &str) -> Result<Option<u64>> {
-        match &self.searcher {
+        match self.searcher() {
             Some(searcher) => searcher.doc_freq(word).map(Some),
             None => Ok(None),
         }
@@ -451,7 +575,7 @@ impl Mailbox {
     ///
     /// [`crate::Error::Tantivy`] si l'index est illisible.
     pub fn contains(&self, id: MessageId, word: &str) -> Result<Option<bool>> {
-        match &self.searcher {
+        match self.searcher() {
             Some(searcher) => searcher.contains(id, word).map(Some),
             None => Ok(None),
         }
@@ -464,7 +588,7 @@ impl Mailbox {
     /// La comparaison juste est celle de [`Self::index_coverage`].
     #[must_use]
     pub fn indexed_documents(&self) -> Option<u64> {
-        self.searcher.as_ref().map(Searcher::document_count)
+        self.searcher().map(Searcher::document_count)
     }
 
     /// L'index couvre-t-il le store ? `None` si l'index n'est pas lisible.
@@ -516,7 +640,7 @@ impl Mailbox {
 
     /// Le corps commun des deux, qui ne décide d'aucun plafond.
     fn search_within(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let Some(searcher) = &self.searcher else {
+        let Some(searcher) = self.searcher() else {
             return Ok(Vec::new());
         };
 
@@ -1412,6 +1536,89 @@ mod tests {
             2,
             "un message a été indexé deux fois"
         );
+    }
+
+    /// Une boîte ouverte en arrière-plan cherche comme l'autre, et une recherche faite sitôt la
+    /// boîte ouverte attend l'index — voir `Mailbox::open_in_background`.
+    #[test]
+    fn a_box_opened_in_background_searches_like_the_other_and_waits_for_its_index() {
+        let (_dir, mailbox) = mailbox();
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let root = mailbox.store().root().to_owned();
+        let expected = Mailbox::open(&root)
+            .unwrap()
+            .search("facture", 10)
+            .unwrap()
+            .len();
+        assert_eq!(expected, 2, "la fixture ne porte pas le mot");
+        // Plusieurs fois : une recherche faite **sitôt la boîte ouverte** doit attendre l'index,
+        // jamais rendre une liste vide comme s'il manquait — c'est ce qu'une ouverture différée
+        // naïve ferait une fois sur deux.
+        for _ in 0..20 {
+            let deferred = Mailbox::open_in_background(&root).unwrap();
+            assert!(
+                deferred.search_available(),
+                "« sans index » annoncé pendant l'ouverture"
+            );
+            assert_eq!(deferred.search("facture", 10).unwrap().len(), expected);
+            assert_eq!(deferred.indexed_documents(), Some(2));
+        }
+        // L'attente hors de la boîte, puis l'état : prêt, et la révision le dit — c'est ce qui fait
+        // redemander `server.hello` à une coquille qui l'a reçu pendant l'ouverture.
+        let deferred = Mailbox::open_in_background(&root).unwrap();
+        deferred.search_ready().wait();
+        assert_eq!(deferred.search_state(), SearchState::Ready);
+        assert!(deferred.revision().unwrap().ends_with(".1"));
+    }
+
+    /// Un index illisible, ouvert dans un fil : la boîte répond sans recherche, comme à
+    /// l'ouverture ordinaire — et le dit, une fois l'ouverture finie.
+    #[test]
+    fn an_unreadable_index_opened_in_background_leaves_the_box_without_search() {
+        let (_dir, mailbox) = mailbox();
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let root = mailbox.store().root().to_owned();
+        drop(mailbox);
+        std::fs::write(root.join("search").join("meta.json"), b"{ pas du json").unwrap();
+        let deferred = Mailbox::open_in_background(&root).unwrap();
+        assert!(deferred.search("facture", 10).unwrap().is_empty());
+        assert!(!deferred.search_available());
+        assert_eq!(deferred.search_state(), SearchState::Absent);
+        assert!(deferred.revision().unwrap().ends_with(".2"));
+        // Le reste répond.
+        assert!(!deferred.folders().unwrap().is_empty());
+    }
+
+    /// Une ouverture qui panique ne laisse personne attendre : la place se remplit de « pas
+    /// d'index » quand elle est lâchée, panique comprise.
+    #[test]
+    fn an_opening_that_panics_still_fills_its_slot() {
+        let slot = Arc::new(OnceLock::new());
+        let filled = Filled(Arc::clone(&slot));
+        let joined = std::thread::spawn(move || {
+            let _keep = filled;
+            panic!("ouverture fabriquée qui panique");
+        })
+        .join();
+        assert!(joined.is_err());
+        // Attendue sur un autre fil, avec une échéance : sans la garde, l'attente ne finirait
+        // jamais, et le test doit tomber plutôt que pendre.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiting = Arc::clone(&slot);
+        std::thread::spawn(move || {
+            let _ = sender.send(waiting.wait().is_none());
+        });
+        assert_eq!(
+            receiver.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(true),
+            "la place est restée vide"
+        );
+        // Le contrôle inverse : une place remplie ne l'est pas deux fois.
+        let kept = Arc::new(OnceLock::new());
+        let filled = Filled(Arc::clone(&kept));
+        let _ = filled.0.set(None);
+        drop(filled);
+        assert!(kept.get().is_some());
     }
 
     /// Le texte d'un PDF rangé par l'enfant extracteur après l'indexation entre dans l'index à la

@@ -32,8 +32,8 @@ pub use model::{
 };
 pub use progress::Progress;
 pub use query::{
-    Attachment, FolderSummary, Mailbox, MessageDetail, Rendered, SearchResult, attachment_bytes,
-    calendar_parts, invitation_of,
+    Attachment, FolderSummary, Mailbox, MessageDetail, Rendered, SearchReady, SearchResult,
+    SearchState, attachment_bytes, calendar_parts, invitation_of,
 };
 pub use source::Source;
 pub use store::Store;

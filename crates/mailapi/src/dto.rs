@@ -129,6 +129,11 @@ pub struct Hello {
     /// Faux quand l'index plein texte est absent : `search.query` rendra une liste vide,
     /// et un client honnête le dit à l'utilisateur au lieu d'afficher « aucun résultat ».
     pub search_available: bool,
+    /// Vrai pendant que l'index plein texte s'ouvre, au démarrage du démon : `search_available`
+    /// n'est alors qu'une promesse, et un client qui l'affiche redemande `server.hello` au changement
+    /// suivant — la fin de l'ouverture en est un. Absent d'un démon plus ancien.
+    #[serde(default)]
+    pub search_opening: bool,
     /// La révision du store. Voir [`Revision`].
     pub revision: String,
     /// Nombre de messages, pour afficher quelque chose immédiatement.

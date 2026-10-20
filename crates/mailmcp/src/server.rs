@@ -113,6 +113,7 @@ impl MailServer {
     ) -> Result<Json<dto::Results>, ErrorData> {
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
         let query = params.query;
+        self.index_ready().await;
         let found = self
             .read(move |mailbox| mailbox.search(&query, limit))
             .await?;
@@ -190,10 +191,23 @@ impl MailServer {
     ) -> Result<Json<dto::Results>, ErrorData> {
         let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
         let address = params.address;
+        self.index_ready().await;
         let found = self
             .read(move |mailbox| mailbox.contact_history(&address, limit))
             .await?;
         Ok(Json(results(found, limit)))
+    }
+
+    /// Attend que l'index plein texte soit ouvert, **sans tenir la boîte** : une recherche qui
+    /// arrive pendant l'ouverture — au démarrage du démon — attendrait sinon sous le verrou, et
+    /// toutes les autres lectures avec elle. Voir `Mailbox::open_in_background`.
+    async fn index_ready(&self) {
+        let ready = self
+            .mailbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .search_ready();
+        let _ = tokio::task::spawn_blocking(move || ready.wait()).await;
     }
 
     /// Exécute une lecture sur la boîte, hors du fil du runtime.

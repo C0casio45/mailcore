@@ -4453,3 +4453,70 @@ des répliques — la place de leurs fichiers sur le disque ou dans le cache —
 il est plus grand que l'effet qu'on cherche. La règle ne se tranche donc pas ici ; il faudrait,
 comme pour les rangs, mesurer d'abord le bruit entre deux témoins. En valeur absolue, tout tient
 sous 1,5 ms sur les mots seuls et sous 9 ms sur le jeu primaire, pour un seuil de 50 ms.
+
+### 2026-10-20 (nuit, après la clôture) — le correctif du démarrage vérifié, et la première image qui n'attend plus l'index
+
+**En clair d'abord.** L'utilisateur a relancé l'application : encore **4,6 s** avant la première
+image. Le correctif du veilleur a pourtant fait ce qu'il devait — mais pour le lancement
+**suivant**, pas pour celui-là. Et la mesure a montré un défaut de structure plus profond : la
+fenêtre attendait l'ouverture de l'index plein texte, dont la liste des messages n'a aucun besoin.
+
+**Le correctif du veilleur, vérifié sur le journal de ce lancement** (binaire de 682cbd3) :
+
+- les **cinq** synchronisations sont mises en file dès la connexion des veilleurs ;
+- le courrier qui manquait arrive : **628 messages** neufs sur les cinq comptes, indexés puis
+  vectorisés dans la session ;
+- l'index du store du quotidien passe de **149 segments à 6** — 37 fichiers —, fusionné par la
+  première mise à jour qui a eu quelque chose à faire.
+
+**Pourquoi ce lancement était lent quand même.** La coquille ouvre le service dans un fil pendant
+que sa fenêtre se crée, puis l'**attend** avant sa première image (`opening.join()`) — un choix du
+2026-10-09, fait quand le store s'ouvrait en 37 ms. Or ouvrir la boîte, c'était aussi ouvrir
+l'index plein texte : monter chacun de ses segments. En 149 segments et hors du cache du système,
+au premier lancement de la journée, **4,3 s** — l'étape `store` du journal. La fusion règle les
+segments ; elle ne règle pas un index froid, ni le prochain index fragmenté.
+
+**Ce qui change** : `Mailbox::open_in_background`, que le service emploie. SQLite s'ouvre tout de
+suite ; l'index s'ouvre dans un fil, et son chercheur arrive dans une place partagée
+(`OnceLock`). La première image n'attend plus que SQLite. Une recherche faite pendant
+l'ouverture **attend** l'index — elle ne rend jamais une liste vide comme si l'index manquait —, et
+`search_available` ne dit pas « absent » tant qu'on ne sait pas : sans ça, chaque démarrage aurait
+affiché « sans index ». Une ouverture qui panique remplit quand même sa place — « pas d'index » —,
+sinon chaque recherche attendrait pour toujours. La CLI, MCP et les tests gardent l'ouverture
+synchrone.
+
+Trois tests et leurs contrôles négatifs : une boîte ouverte en arrière-plan cherche comme l'autre,
+même sitôt ouverte — un accès qui n'attend pas fait tomber le test, comme un `search_available` qui
+dit « absent » pendant l'ouverture ; un index illisible laisse la boîte sans recherche, le reste
+répondant ; une ouverture qui panique remplit sa place — sans la garde, le test tombe en cinq
+secondes au lieu de pendre.
+
+**Relu avant d'être livré** — deux angles, la concurrence et ce que l'utilisateur voit, chaque
+remarque soumise à un contradicteur : cinq défauts réels, mineurs, tous corrigés.
+
+- **Une recherche attendait l'index sous le verrou de la boîte.** Faite dans les premières
+  secondes, elle tenait la boîte jusqu'à la fin de l'ouverture, et toutes les autres lectures avec
+  elle — la liste d'un dossier, l'abonnement de la coquille, les clients MCP. La règle écrite sur la
+  recherche par le sens, appliquée au plein texte : le démon et le serveur MCP attendent l'index
+  **avant** de prendre le verrou (`Mailbox::search_ready`).
+- **`server.hello` promettait l'index pour toute la session.** Demandé pendant l'ouverture, il
+  disait « disponible », et rien ne le redemandait : un index illisible ne se serait jamais
+  affiché « sans index ». La révision du store porte maintenant l'état de l'index — la fin de
+  l'ouverture est un changement —, `server.hello` dit `search_opening`, et la coquille le
+  redemande au changement suivant ; elle affiche « index en cours d'ouverture » entre-temps.
+- **Le repli d'un fil refusé était mort** : la garde, construite hors du fil, était lâchée avec la
+  fermeture refusée et posait « pas d'index » avant le repli — un index sain annoncé absent pour
+  la session. Elle se construit dans le fil.
+- **Le journal ne disait plus combien l'index met à s'ouvrir** — c'est par lui que les 4,3 s ont été
+  trouvées. Le fil d'ouverture écrit sa durée et son issue.
+- Un commentaire de test déplacé sur le mauvais test, remis à sa place.
+
+**Mesuré** (`cargo xtask measure-startup-model`, réplique du corpus, cinq lancements par
+configuration dont le premier à froid). La dispersion d'abord : avec le modèle, les lancements 2 à
+4 tiennent entre 190 et 198 ms, le cinquième monte à 588 ms — un écart de la machine, seul de son
+espèce ; sans modèle, 169 à 188 ms. **Le store s'ouvre en 5,3 à 5,6 ms** de médiane, contre 37 ms le
+2026-10-09 : il n'attend plus l'index. Le démarrage à chaud reste celui de la fenêtre — 198 ms avec
+le modèle, 187 sans, sous les 225 ms du critère 1 de la phase 2. Ce que ce banc ne peut pas
+montrer, et qui était le symptôme : un index **froid**. Le cache du système est chaud ici, et rien
+ne le vide sans outil d'administration. Le prochain lancement du jour le dira — et il ne peut plus
+attendre l'index, par construction.

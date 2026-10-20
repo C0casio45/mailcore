@@ -288,7 +288,17 @@ const ROWS: usize = 2_000;
 /// [`crate::Error::Io`] si le répertoire ne peut pas être créé, [`crate::Error::Tantivy`]
 /// si l'index existant est illisible ou son schéma incompatible.
 pub fn open_or_create(store: &Store) -> Result<(Index, Fields)> {
-    let dir = store.search_dir();
+    open_or_create_in(&store.search_dir())
+}
+
+/// [`open_or_create`] sur un répertoire d'index donné — pour qu'un fil l'ouvre sans tenir de
+/// [`Store`] : une connexion SQLite ne traverse pas les fils, un chemin si.
+///
+/// # Errors
+///
+/// Comme [`open_or_create`].
+pub fn open_or_create_in(dir: &camino::Utf8Path) -> Result<(Index, Fields)> {
+    let dir = dir.to_owned();
     std::fs::create_dir_all(&dir).map_err(|source| crate::Error::Io {
         path: dir.clone(),
         source,
