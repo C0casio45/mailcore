@@ -42,7 +42,14 @@ impl Wire {
         // Un délai de lecture, et il est là pour une raison précise : un client qui a
         // provoqué une panne peut ne plus rien envoyer. Sans délai, le fil de session
         // resterait pour toute la durée du processus de test.
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        //
+        // **Cinq minutes, et pas trente secondes**, depuis le 2026-10-20 : un client qui range
+        // deux mille messages d'un `FETCH` — en profil de débogage, sur un exécuteur de CI qui
+        // fait tourner quatre-vingt-cinq tests à la fois — peut se taire plus de trente secondes
+        // avant sa commande suivante. Le serveur raccrochait alors, et la moisson échouait sur
+        // `ConnectionAborted` (10053) : `a_renumbered_bulk_folder_…`, une fois sous Windows. Un
+        // vrai serveur attend au moins trente minutes (RFC 3501, §5.4).
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(300)))?;
         let reader = BufReader::new(stream.try_clone()?);
         Ok(Self {
             stream,
