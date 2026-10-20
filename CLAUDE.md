@@ -4,7 +4,7 @@ Client mail open source, natif, AI-native, écrit en Rust.
 
 Lis `docs/VISION.md` (le pourquoi), `docs/ARCHITECTURE.md` (le comment),
 `docs/PRIVACY.md` (non négociable),
-`docs/PHASE-4.md` (ce qu'il faut livrer maintenant),
+`docs/PHASE-4.md` (la dernière phase, close le 2026-10-20 avec deux critères non tenus),
 `docs/PHASE-3.md`, `docs/PHASE-2.md` et `docs/PHASE-1.md` (ce qui est fait, mesuré, et ce que
 les mesures ont appris)
 avant d'écrire du code.
@@ -14,7 +14,11 @@ phase 3 depuis le 2026-09-15** : leurs critères sont mesurés sur le corpus ré
 derniers de la phase 3 sur un vrai serveur. La phase 3 était l'envoi, puis le carnet d'adresses,
 la signature riche et les invitations reçues.
 
-**La phase 4 est la recherche sémantique, et rien d'autre** — un embedding par message, calculé
+**La phase 4 est close depuis le 2026-10-20, avec les critères 1 et 8 non tenus** — après deux
+familles de modèles, la synonymie en français reste hors de portée : la cible est dans les dix
+premiers pour 26,7 % des requêtes au mieux, contre 80 %. Les sept autres sont tenus, le 4 à chaud
+seulement. Un modèle meilleur se mesure contre ces deux critères, au même banc. La phase était la
+recherche sémantique, et rien d'autre — un embedding par message, calculé
 par un modèle **local**. Le tri automatique, le résumé de fil et la rédaction assistée sont
 dehors : ils sont ponctuels, donc le consentement y a un sens qu'il n'a pas pour une passe qui
 traite tout le corpus. Vectoriser par une API ferait sortir **l'intégralité** du courrier, ce qui
