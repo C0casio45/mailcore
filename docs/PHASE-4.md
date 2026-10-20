@@ -4420,3 +4420,14 @@ deux dangers concrets :
 Et `measure-recall` et `measure-search` refusent un store où des messages attendent l'index — ou
 leurs vecteurs, quand un modèle est donné —, et disent où en est la lecture des PDF : un texte lu
 mais pas indexé laisse l'ancien document en place, et la vérification de couverture ne le voit pas.
+
+**La latence, mesurée seule — et indécidable avec cet instrument.** `pdf-effect --latency-only` :
+témoin et après refaits, puis la latence trois fois de suite dans le même processus, chercheurs
+rouverts à chaque fois. Sur les mots seuls, **l'après est le plus rapide**, ×0,70, ×0,72, ×0,70 — trois
+mesures concordantes, dispersion entre tours 0,07 à 0,11. Mis bout à bout avec le banc complet,
+le côté le plus lent change d'un relevé à l'autre : l'après plus lent de 40 % deux fois, égal une
+fois, plus rapide de 30 % trois fois de suite. Un écart qui change de signe avec la réplique vient
+des répliques — la place de leurs fichiers sur le disque ou dans le cache —, pas du texte des PDF :
+il est plus grand que l'effet qu'on cherche. La règle ne se tranche donc pas ici ; il faudrait,
+comme pour les rangs, mesurer d'abord le bruit entre deux témoins. En valeur absolue, tout tient
+sous 1,5 ms sur les mots seuls et sous 9 ms sur le jeu primaire, pour un seuil de 50 ms.

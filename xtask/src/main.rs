@@ -652,6 +652,9 @@ enum Command {
         /// L'exécutable `maild` qui lit les PDF. Par défaut, celui de `target/release`.
         #[arg(long)]
         maild: Option<Utf8PathBuf>,
+        /// La latence seule, trois fois de suite — sans les rangs ni les vecteurs.
+        #[arg(long)]
+        latency_only: bool,
     },
 
     /// La première lecture des PDF d'un store, sur une réplique, par l'enfant livré : durée,
@@ -1020,7 +1023,12 @@ fn main() -> Result<()> {
             vectors,
             model,
             maild,
-        } => pdfeffect::run(&pdfeffect::Inputs {
+            latency_only,
+        } => (if latency_only {
+            pdfeffect::latency_only
+        } else {
+            pdfeffect::run
+        })(&pdfeffect::Inputs {
             store,
             vectors,
             model,

@@ -506,6 +506,79 @@ pub fn run(inputs: &Inputs) -> Result<()> {
     Ok(())
 }
 
+/// `pdf-effect --latency-only` : la latence seule, témoin contre après, **trois fois de suite**
+/// dans le même processus, chercheurs rouverts à chaque fois. Le banc complet l'avait mesurée
+/// ×1,41, ×1,39 puis ×1,00 sur les mots seuls, d'un relevé à l'autre : un relevé qui ne se
+/// reproduit pas ne se lit pas, et celui-ci dit si l'écart est dans l'index ou dans la machine.
+///
+/// # Errors
+///
+/// Comme [`run`].
+pub fn latency_only(inputs: &Inputs) -> Result<()> {
+    release_only("pdf-effect")?;
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("racine du workspace")?
+        .to_owned();
+    let program = fresh_maild(&workspace, inputs.maild.as_ref())?;
+    let base = workspace.join("target").join("measure-pdf-latency");
+    let sources = Sources {
+        store: inputs.store.clone(),
+        vectors: inputs.vectors.clone(),
+        model: inputs.model.clone(),
+        maild: Some(program.clone()),
+    };
+    let after = Replica::build(&sources, base.join("apres").as_str(), true)?;
+    let a_root = after.root.clone();
+    inside(&a_root, &base)?;
+    let store_a = Store::open(&a_root)?;
+    mailcore::index::rebuild(&store_a, &Progress::new())?;
+    merge_to_one(&store_a)?;
+    drop(store_a);
+    let control = control_of(&a_root, &sources.store.join("blobs"), &base, "temoin")?;
+    let t_root = control.root.clone();
+    let store_a = Store::open(&a_root)?;
+    let store_t = Store::open(&t_root)?;
+
+    let (_, remarked) = maild::attachments::catch_up(&a_root, program.as_std_path())
+        .map_err(|failure| anyhow::anyhow!("lecture des PDF en échec : {}", failure.code()))?;
+    let ids: Vec<MessageId> = store_a
+        .unindexed(usize::MAX)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    mark_again(&t_root, &ids)?;
+    for store in [&store_t, &store_a] {
+        mailcore::index::update(store, &Progress::new())?;
+        anyhow::ensure!(store.unindexed_total()? == 0, "l'index n'a pas tout repris");
+        merge_to_one(store)?;
+    }
+    println!("Répliques         {remarked} messages remis ; un segment de chaque côté");
+    let mut held = Vec::new();
+    for attempt in 1..=3 {
+        println!("\n===== mesure {attempt}/3 =====");
+        calm()?;
+        held.push(latency(
+            &store_t,
+            &store_a,
+            &inputs.phrases,
+            &inputs.primary,
+        )?);
+    }
+    println!(
+        "\nLatence           {} sur trois mesures",
+        held.iter()
+            .map(|ok| if *ok { "tenue" } else { "NON TENUE" })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    drop(store_a);
+    drop(store_t);
+    drop(control);
+    drop(after);
+    Ok(())
+}
+
 /// La conclusion, **composée après les décisions**, dans les mots de la règle.
 fn verdict(
     reproducible: bool,
