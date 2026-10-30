@@ -903,7 +903,26 @@ enum Command {
     },
 }
 
+/// La pile d'un fil de travail : celle du fil principal de Windows — un mégaoctet — ne suffit pas.
+///
+/// En profil de débogage, l'analyse de `Command` par clap et le `match` de [`run`] la dépassaient :
+/// `cargo xtask --help` lui-même finissait en `STATUS_STACK_OVERFLOW`, trouvé le 2026-10-30. Les
+/// bancs à modèle se lançaient en `--release`, ce qui le cachait. Seize mégaoctets sont réservés,
+/// pas engagés : le système ne les donne qu'à mesure qu'ils servent.
+const STACK: usize = 16 * 1024 * 1024;
+
 fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("xtask".into())
+        .stack_size(STACK)
+        .spawn(run)?;
+    // Une panique a déjà été écrite par le crochet de panique ; il ne reste qu'à échouer.
+    worker
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("xtask a paniqué")))
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::ProfileScan { profile } => profile::scan(profile.as_std_path()),
