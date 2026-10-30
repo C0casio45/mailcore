@@ -429,6 +429,24 @@ de noms passé à `cargo test` excluait les tests d'intégration — leurs noms 
 du module. Un contrôle se lit sur la ligne `test result` : `0 filtered out`, ou le nom du test
 attendu parmi les échecs.
 
+**Le serveur MCP en stdio ne fait que lire** — depuis le 2026-10-30 (`Mailbox::open_reader`).
+Claude Code le lance de lui-même à chaque session, sur le store que sa configuration désigne ; il
+montait tout le démon, et sur le corpus de mesure il l'a migré du schéma 15 au 17, sans retour,
+puis y a lu les PDF. **Le corpus est donc au schéma 17, PDF lus**, et ses vecteurs ont été refaits
+(`docs/PHASE-4.md`, journal du jour). Trois choses à ne pas défaire :
+
+- **un écrivain par store est un fait d'ouverture, pas une intention d'appelant.** Le lecteur ouvre
+  SQLite en lecture seule pour le système, refuse un schéma ancien au lieu de le migrer, ne crée
+  rien ; `guard::open_store` ne couvrait que les bancs, et le processus qui a écrit n'en était pas
+  un ;
+- **une migration peut ne vivre que dans `-wal`** : la base reste identique au bit tant qu'aucun
+  point de contrôle ne l'a reportée. Un contrôle « rien n'a été écrit » relit aussi le journal, et
+  un store « d'avant » se fabrique par `migrations::apply_up_to`, jamais en réécrivant
+  `user_version` — un tel store ne se migre pas, donc ne montre aucun migrateur ;
+- **les drapeaux `vectorised` sont communs à tous les fichiers de vecteurs.** Reposer à la main un
+  fichier écrit avant les PDF passe tous les gardes avec 1 166 vecteurs faux. Seuls les fichiers
+  `-pdf` se reposent.
+
 ## Règles absolues
 
 1. **Ne jamais écrire dans le profil Thunderbird.** Il est en production, l'utilisateur

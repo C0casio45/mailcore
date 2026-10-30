@@ -118,7 +118,10 @@ régresser le jeu de requêtes.
 l'index fusionné ; la première lecture des PDF **dans l'application**, au premier lancement qui
 suivra la recompilation — elle n'a tourné que dans les tests et sur des répliques ; la latence du
 texte des PDF, indécidable avec l'instrument du jour ; et la vérification du correctif du démarrage
-du 2026-10-20, qui attend ce même lancement.
+du 2026-10-20, qui attend ce même lancement. **Les deux dernières sont levées le 2026-10-30**, sur
+les lancements du 21 et du 22 : 212 ms à la première image, et la première lecture des PDF faite en
+8 min 40 s sans un avertissement. Le même jour, le corpus a été migré au schéma 17 par le serveur
+MCP, PDF lus : le critère 1 y a été remesuré, sans changement au-delà du bruit — voir le journal.
 
 ## Ordre de travail
 
@@ -4520,3 +4523,103 @@ le modèle, 187 sans, sous les 225 ms du critère 1 de la phase 2. Ce que ce ban
 montrer, et qui était le symptôme : un index **froid**. Le cache du système est chaud ici, et rien
 ne le vide sans outil d'administration. Le prochain lancement du jour le dira — et il ne peut plus
 attendre l'index, par construction.
+
+### 2026-10-30 — le serveur MCP avait migré le corpus, et ce que les lancements du 21 et du 22 ont montré
+
+**En clair d'abord.** Claude Code lance un serveur MCP — `maild stdio` — au début de chaque
+session, sur le store que sa configuration désigne : ici, le corpus de mesure. Ce processus montait
+tout le démon. À l'ouverture d'une session, le 2026-10-30, il a migré le corpus du schéma 15 au 17,
+sans retour possible, puis y a lu les PDF et mis l'index à jour. Aucune copie au schéma 15
+n'existait : le corpus a été remis en état **au schéma 17**, et le serveur MCP ne fait plus que
+lire (32a96df).
+
+**Ce que le processus a fait, et ce qu'il n'a pas fait** — relu par une connexion SQLite en
+lecture seule :
+
+- la migration, reportée dans la base elle-même ;
+- 61 s après son lancement, la lecture des PDF : 73 658 messages marqués lus, 1 789 pièces rangées
+  pour 1 330 messages, 1 166 messages remis à l'index et aux vecteurs — les chiffres de la réplique
+  de `pdf-effect` ;
+- la mise à jour de l'index : 7 segments, 73 658 documents vivants ;
+- **pas** les vecteurs : le corpus n'a pas de modèle installé, et `vectors.bin` restait identique au
+  bit à `vectors-e5-latin.bin`. 1 166 messages attendaient donc leur vecteur, et `measure-recall
+  --model` le refusait — `guard::settled` a fait son travail ;
+- ses veilleurs ont démarré sur les onze comptes du corpus sans rien moissonner, et sa file d'envoi
+  était vide : rien n'est sorti de la machine.
+
+**Le corpus remis en état** :
+
+- les 1 166 vecteurs refaits avec le modèle en place, e5, par `mail vectors --bert` : 218 s.
+  `vectors.bin` porte 74 824 enregistrements, copiés en `measurements/vectors-e5-latin-pdf.bin` ;
+- les mêmes avec granite, dans un fichier à part : `vectors-granite-latin.bin` posé à la place, les
+  drapeaux des 1 166 remis à zéro, la passe incrémentale refaite — 120 s —, le résultat rangé en
+  `measurements/vectors-granite-latin-pdf.bin`, et e5 remis en place ;
+- **un piège à ne pas refaire** : les drapeaux `vectorised` vivent dans la base, communs à tous les
+  fichiers de vecteurs. Reposer un fichier écrit avant les PDF — `vectors-granite-latin.bin`,
+  `vectors-e5-latin.bin` — passerait `settled` sans un mot, avec 1 166 vecteurs qui ignorent le
+  texte de leurs PDF. Ces fichiers restent pour l'histoire ; seuls les `-pdf` se reposent.
+
+**Ce qui ne se rejoue plus sur le corpus.** `pdf-effect` et `measure-arrival --pdf` refusent un
+store dont les PDF sont lus — leurs verdicts restent ceux du 2026-10-20. `pdf-effect
+--latency-only` ne refuse pas mais compare deux répliques identiques : il ne mesure plus rien. Et
+toute réplique du corpus porte maintenant un index de 7 segments, dont deux avec des retraits, et
+le texte des PDF : un temps mesuré dessus ne se compare plus sans précaution à ceux d'avant.
+
+**La nouvelle base du critère 1**, corpus au schéma 17, PDF lus — `measure-recall`, relevés et
+rangs dans `measurements/corpus-v2-2026-10-30/`. Cibles de l'hybride dans les dix premiers :
+
+| Jeu | granite, 2026-10-10 | granite, PDF lus | e5, 2026-10-10 | e5, PDF lus |
+|---|---|---|---|---|
+| v5, 30 requêtes | 8 (26,7 %) | 8 (26,7 %) | 3 | 4 |
+| v4, 24 requêtes | 7 (29,2 %) | 7 (29,2 %) | 3 | 3 |
+| v3, 46 requêtes | 9 (19,6 %) | 10 (21,7 %) | 8 | 8 |
+
+Rien au-dessus du bruit — c'est ce que `pdf-effect` avait conclu sous règle gelée, « pas montré
+pire » —, et ces relevés ne sont pas une expérience contrôlée : la segmentation de l'index a changé
+en même temps. **Les critères 1 et 8 restent non tenus.** Un modèle candidat se compare désormais à
+`vectors-granite-latin-pdf.bin`, au même banc.
+
+**Le correctif** (32a96df). `maild stdio --protocol mcp` ouvre la boîte par
+`Mailbox::open_reader` et ne monte aucun `Service` : ni migration, ni moisson, ni facteur, ni passe
+de fond. La règle est tenue au point d'ouverture et pas par l'appelant : SQLite ouvert en lecture
+seule par le système, `query_only`, aucun point de contrôle à la fermeture, des blobs et des
+fichiers de verrou qui refusent d'écrire, un index tantivy jamais créé et pris par le verrou des
+lecteurs. Un schéma ancien est refusé avec ce qu'il faut faire ; un index absent est rouvert à la
+recherche suivante si `search/` a changé. Le seul fichier qui bouge est `-shm`, que SQLite écrit
+pour coordonner un lecteur. Relu sous trois angles, quatre défauts confirmés et corrigés, 1 831
+tests.
+
+Deux leçons :
+
+- **un garde-fou posé chez les appelants ne couvre que les appelants qu'on connaît.**
+  `guard::open_store` protégeait les bancs depuis le 2026-10-20 ; le processus qui a écrit n'en
+  était pas un, et personne ne l'avait compté parmi les écrivains. C'est la leçon du 2026-09-09 —
+  un paramètre qui peut désigner le store réel le désignera — appliquée à une configuration ;
+- **un contrôle sur les octets de la base ne voit pas une migration restée dans le journal.** Le
+  contrôle négatif l'a montré : remis sur l'ancien chemin, un lecteur migrait un vrai store d'avant,
+  et `index.sqlite` restait identique au bit — la migration vivait dans `-wal`, faute de point de
+  contrôle. Les tests comparent donc aussi le journal, et fabriquent un **vrai** store d'avant
+  (`migrations::apply_up_to`) : un `user_version` réécrit ne se migre pas, et ne laisse voir aucun
+  lecteur qui migrerait.
+
+**Trouvé au passage** : `cargo xtask`, en profil de débogage, débordait la pile du fil principal
+sous Windows — `--help` compris. Les bancs à modèle se lançaient en `--release`, ce qui le cachait.
+Le travail tourne maintenant dans un fil à la pile plus large.
+
+**Ce que les lancements du 21 et du 22 ont montré**, lus dans le journal de la coquille — les deux
+dernières réserves de la clôture sont levées :
+
+- **le démarrage** : première image à 212 ms le 22, store ouvert en 118 ms, index ouvert à côté en
+  304 ms. Le 21, 1 018 ms, migration 16 → 17 comprise ;
+- **la première lecture des PDF dans l'application** : 254 passages de 200 messages, 941 messages
+  remis à l'index, 8 min 40 s — prévue à 6 ou 7 min —, aucun avertissement.
+
+Et deux défauts, traités dans les entrées qui suivent :
+
+- **la coquille lancée deux fois à la même seconde**, le 21, cause inconnue : deux démons complets
+  sur un store. Deux moissons refusées « database is locked » en moins d'une seconde — bien sous
+  les 5 s d'attente promises —, et le courrier de ces comptes arrivé 14 et 24 min plus tard ;
+- **un serveur lent qui retient tout**, le 22 : le serveur d'un compte répondait en 20 à 40 s par
+  commande, contre 0,1 s la veille. Sa moisson a tenu l'unique fil des jobs plus de 18 min ;
+  l'arrivée annoncée d'un autre compte a attendu derrière, et les passes de fond — vecteurs, PDF —
+  n'ont pas tourné. L'interface n'a pas figé ; le courrier, lui, n'arrivait plus.
