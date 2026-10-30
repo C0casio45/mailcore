@@ -2,11 +2,15 @@
 //!
 //! ## Ouvrir n'est pas lire
 //!
-//! `Store::open` applique les migrations, et `mailcore` n'a pas d'ouverture en lecture seule :
-//! ouvrir le corpus `measurements/store` — au schéma 15 le 2026-10-20 — avec un binaire au schéma
-//! 17 l'écrit **en place**, et aucun binaire plus ancien ne le rouvre ensuite. Les bancs qui
-//! travaillent sur une réplique sous `target/` n'ont rien à craindre ; les autres passent par
-//! [`open_store`] et [`open_mailbox`], qui refusent un store qu'ils migreraient hors de `target/`.
+//! `Store::open` applique les migrations : ouvrir un store avec un binaire plus récent l'écrit
+//! **en place**, et aucun binaire plus ancien ne le rouvre ensuite. Les bancs qui travaillent sur
+//! une réplique sous `target/` n'ont rien à craindre ; les autres passent par [`open_store`] et
+//! [`open_mailbox`], qui refusent un store qu'ils migreraient hors de `target/`.
+//!
+//! Ces gardes ne couvrent que les bancs. Le corpus `measurements/store` a été migré du schéma 15
+//! au 17 le 2026-10-30 par un autre chemin — le serveur MCP qu'un client lance de lui-même, qui
+//! montait alors tout le démon. Ce chemin ouvre désormais en lecture (`Store::open_reader`), qui
+//! refuse un schéma ancien au lieu de le migrer ; voir `docs/PHASE-4.md`, journal de ce jour.
 //!
 //! ## Un relevé sur un état à moitié fait ment sans le dire
 //!

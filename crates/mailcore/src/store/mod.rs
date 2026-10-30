@@ -40,6 +40,8 @@ pub struct Store {
     root: Utf8PathBuf,
     blobs: FsBlobStore,
     conn: rusqlite::Connection,
+    /// Vrai pour un store ouvert par [`Store::open_reader`] : voir [`Store::is_reader`].
+    reader: bool,
 }
 
 impl Store {
@@ -62,7 +64,86 @@ impl Store {
         let conn = db::open(&root.join("index.sqlite"))?;
 
         tracing::debug!(root = %root, "store ouvert");
-        Ok(Self { root, blobs, conn })
+        Ok(Self {
+            root,
+            blobs,
+            conn,
+            reader: false,
+        })
+    }
+
+    /// Ouvre un store **existant** en lecture : rien n'est créé, migré ni écrit.
+    ///
+    /// ## Pourquoi un second chemin d'ouverture
+    ///
+    /// [`Self::open`] est celui d'un écrivain : il crée l'arborescence et migre le schéma, ce qui
+    /// est irréversible. Le serveur MCP qu'un client lance en stdio passait par là, et par tout ce
+    /// que le démon monte autour : le 2026-10-30, il a migré le corpus de mesure et lancé sur lui
+    /// la moisson et les passes de fond. Pointé sur le store du quotidien, il aurait été un second
+    /// écrivain complet à côté de la coquille. La règle « un lecteur n'écrit pas » est donc tenue
+    /// **ici, au point d'ouverture**, et pas par la vigilance de chaque appelant :
+    ///
+    /// - pas de `create_dir_all` — ni de la racine, ni de `blobs/`, ni de `tmp/` ;
+    /// - SQLite ouvert en lecture, sans création, sans migration — voir [`db::open_reader`] ;
+    /// - les blobs et les fichiers de verrou refusent d'écrire ([`crate::Error::ReadOnly`]).
+    ///
+    /// Ce qui peut bouger sur le disque est ce que SQLite écrit pour coordonner un lecteur WAL —
+    /// `index.sqlite-shm`, et `-wal` vide s'il manquait. [`db::open_reader`] le détaille.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::NoStore`] si `index.sqlite` est absent, [`crate::Error::SchemaBehind`] si
+    /// le store attend une migration, et ce que rend [`db::open_reader`].
+    pub fn open_reader(root: impl AsRef<Utf8Path>) -> Result<Self> {
+        let root = root.as_ref().to_owned();
+        let index = root.join("index.sqlite");
+        match std::fs::metadata(&index) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Err(Error::NoStore { root }),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::NoStore { root });
+            }
+            Err(source) => {
+                return Err(Error::Io {
+                    path: index,
+                    source,
+                });
+            }
+        }
+
+        let blobs = FsBlobStore::open_reader(&root);
+        let conn = db::open_reader(&index)?;
+
+        tracing::debug!(root = %root, "store ouvert en lecture");
+        Ok(Self {
+            root,
+            blobs,
+            conn,
+            reader: true,
+        })
+    }
+
+    /// Vrai si le store a été ouvert par [`Self::open_reader`].
+    ///
+    /// Ce qui écrit à côté de SQLite le demande avant de toucher au disque — voir
+    /// [`Self::refuse_if_reader`] —, et `Mailbox` s'en sert pour ouvrir l'index plein texte sans
+    /// jamais le créer.
+    #[must_use]
+    pub const fn is_reader(&self) -> bool {
+        self.reader
+    }
+
+    /// [`crate::Error::ReadOnly`] pour `path` si le store a été ouvert en lecture.
+    ///
+    /// À appeler **avant** de créer un fichier sous la racine. SQLite n'en a pas besoin : sa
+    /// connexion de lecteur refuse elle-même.
+    pub(crate) fn refuse_if_reader(&self, path: &Utf8Path) -> Result<()> {
+        if self.reader {
+            return Err(Error::ReadOnly {
+                path: path.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// La racine du store.
@@ -128,6 +209,41 @@ pub fn default_root() -> Result<Utf8PathBuf> {
     })
 }
 
+/// Un relevé de fichiers : chemin relatif, et contenu — `None` pour un répertoire.
+#[cfg(test)]
+pub(crate) type Tree = std::collections::BTreeMap<String, Option<Vec<u8>>>;
+
+/// Tout ce qu'il y a sous `root`, octet pour octet : un répertoire vaut `None`, un fichier son
+/// contenu. Pour les tests qui vérifient qu'un lecteur n'a rien écrit — sur des stores de quelques
+/// fichiers.
+///
+/// Les deux fichiers que SQLite écrit pour coordonner un lecteur WAL, `index.sqlite-wal` et
+/// `index.sqlite-shm`, sont rendus à part : chaque test dit ce qu'il en attend, au lieu de les
+/// ignorer en silence.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) fn snapshot(root: &Utf8Path) -> (Tree, [Option<Vec<u8>>; 2]) {
+    fn walk(root: &Utf8Path, dir: &Utf8Path, out: &mut Tree) {
+        for entry in dir.read_dir_utf8().unwrap() {
+            let path = entry.unwrap().into_path();
+            let name = path.strip_prefix(root).unwrap().as_str().replace('\\', "/");
+            if path.is_dir() {
+                out.insert(name, None);
+                walk(root, &path, out);
+            } else {
+                out.insert(name, Some(std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    if root.exists() {
+        walk(root, root, &mut tree);
+    }
+    let wal = tree.remove("index.sqlite-wal").flatten();
+    let shm = tree.remove("index.sqlite-shm").flatten();
+    (tree, [wal, shm])
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -182,5 +298,104 @@ mod tests {
 
         let hash = first.blobs().put(b"un message").unwrap().hash;
         assert!(!second.blobs().contains(hash).unwrap());
+    }
+
+    // --- `open_reader` ---------------------------------------------------------------------
+
+    #[test]
+    fn a_reader_pointed_at_no_store_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = Utf8Path::from_path(dir.path()).unwrap().to_owned();
+
+        // Une racine absente : refusée, et toujours absente.
+        let absent = parent.join("pas/encore/la");
+        assert!(matches!(
+            Store::open_reader(&absent),
+            Err(Error::NoStore { root }) if root == absent
+        ));
+        assert!(!parent.join("pas").exists(), "la racine a été créée");
+
+        // Une racine vide : refusée, et toujours vide — ni `blobs/`, ni `tmp/`, ni base.
+        let empty = parent.join("vide");
+        std::fs::create_dir(&empty).unwrap();
+        let before = snapshot(&parent);
+        assert!(matches!(
+            Store::open_reader(&empty),
+            Err(Error::NoStore { .. })
+        ));
+        assert_eq!(snapshot(&parent), before, "le lecteur a créé quelque chose");
+    }
+
+    #[test]
+    fn a_reader_store_writes_no_file_beside_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap().to_owned();
+        let hash = {
+            let store = Store::open(&root).unwrap();
+            store.blobs().put(b"un message").unwrap().hash
+        };
+        let (files, journal) = snapshot(&root);
+        assert_eq!(journal, [None, None], "précondition : un store fermé");
+
+        let reader = Store::open_reader(&root).unwrap();
+        assert!(reader.is_reader());
+        // La lecture marche…
+        assert_eq!(reader.blobs().read(hash).unwrap(), b"un message");
+        // … et chaque écriture est refusée avant de toucher au disque.
+        let refused = |outcome: Result<()>| matches!(outcome, Err(Error::ReadOnly { .. }));
+        assert!(refused(reader.blobs().put(b"un autre").map(drop)));
+        assert!(refused(
+            reader.blobs().put_reader(&mut &b"un flux"[..]).map(drop)
+        ));
+        assert!(refused(reader.blobs().put_writer().map(drop)));
+        assert!(refused(reader.blobs().delete(hash).map(drop)));
+        assert!(refused(reader.lock_delivery().map(drop)));
+        assert!(refused(pdfs::ScanLock::try_acquire(&reader).map(drop)));
+        drop(reader);
+
+        let (after, [wal, _shm]) = snapshot(&root);
+        assert_eq!(after, files, "un fichier du store a changé");
+        // Ce que SQLite a créé pour lire, et rien de plus : un journal vide — voir
+        // `db::open_reader`.
+        assert_eq!(wal.as_deref(), Some(&[][..]));
+    }
+
+    /// Une racine qui n'a que sa base — copiée, ou archivée par un outil qui laisse les répertoires
+    /// vides en route : un lecteur l'ouvre, et n'y crée ni `blobs/` ni `tmp/`. Les autres tests
+    /// ouvrent des stores que `Store::open` a déjà garnis, où un `create_dir_all` ne se verrait pas.
+    #[test]
+    fn a_reader_creates_no_blob_store_beside_a_lone_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap().to_owned();
+        drop(db::open(&root.join("index.sqlite")).unwrap());
+        let (files, journal) = snapshot(&root);
+        assert_eq!(
+            files.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["index.sqlite"],
+            "précondition : la base seule"
+        );
+        assert_eq!(journal, [None, None], "précondition : une base fermée");
+
+        let reader = Store::open_reader(&root).unwrap();
+        // Un magasin absent se lit comme un magasin vide.
+        let hash = crate::model::BlobHash::of(b"un message");
+        assert!(matches!(
+            reader.blobs().read(hash),
+            Err(Error::BlobNotFound(missing)) if missing == hash
+        ));
+        assert!(!reader.blobs().contains(hash).unwrap());
+        drop(reader);
+
+        let (after, _) = snapshot(&root);
+        assert_eq!(after, files, "le lecteur a créé quelque chose");
+    }
+
+    #[test]
+    fn a_writer_store_is_not_a_reader() {
+        // Le contrôle inverse du précédent : la barrière ne vise que le lecteur.
+        let (_dir, store) = temp_store();
+        assert!(!store.is_reader());
+        assert!(store.blobs().put(b"un message").is_ok());
+        assert!(store.lock_delivery().is_ok());
     }
 }

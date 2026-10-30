@@ -13,11 +13,33 @@
 
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
-use tantivy::{Index, IndexReader};
+use tantivy::{Index, IndexReader, TantivyError};
 
 use crate::error::Result;
+use crate::index::directory::Readonly;
 use crate::index::schema::{self, Fields};
 use crate::model::MessageId;
+
+/// Ouvre l'index **existant** de `dir`, sans jamais rien y créer ni écrire.
+///
+/// Le pendant de [`crate::index::open_or_create_in`] pour une boîte ouverte en lecture
+/// (`Mailbox::open_reader`). Celle-là crée le répertoire et un index vide quand il manque — le bon
+/// geste pour un écrivain, qui va le remplir. Un lecteur, lui, n'a rien à remplir : un répertoire
+/// absent ou un index illisible sont des erreurs, et la boîte répond alors sans recherche, comme
+/// pour un index illisible ouvert par un écrivain. Le répertoire passe par
+/// [`Readonly`](crate::index::directory::Readonly), qui refuse toute écriture et ne crée pas le
+/// fichier de verrou de tantivy.
+///
+/// # Errors
+///
+/// [`crate::Error::Tantivy`] si le répertoire manque, si l'index est absent ou illisible, ou si
+/// son schéma ne se résout pas.
+pub fn open_existing_in(dir: &camino::Utf8Path) -> Result<(Index, Fields)> {
+    let directory = Readonly::open(dir.as_std_path()).map_err(TantivyError::from)?;
+    let index = Index::open(directory)?;
+    let fields = schema::resolve(&index.schema())?;
+    Ok((index, fields))
+}
 
 /// Un résultat de recherche : un message et sa pertinence.
 #[derive(Debug, Clone, Copy, PartialEq)]

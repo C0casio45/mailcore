@@ -14,12 +14,31 @@
 //!
 //! Un serveur MCP joignable seulement en stdio n'est utilisable que depuis la machine du
 //! démon, ce qui exclut le déploiement de référence de `docs/PHASE-1.md`.
+//!
+//! ## `stdio --protocol mcp` est un lecteur, et rien d'autre
+//!
+//! C'est le processus qu'un client — Claude Code — lance de lui-même, à côté de l'application qui
+//! tourne déjà. Il ouvre la boîte par `Mailbox::open_reader` et sert les cinq outils **sans monter
+//! de [`Service`]** : ni migration, ni création, ni jobs, ni veilleurs `IDLE`, ni facteur, ni passe
+//! de fond des vecteurs ou des PDF, ni recherche par le sens. L'écrivain d'un store est
+//! l'application — le démon embarqué de la coquille — ou un démon complet : `maild http`, ou
+//! `maild stdio --protocol api`.
+//!
+//! Jusqu'au 2026-10-30, ce processus passait par `Service::open` comme les autres : lancé sur le
+//! corpus de mesure, il l'a migré de façon irréversible et y a lancé la moisson et les passes de
+//! fond. Sur le store du quotidien, il aurait été un second écrivain complet à côté de la coquille
+//! — deux moissons, deux connexions `IDLE` par compte, deux passes de fond.
+//!
+//! La règle est tenue **au point d'ouverture**, pas par ce qu'on choisit d'appeler ensuite : la
+//! connexion SQLite d'un lecteur est ouverte en lecture par le système, le store refuse d'écrire
+//! un blob ou un verrou, et l'index plein texte n'est jamais créé — voir `Store::open_reader`.
 
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
+use mailcore::Mailbox;
 use mailmcp::MailServer;
 
 use maild::Service;
@@ -77,6 +96,12 @@ enum Command {
     ///
     /// **Un seul protocole à la fois**, contrairement à HTTP qui sert les deux : il n'y a
     /// qu'un flux d'entrée, et rien dans un message ne dirait auquel il appartient.
+    ///
+    /// **`mcp` ne fait que lire** : le store est ouvert sans création ni migration — un schéma
+    /// ancien est refusé —, et rien d'autre n'est monté : ni moisson, ni facteur, ni passe de
+    /// fond. Un client le lance de lui-même, à côté de l'application qui écrit déjà ; monter le
+    /// démon complet, comme jusqu'au 2026-10-30, migrait le store et doublait chaque tâche de fond.
+    /// `api` monte le démon complet, qui écrit.
     Stdio {
         /// Le protocole à servir : `mcp` pour un modèle, `api` pour l'UI ou la CLI.
         #[arg(long, default_value = "mcp")]
@@ -177,8 +202,8 @@ fn main() -> Result<()> {
             tls_key,
             allow_plaintext: insecure_no_tls,
         }),
-        Command::Stdio { protocol } => serve(
-            Requested {
+        Command::Stdio { protocol } => {
+            let requested = Requested {
                 store: cli.store,
                 profiles: cli.profiles,
                 ui_dir: cli.ui_dir,
@@ -186,10 +211,14 @@ fn main() -> Result<()> {
                 tls_cert: None,
                 tls_key: None,
                 allow_plaintext: false,
-            },
-            protocol,
-            launch,
-        ),
+            };
+            match protocol {
+                // Le lecteur : pas de `Service`, donc pas de passe de fond à lancer, et `launch`
+                // n'a pas d'usage ici.
+                Protocol::Mcp => serve_mcp_reader(requested),
+                Protocol::Api => serve(requested, launch),
+            }
+        }
         Command::Http {
             listen,
             tls_cert,
@@ -205,8 +234,6 @@ fn main() -> Result<()> {
                 tls_key,
                 allow_plaintext: insecure_no_tls,
             },
-            // Sans objet en HTTP : les deux protocoles sont servis, sur deux chemins.
-            Protocol::Mcp,
             launch,
         ),
     }
@@ -295,8 +322,27 @@ fn check(requested: Requested) -> Result<()> {
     Ok(())
 }
 
-/// Ouvre la boîte et sert le protocole.
-fn serve(requested: Requested, protocol: Protocol, launch: maild::vectors::Launch) -> Result<()> {
+/// `maild stdio --protocol mcp` : ouvre la boîte **en lecture** et sert les outils MCP, sans rien
+/// monter d'autre — voir l'en-tête du module.
+fn serve_mcp_reader(requested: Requested) -> Result<()> {
+    let config = resolve(requested)?;
+    if !config.profiles.is_empty() {
+        tracing::warn!("--profile sans effet : le serveur MCP en stdio ne lance aucune tâche");
+    }
+
+    let mailbox = Mailbox::open_reader(&config.store)
+        .with_context(|| format!("ouverture en lecture du store {}", config.store))?;
+    tracing::info!(
+        "MCP sur stdio, en lecture seule : ni migration, ni moisson, ni passe de fond — \
+         l'application, ou maild http, écrit le store"
+    );
+
+    let runtime = tokio::runtime::Runtime::new().context("runtime tokio")?;
+    runtime.block_on(api::stdio::serve(MailServer::new(mailbox)))
+}
+
+/// Monte le démon complet — celui qui écrit — et sert l'API en stdio, ou MCP et l'API en HTTP.
+fn serve(requested: Requested, launch: maild::vectors::Launch) -> Result<()> {
     let config = resolve(requested)?;
 
     // Rappelé à chaque démarrage, pas seulement au premier : un drapeau posé une fois dans
@@ -327,17 +373,16 @@ fn serve(requested: Requested, protocol: Protocol, launch: maild::vectors::Launc
         );
     }
 
-    let server = MailServer::from_shared(std::sync::Arc::clone(&service.mailbox));
     let client_api = service.api.clone();
 
     let runtime = tokio::runtime::Runtime::new().context("runtime tokio")?;
 
     let served = match config.listen {
-        Listen::Local => match protocol {
-            Protocol::Mcp => runtime.block_on(api::stdio::serve(server)),
-            Protocol::Api => runtime.block_on(api::stdio::serve_api(client_api)),
-        },
+        // En stdio, le démon complet ne sert que l'API : MCP y est servi par le lecteur,
+        // `serve_mcp_reader`, et cette combinaison-là n'a plus de chemin.
+        Listen::Local => runtime.block_on(api::stdio::serve_api(client_api)),
         Listen::Tcp(address) => {
+            let server = MailServer::from_shared(std::sync::Arc::clone(&service.mailbox));
             runtime.block_on(api::http::serve(server, client_api, address, &config))
         }
     };

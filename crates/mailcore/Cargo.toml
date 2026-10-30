@@ -28,5 +28,10 @@ tracing.workspace     = true
 serde.workspace       = true
 serde_json.workspace  = true
 
+[features]
+# Expose `store::migrations::apply_up_to` aux tests d'un autre crate : un vrai store d'un schéma
+# plus ancien, que le démon fait lire à son serveur MCP pour vérifier qu'il ne le migre pas.
+test-support = []
+
 [lints]
 workspace = true

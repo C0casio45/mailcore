@@ -364,6 +364,8 @@ impl ScanLock {
     /// [`crate::Error::Io`] si le fichier de verrou n'est pas ouvrable.
     pub fn try_acquire(store: &Store) -> Result<Option<Self>> {
         let path = store.root().join("attachments.lock");
+        // Un lecteur ne range aucun texte, et ne crée pas le fichier de verrou.
+        store.refuse_if_reader(&path)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)

@@ -43,7 +43,7 @@
 //! chaque écrivain et ferait attendre chaque lecteur dix secondes — un test le vérifie.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +51,7 @@ use tantivy::directory::error::{
     DeleteError, LockError, OpenDirectoryError, OpenReadError, OpenWriteError,
 };
 use tantivy::directory::{
-    Directory, DirectoryLock, FileHandle, FileSlice, Lock, MmapDirectory, WatchCallback,
+    Directory, DirectoryLock, FileHandle, FileSlice, Lock, META_LOCK, MmapDirectory, WatchCallback,
     WatchHandle, WritePtr,
 };
 
@@ -78,6 +78,137 @@ impl Patient {
         Ok(Self {
             inner: MmapDirectory::open(path)?,
         })
+    }
+}
+
+/// Le répertoire de l'index **d'un lecteur** : [`Patient`], qui refuse d'écrire et de créer.
+///
+/// Ce que tantivy fait d'un index qu'on ne fait que lire : il relit `meta.json` et `.managed.json`,
+/// mappe les segments, et prend, le temps de les ouvrir, le verrou `.tantivy-meta.lock` — qui
+/// empêche l'écrivain d'un autre processus d'en effacer un sous ses yeux. Tout ça se fait par
+/// lecture, **sauf le verrou** : [`MmapDirectory`] ouvre son fichier **en écriture**, et le crée
+/// s'il manque. Sur un store protégé en écriture — un attribut lecture seule, un montage `:ro` —
+/// cette ouverture échouait, et la boîte répondait sans recherche, « aucun résultat » à tout,
+/// devant un index intact.
+///
+/// D'où les trois règles :
+///
+/// - **écrire, effacer, remplacer est refusé**, par une erreur d'accès refusé, et le verrou de
+///   l'écrivain aussi : un `IndexWriter` construit par erreur sur cet index échoue à sa
+///   construction, au lieu d'écrire — ou de tenir ce verrou contre l'écrivain de l'application ;
+/// - **le verrou des lecteurs est pris sur une ouverture en lecture**, par le même appel système
+///   que tantivy — `LockFileEx` sur toute l'étendue sous Windows, `flock` sous Linux et macOS, qui
+///   acceptent tous deux une poignée en lecture. C'est donc toujours le verrou de l'écrivain : un test
+///   vérifie que l'un tient l'autre à la porte, dans les deux sens ;
+/// - **ce verrou n'est pris que si son fichier existe déjà.** Il existe dès qu'un écrivain a validé
+///   ou qu'une boîte a ouvert l'index une fois, et tantivy ne l'efface jamais. S'il manque, le
+///   lecteur renonce à l'index — la boîte répond sans recherche — plutôt que de le créer, ou que de
+///   lire sans le verrou des segments qu'un écrivain pourrait effacer.
+#[derive(Debug, Clone)]
+pub(crate) struct Readonly {
+    inner: Patient,
+    /// La racine de l'index, où le verrou des lecteurs est ouvert.
+    root: PathBuf,
+}
+
+impl Readonly {
+    /// Ouvre le répertoire, qui doit exister : il n'est pas créé.
+    pub(crate) fn open(path: &Path) -> Result<Self, OpenDirectoryError> {
+        Ok(Self {
+            inner: Patient::open(path)?,
+            root: path.to_owned(),
+        })
+    }
+}
+
+/// Le refus d'écrire d'un [`Readonly`], en erreur d'entrée-sortie.
+fn refused(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "index ouvert en lecture : {} n'est pas écrit",
+            path.display()
+        ),
+    )
+}
+
+impl Directory for Readonly {
+    fn get_file_handle(&self, path: &Path) -> Result<Arc<dyn FileHandle>, OpenReadError> {
+        self.inner.get_file_handle(path)
+    }
+
+    fn open_read(&self, path: &Path) -> Result<FileSlice, OpenReadError> {
+        self.inner.open_read(path)
+    }
+
+    fn delete(&self, path: &Path) -> Result<(), DeleteError> {
+        Err(DeleteError::IoError {
+            io_error: Arc::new(refused(path)),
+            filepath: path.to_owned(),
+        })
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool, OpenReadError> {
+        self.inner.exists(path)
+    }
+
+    fn open_write(&self, path: &Path) -> Result<WritePtr, OpenWriteError> {
+        Err(OpenWriteError::wrap_io_error(
+            refused(path),
+            path.to_owned(),
+        ))
+    }
+
+    fn atomic_read(&self, path: &Path) -> Result<Vec<u8>, OpenReadError> {
+        self.inner.atomic_read(path)
+    }
+
+    fn atomic_write(&self, path: &Path, _data: &[u8]) -> io::Result<()> {
+        Err(refused(path))
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        // Rien n'a été écrit, donc rien à rendre durable.
+        Ok(())
+    }
+
+    fn acquire_lock(&self, lock: &Lock) -> Result<DirectoryLock, LockError> {
+        // **Le verrou des lecteurs, et lui seul.** Celui de l'écrivain, pris par un `IndexWriter`
+        // construit par erreur, tiendrait l'écrivain de l'application à la porte pendant toute la
+        // vie de ce processus.
+        if lock.filepath != META_LOCK.filepath {
+            return Err(LockError::wrap_io_error(refused(&lock.filepath)));
+        }
+        // **En lecture**, là où `MmapDirectory::acquire_lock` ouvre en écriture même un fichier
+        // présent : `File::open` ne crée rien, et passe sur un fichier qu'on ne peut pas écrire.
+        let file = match std::fs::File::open(self.root.join(&lock.filepath)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(LockError::wrap_io_error(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{} absent : un lecteur ne le crée pas",
+                        lock.filepath.display()
+                    ),
+                )));
+            }
+            Err(error) => return Err(LockError::wrap_io_error(error)),
+        };
+        // Le verrou exclusif de tantivy (`fs4`), par les mêmes appels : `LockFileEx` sur toute
+        // l'étendue, `0..!0`, sous Windows — sur une autre, il ne heurterait pas celui de
+        // l'écrivain — et `flock` sous Linux et macOS.
+        if lock.is_blocking {
+            file.lock().map_err(LockError::wrap_io_error)?;
+        } else if file.try_lock().is_err() {
+            // Ce que fait tantivy : tout échec d'un essai sans attente est un verrou occupé.
+            return Err(LockError::LockBusy);
+        }
+        // Lâcher la poignée relâche le verrou, comme chez tantivy.
+        Ok(DirectoryLock::from(Box::new(file)))
+    }
+
+    fn watch(&self, callback: WatchCallback) -> tantivy::Result<WatchHandle> {
+        self.inner.watch(callback)
     }
 }
 
@@ -388,6 +519,74 @@ mod tests {
         patient.atomic_write(meta, b"deux").unwrap();
         releaser.join().unwrap();
         assert_eq!(patient.atomic_read(meta).unwrap(), b"deux");
+    }
+
+    /// Le verrou des lecteurs que prend [`super::Readonly`], sur une ouverture en lecture, est
+    /// **celui de tantivy** : tenu par l'un, l'autre est à la porte, dans les deux sens. Un verrou
+    /// réimplémenté qui ne heurterait pas celui de l'écrivain laisserait celui-ci effacer un
+    /// segment pendant qu'un lecteur l'ouvre.
+    #[test]
+    fn the_lock_of_a_reader_is_the_lock_of_tantivy() {
+        use tantivy::directory::error::LockError;
+        use tantivy::directory::{Directory, Lock, META_LOCK, MmapDirectory};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy = MmapDirectory::open(dir.path()).unwrap();
+        let reader = super::Readonly::open(dir.path()).unwrap();
+        // Sans attente, pour qu'un verrou tenu se lise en un refus au lieu de bloquer le test.
+        let at_once = Lock {
+            filepath: META_LOCK.filepath.clone(),
+            is_blocking: false,
+        };
+        let busy = |outcome: Result<_, LockError>| matches!(outcome, Err(LockError::LockBusy));
+
+        // tantivy le tient — et crée le fichier : le lecteur est refusé.
+        let held = tantivy.acquire_lock(&META_LOCK).unwrap();
+        assert!(busy(reader.acquire_lock(&at_once)), "le lecteur est passé");
+        drop(held);
+
+        // Le lecteur le tient : tantivy est refusé.
+        let held = reader.acquire_lock(&META_LOCK).unwrap();
+        assert!(busy(tantivy.acquire_lock(&at_once)), "tantivy est passé");
+        drop(held);
+        // Et relâché, il est libre.
+        drop(tantivy.acquire_lock(&at_once).unwrap());
+    }
+
+    /// Le cas trouvé en relecture : un verrou qu'on ne peut pas écrire — store protégé en écriture.
+    /// tantivy ne le prend pas, parce qu'il ouvre en écriture ; le lecteur, si.
+    #[test]
+    fn a_reader_takes_a_lock_file_it_cannot_write() {
+        use tantivy::directory::{Directory, META_LOCK, MmapDirectory};
+
+        let dir = tempfile::tempdir().unwrap();
+        let tantivy = MmapDirectory::open(dir.path()).unwrap();
+        drop(tantivy.acquire_lock(&META_LOCK).unwrap());
+        let path = dir.path().join(&META_LOCK.filepath);
+        let set_readonly = |readonly: bool| {
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(&path, permissions).unwrap();
+        };
+        set_readonly(true);
+        let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
+        let by_tantivy = tantivy.acquire_lock(&META_LOCK).map(drop);
+        let by_reader = super::Readonly::open(dir.path())
+            .unwrap()
+            .acquire_lock(&META_LOCK)
+            .map(drop);
+        // Rendu inscriptible avant toute assertion : le répertoire temporaire doit pouvoir s'effacer.
+        set_readonly(false);
+
+        assert!(
+            !writable,
+            "précondition : le verrou est encore inscriptible — compte privilégié ?"
+        );
+        assert!(
+            by_tantivy.is_err(),
+            "précondition : tantivy a pris un verrou en lecture seule"
+        );
+        by_reader.unwrap();
     }
 
     /// Le câblage, en lecture.

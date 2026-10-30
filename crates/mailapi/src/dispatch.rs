@@ -735,12 +735,20 @@ pub fn opaque(source: mailcore::Error) -> Error {
     tracing::warn!(%source, "méthode de l'API en échec");
     let message = match source {
         mailcore::Error::Query(_) => "requête de recherche invalide",
-        mailcore::Error::Sqlite(_) | mailcore::Error::Io { .. } => "le store est illisible",
+        mailcore::Error::Sqlite(_)
+        | mailcore::Error::Io { .. }
+        | mailcore::Error::NoStore { .. }
+        | mailcore::Error::WalUnavailable { .. } => "le store est illisible",
         mailcore::Error::Tantivy(_) => "l'index plein texte est illisible",
         mailcore::Error::BlobNotFound(_) => "le contenu du message est introuvable",
-        mailcore::Error::InvalidHash(_) | mailcore::Error::UnsupportedSchema { .. } => {
+        mailcore::Error::InvalidHash(_)
+        | mailcore::Error::UnsupportedSchema { .. }
+        | mailcore::Error::SchemaBehind { .. } => {
             "le store n'est pas exploitable par cette version"
         }
+        // L'API est servie par un démon qui écrit : un store ouvert en lecture n'y arrive pas.
+        // Le cas existe quand même, et le chemin reste ici, comme les autres.
+        mailcore::Error::ReadOnly { .. } => "le store est ouvert en lecture seule",
         // La configuration d'un compte est cassée, ou un serveur répond hors spécification.
         // Le message reste vague pour la même raison que les autres : il porterait un nom
         // d'hôte et un identifiant, et ni l'un ni l'autre n'a à traverser le réseau.

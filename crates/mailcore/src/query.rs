@@ -101,6 +101,37 @@ pub struct Mailbox {
     /// l'ouverture — une recherche faite pendant attend, elle ne rend jamais une liste vide comme
     /// si l'index n'existait pas.
     search: Arc<OnceLock<Option<Searcher>>>,
+    /// **Pour une boîte ouverte en lecture**, l'index trouvé après l'ouverture — voir
+    /// [`Self::late_searcher`]. Vide pour les autres, qui créent l'index à l'ouverture.
+    late: std::cell::OnceCell<Searcher>,
+    /// L'état de `search/` au dernier essai d'ouverture d'un lecteur : un essai qui a échoué ne
+    /// se refait que si quelque chose y a changé depuis.
+    tried: std::cell::Cell<Option<Footprint>>,
+}
+
+/// Ce qu'un lecteur regarde de `search/`, en deux `stat`, avant de réessayer d'en ouvrir l'index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Footprint {
+    /// La date et la taille de `meta.json`, que chaque validation de l'écrivain remplace — `None`
+    /// s'il manque : il n'y a pas d'index à ouvrir.
+    meta: Option<(std::time::SystemTime, u64)>,
+    /// Le verrou des lecteurs est-il là ? Un lecteur ne le crée pas, et sans lui il renonce.
+    lock: bool,
+}
+
+impl Footprint {
+    fn of(dir: &Utf8Path) -> Self {
+        let meta = std::fs::metadata(dir.join("meta.json"))
+            .ok()
+            .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+        Self {
+            meta,
+            lock: dir
+                .as_std_path()
+                .join(&tantivy::directory::META_LOCK.filepath)
+                .is_file(),
+        }
+    }
 }
 /// Un dossier et ses compteurs.
 #[derive(Debug, Clone)]
@@ -244,14 +275,52 @@ impl Drop for Filled {
 
 /// Le chercheur d'un index, ou `None` s'il ne s'ouvre pas — l'arbitrage de [`Mailbox::open`] : un
 /// index illisible laisse la boîte sans recherche, il ne la casse pas.
-fn open_searcher(dir: &Utf8Path) -> Option<Searcher> {
-    match index::open_or_create_in(dir).and_then(|(index, _)| Searcher::open(&index)) {
+///
+/// `reader` pour une boîte ouverte en lecture ([`Mailbox::open_reader`]) : l'index existant est
+/// ouvert tel quel, **jamais créé** — un index absent laisse aussi la boîte sans recherche.
+fn open_searcher(dir: &Utf8Path, reader: bool) -> Option<Searcher> {
+    let opened = if reader {
+        index::open_existing_in(dir)
+    } else {
+        index::open_or_create_in(dir)
+    };
+    match opened.and_then(|(index, _)| Searcher::open(&index)) {
         Ok(searcher) => Some(searcher),
         Err(source) => {
             tracing::warn!(%source, "index plein texte indisponible, recherche désactivée");
             None
         }
     }
+}
+
+/// La place du chercheur de `store`, remplie **dans un fil** — voir [`Mailbox::open_in_background`].
+fn open_searcher_in_background(store: &Store) -> Arc<OnceLock<Option<Searcher>>> {
+    let search = Arc::new(OnceLock::new());
+    let slot = Arc::clone(&search);
+    let dir = store.search_dir();
+    let reader = store.is_reader();
+    let spawned = std::thread::Builder::new()
+        .name("mailcore-index-ouverture".to_owned())
+        .spawn(move || {
+            // La garde **dans** le fil : un fil refusé ne lâche alors qu'un `Arc`, et le repli
+            // ci-dessous remplit la place. Construite avant, elle aurait été lâchée avec la
+            // fermeture refusée — « pas d'index » posé avant le repli, qui l'aurait perdu.
+            let slot = Filled(slot);
+            let started = std::time::Instant::now();
+            let opened = open_searcher(&dir, reader);
+            // Ce que l'étape `store` du démarrage comptait jusqu'ici, et qu'elle ne voit plus.
+            tracing::info!(
+                ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                disponible = opened.is_some(),
+                "index plein texte ouvert"
+            );
+            let _ = slot.0.set(opened);
+        });
+    if spawned.is_err() {
+        // Pas de fil : l'ouverture se fait ici, comme avant.
+        let _ = search.set(open_searcher(&store.search_dir(), store.is_reader()));
+    }
+    search
 }
 
 impl Mailbox {
@@ -264,8 +333,54 @@ impl Mailbox {
     /// [`crate::Error::Io`] ou [`crate::Error::Sqlite`] si le store est inutilisable.
     pub fn open(root: impl AsRef<Utf8Path>) -> Result<Self> {
         let store = Store::open(root)?;
-        let search = Arc::new(OnceLock::from(open_searcher(&store.search_dir())));
-        Ok(Self { store, search })
+        let search = Arc::new(OnceLock::from(open_searcher(&store.search_dir(), false)));
+        Ok(Self::assemble(store, search))
+    }
+
+    /// La boîte, sans index trouvé après coup.
+    fn assemble(store: Store, search: Arc<OnceLock<Option<Searcher>>>) -> Self {
+        Self {
+            store,
+            search,
+            late: std::cell::OnceCell::new(),
+            tried: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Ouvre une boîte **en lecture** : rien n'est créé, migré ni écrit — ni le store, ni l'index.
+    ///
+    /// C'est l'ouverture du serveur MCP en stdio, qu'un client lance à côté de l'application : un
+    /// processus qui ne fait que lire n'a pas à être un second écrivain. Le store passe par
+    /// [`Store::open_reader`], qui refuse un schéma ancien au lieu de le migrer ; l'index plein
+    /// texte par [`crate::index::open_existing_in`], qui ne le crée jamais — absent ou illisible,
+    /// la boîte répond sans recherche, comme à l'ouverture ordinaire.
+    ///
+    /// **Sans recherche, mais pas pour toujours.** Un écrivain crée son index à l'ouverture ; un
+    /// lecteur, non, donc l'index que l'application crée ou répare **après** doit pouvoir lui
+    /// arriver sans redémarrage : le serveur MCP vit le temps de la session de son client, des
+    /// heures, et il répondait « aucun résultat » à chaque recherche pendant que les dossiers se
+    /// remplissaient. Chaque recherche réessaie donc, si `search/` a changé depuis l'essai
+    /// précédent — voir [`Self::late_searcher`].
+    ///
+    /// L'index s'ouvre **dans un fil**, comme pour [`Self::open_in_background`] : un client MCP
+    /// attend la réponse à son `initialize`, et elle n'a pas besoin de l'index.
+    ///
+    /// Les écritures que la boîte sait faire — la file d'envoi, une marque de lecture — échouent
+    /// dans SQLite, dont la connexion est en lecture : voir `store::db::open_reader`.
+    ///
+    /// # Errors
+    ///
+    /// Ce que rend [`Store::open_reader`] : [`crate::Error::NoStore`],
+    /// [`crate::Error::SchemaBehind`], [`crate::Error::UnsupportedSchema`],
+    /// [`crate::Error::WalUnavailable`] ou [`crate::Error::Sqlite`].
+    pub fn open_reader(root: impl AsRef<Utf8Path>) -> Result<Self> {
+        let store = Store::open_reader(root)?;
+        // Relevé **avant** l'essai du fil : ce qui change pendant qu'il échoue sera vu.
+        let before = Footprint::of(&store.search_dir());
+        let search = open_searcher_in_background(&store);
+        let mailbox = Self::assemble(store, search);
+        mailbox.tried.set(Some(before));
+        Ok(mailbox)
     }
 
     /// [`Self::open`], **l'index plein texte ouvert dans un fil** : la boîte rend la main dès que
@@ -290,36 +405,46 @@ impl Mailbox {
     /// recherche, comme à l'ouverture ordinaire.
     pub fn open_in_background(root: impl AsRef<Utf8Path>) -> Result<Self> {
         let store = Store::open(root)?;
-        let search = Arc::new(OnceLock::new());
-        let slot = Arc::clone(&search);
-        let dir = store.search_dir();
-        let spawned = std::thread::Builder::new()
-            .name("mailcore-index-ouverture".to_owned())
-            .spawn(move || {
-                // La garde **dans** le fil : un fil refusé ne lâche alors qu'un `Arc`, et le repli
-                // ci-dessous remplit la place. Construite avant, elle aurait été lâchée avec la
-                // fermeture refusée — « pas d'index » posé avant le repli, qui l'aurait perdu.
-                let slot = Filled(slot);
-                let started = std::time::Instant::now();
-                let opened = open_searcher(&dir);
-                // Ce que l'étape `store` du démarrage comptait jusqu'ici, et qu'elle ne voit plus.
-                tracing::info!(
-                    ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    disponible = opened.is_some(),
-                    "index plein texte ouvert"
-                );
-                let _ = slot.0.set(opened);
-            });
-        if spawned.is_err() {
-            // Pas de fil : l'ouverture se fait ici, comme avant.
-            let _ = search.set(open_searcher(&store.search_dir()));
-        }
-        Ok(Self { store, search })
+        let search = open_searcher_in_background(&store);
+        Ok(Self::assemble(store, search))
     }
 
     /// Le chercheur, **en attendant la fin de son ouverture** si elle se fait encore dans un fil.
     fn searcher(&self) -> Option<&Searcher> {
-        self.search.wait().as_ref()
+        match self.search.wait() {
+            Some(searcher) => Some(searcher),
+            None => self.late_searcher(),
+        }
+    }
+
+    /// L'index d'une boîte **ouverte en lecture** qui n'en avait pas : rouvert s'il est apparu.
+    ///
+    /// Un écrivain n'en a pas besoin — il crée l'index à l'ouverture, et le démon le remonte
+    /// après une reconstruction ([`Self::reload_search`]). Un lecteur ne crée rien, et rien ne le
+    /// remonte : sans ceci, une boîte ouverte avant que l'application ait créé ou réparé l'index
+    /// restait sans recherche pour toute sa vie. Une fois trouvé, l'index suit les validations de
+    /// l'écrivain par le veilleur de tantivy, comme celui de l'ouverture.
+    ///
+    /// **Ce que ça coûte** : deux `stat` par recherche tant qu'il manque. L'essai lui-même — monter
+    /// les segments, des secondes sur un index froid et fragmenté — n'est refait que si
+    /// `meta.json` ou le verrou des lecteurs a changé depuis le précédent : un index illisible ne
+    /// fait pas payer son échec, ni écrire son avertissement, à chaque recherche.
+    fn late_searcher(&self) -> Option<&Searcher> {
+        if !self.store.is_reader() {
+            return None;
+        }
+        if let Some(searcher) = self.late.get() {
+            return Some(searcher);
+        }
+        let dir = self.store.search_dir();
+        let now = Footprint::of(&dir);
+        if now.meta.is_none() || self.tried.get() == Some(now) {
+            return None;
+        }
+        self.tried.set(Some(now));
+        let searcher = open_searcher(&dir, true)?;
+        tracing::info!("index plein texte apparu après l'ouverture : la recherche répond");
+        Some(self.late.get_or_init(|| searcher))
     }
 
     /// De quoi attendre l'index **sans tenir la boîte** : une recherche qui arrive pendant
@@ -331,12 +456,14 @@ impl Mailbox {
         SearchReady(Arc::clone(&self.search))
     }
 
-    /// Où en est l'index plein texte. Ne bloque jamais.
+    /// Où en est l'index plein texte. Ne bloque jamais — et ne réessaie pas : c'est une
+    /// recherche qui rouvre l'index d'un lecteur ([`Self::late_searcher`]).
     #[must_use]
     pub fn search_state(&self) -> SearchState {
         match self.search.get() {
             None => SearchState::Opening,
             Some(Some(_)) => SearchState::Ready,
+            Some(None) if self.late.get().is_some() => SearchState::Ready,
             Some(None) => SearchState::Absent,
         }
     }
@@ -378,9 +505,16 @@ impl Mailbox {
     /// même arbitrage qu'à l'ouverture, critère 1. La valeur rendue dit si la recherche est
     /// disponible après l'opération.
     pub fn reload_search(&mut self) -> bool {
-        let reopened = open_searcher(&self.store.search_dir());
+        // Une boîte ouverte en lecture le reste : son index se rouvre sans jamais être créé.
+        let dir = self.store.search_dir();
+        let before = Footprint::of(&dir);
+        let reopened = open_searcher(&dir, self.store.is_reader());
         let available = reopened.is_some();
         self.search = Arc::new(OnceLock::from(reopened));
+        // L'index trouvé après coup est remplacé par celui-ci, et l'essai qu'on vient de faire
+        // compte comme le dernier.
+        self.late = std::cell::OnceCell::new();
+        self.tried.set(Some(before));
         available
     }
 
@@ -548,7 +682,8 @@ impl Mailbox {
     ///
     /// La première version l'affirmait, et un test l'a démenti : [`Self::open`] crée un index
     /// **vide** quand il n'y en a pas, donc un store fraîchement importé rend `Some(0)` pour tous
-    /// les mots, pas `None`. `None` ne sort que d'un index illisible.
+    /// les mots, pas `None`. `None` ne sort que d'un index illisible — ou absent, pour une boîte
+    /// ouverte par [`Self::open_reader`], qui n'en crée pas.
     ///
     /// La conséquence est à connaître de tout appelant qui s'en sert pour juger une requête : sur
     /// un index vide ou incomplet, **chaque mot a l'air introuvable**. Un banc qui classe ses
@@ -1619,6 +1754,262 @@ mod tests {
         let _ = filled.0.set(None);
         drop(filled);
         assert!(kept.get().is_some());
+    }
+
+    // --- `Mailbox::open_reader` --------------------------------------------------------------
+
+    /// La fixture, indexée, **fermée** : comme la laisse l'application qui s'arrête.
+    fn closed_indexed_store() -> (tempfile::TempDir, camino::Utf8PathBuf) {
+        let (dir, mailbox) = mailbox();
+        crate::index::update(mailbox.store(), &crate::Progress::new()).unwrap();
+        let root = mailbox.store().root().to_owned();
+        drop(mailbox);
+        (dir, root)
+    }
+
+    /// Ouvre en lecture et attend l'index : un test qui compare le disque ensuite ne doit pas
+    /// courir contre le fil d'ouverture.
+    fn reader(root: &Utf8Path) -> Mailbox {
+        let reader = Mailbox::open_reader(root).unwrap();
+        reader.search_ready().wait();
+        reader
+    }
+
+    #[test]
+    fn a_reader_answers_like_the_box_it_reads() {
+        let (_dir, root) = closed_indexed_store();
+        let (files, journal) = crate::store::snapshot(&root);
+        assert_eq!(journal, [None, None], "précondition : un store fermé");
+
+        let reader = reader(&root);
+        assert!(reader.store().is_reader());
+        assert_eq!(reader.search_state(), SearchState::Ready);
+        assert_eq!(reader.folders().unwrap().len(), 2);
+        let hits = reader.search("facture", 10).unwrap();
+        assert_eq!(hits.len(), 2, "les deux messages parlent de facture");
+        let detail = reader
+            .message(hits[0].item.id)
+            .unwrap()
+            .unwrap_or_else(|| panic!("message introuvable"));
+        assert!(detail.body.contains("facture") || detail.body.contains("regarde"));
+        assert_eq!(reader.thread(hits[0].item.id).unwrap().len(), 1);
+        assert_eq!(
+            reader
+                .contact_history("plombier@exemple.fr", 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(reader.revision().is_ok());
+        drop(reader);
+
+        let (after, [wal, _shm]) = crate::store::snapshot(&root);
+        assert_eq!(after, files, "lire a changé un fichier du store");
+        assert_eq!(
+            wal.as_deref(),
+            Some(&[][..]),
+            "-wal : créé vide, rien de plus"
+        );
+    }
+
+    #[test]
+    fn a_reader_refuses_an_older_store_and_leaves_it_as_it_was() {
+        let (_dir, root) = closed_indexed_store();
+        // La base remplacée par **une vraie base d'avant**, que `Store::open` migrerait — à côté de
+        // blobs et d'un index. Réécrire la seule version ne suffirait pas : sur un schéma à jour,
+        // la migration échoue et se défait, et un lecteur qui migrerait passerait ce test.
+        let older = crate::store::migrations::SCHEMA_VERSION - 1;
+        std::fs::remove_file(root.join("index.sqlite")).unwrap();
+        {
+            let conn = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
+            crate::store::db::apply_pragmas(&conn).unwrap();
+            crate::store::migrations::apply_up_to(&conn, older).unwrap();
+        }
+        let (files, journal) = crate::store::snapshot(&root);
+        assert_eq!(journal, [None, None], "précondition : un store fermé");
+
+        let refused = Mailbox::open_reader(&root).unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                crate::Error::SchemaBehind { found, expected }
+                    if found == older && expected == crate::store::migrations::SCHEMA_VERSION
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("ne migre jamais"),
+            "le refus ne dit pas pourquoi : {refused}"
+        );
+
+        let (after, [wal, _shm]) = crate::store::snapshot(&root);
+        // Octet pour octet, `index.sqlite` compris : la version lue est toujours l'ancienne.
+        assert_eq!(after, files, "le refus a changé le store");
+        assert_eq!(
+            wal.as_deref(),
+            Some(&[][..]),
+            "-wal : créé vide, rien de plus"
+        );
+    }
+
+    #[test]
+    fn a_reader_without_an_index_has_no_search_and_creates_none() {
+        let (_dir, root) = closed_indexed_store();
+        std::fs::remove_dir_all(root.join("search")).unwrap();
+        let (files, _) = crate::store::snapshot(&root);
+
+        let mut reader = reader(&root);
+        assert_eq!(reader.search_state(), SearchState::Absent);
+        assert!(!reader.search_available());
+        assert!(reader.search("facture", 10).unwrap().is_empty());
+        assert_eq!(reader.indexed_documents(), None);
+        // Le reste répond.
+        assert_eq!(reader.folders().unwrap().len(), 2);
+        // Et la recharger ne le crée pas davantage.
+        assert!(!reader.reload_search());
+        drop(reader);
+
+        let (after, _) = crate::store::snapshot(&root);
+        assert_eq!(after, files);
+        assert!(!root.join("search").exists(), "un index a été créé");
+    }
+
+    /// Un lecteur ouvert avant l'index le trouve quand l'application le crée. Il n'en crée pas, et
+    /// rien ne le remonte : sans la reprise, `search_mail` répondait « aucun résultat » jusqu'au
+    /// redémarrage du client, pendant que les dossiers se remplissaient.
+    #[test]
+    fn a_reader_finds_an_index_created_after_it_opened() {
+        let (_dir, root) = closed_indexed_store();
+        std::fs::remove_dir_all(root.join("search")).unwrap();
+
+        let reader = reader(&root);
+        assert_eq!(reader.search_state(), SearchState::Absent, "précondition");
+        assert!(reader.search("facture", 10).unwrap().is_empty());
+        assert!(!root.join("search").exists(), "le lecteur a créé l'index");
+
+        // L'application crée et remplit l'index, à côté, pendant que le lecteur reste ouvert.
+        {
+            let writer = Store::open(&root).unwrap();
+            crate::index::rebuild(&writer, &crate::Progress::new()).unwrap();
+        }
+
+        assert_eq!(
+            reader.search("facture", 10).unwrap().len(),
+            2,
+            "l'index créé après l'ouverture n'a pas été vu"
+        );
+        assert_eq!(reader.search_state(), SearchState::Ready);
+        assert_eq!(reader.indexed_documents(), Some(2));
+    }
+
+    /// De même pour un index illisible à l'ouverture, puis réparé : `meta.json` remplacé, comme le
+    /// fait un `commit` ou « Reconstruire l'index ».
+    #[test]
+    fn a_reader_finds_an_index_repaired_after_it_opened() {
+        let (_dir, root) = closed_indexed_store();
+        let meta = root.join("search").join("meta.json");
+        let good = std::fs::read(&meta).unwrap();
+        std::fs::write(&meta, b"{ pas du json").unwrap();
+
+        let reader = reader(&root);
+        assert_eq!(reader.search_state(), SearchState::Absent, "précondition");
+        assert!(reader.search("facture", 10).unwrap().is_empty());
+
+        std::fs::write(&meta, &good).unwrap();
+        assert_eq!(reader.search("facture", 10).unwrap().len(), 2);
+        assert_eq!(reader.search_state(), SearchState::Ready);
+    }
+
+    #[test]
+    fn a_reader_on_an_unreadable_index_has_no_search_and_touches_nothing() {
+        let (_dir, root) = closed_indexed_store();
+        std::fs::write(root.join("search").join("meta.json"), b"{ pas du json").unwrap();
+        let (files, _) = crate::store::snapshot(&root);
+
+        let reader = reader(&root);
+        assert_eq!(reader.search_state(), SearchState::Absent);
+        assert!(reader.search("facture", 10).unwrap().is_empty());
+        assert_eq!(reader.folders().unwrap().len(), 2);
+        drop(reader);
+
+        assert_eq!(crate::store::snapshot(&root).0, files);
+    }
+
+    /// Le seul fichier que tantivy crée pour lire : le verrou des lecteurs. Un lecteur ne le crée
+    /// pas — il renonce à l'index — et n'accepte pas d'écrivain.
+    #[test]
+    fn a_reader_creates_no_lock_file_and_takes_no_writer() {
+        let (_dir, root) = closed_indexed_store();
+        let search = root.join("search");
+        assert!(search.join(".tantivy-meta.lock").is_file(), "précondition");
+
+        // Un écrivain sur l'index d'un lecteur : refusé dès sa construction, sans rien écrire.
+        let before = crate::store::snapshot(&root).0;
+        let (index, _) = crate::index::open_existing_in(&search).unwrap();
+        assert!(
+            index
+                .writer::<tantivy::TantivyDocument>(15_000_000)
+                .is_err(),
+            "un écrivain a été accepté sur l'index d'un lecteur"
+        );
+        drop(index);
+        assert_eq!(crate::store::snapshot(&root).0, before);
+
+        // Le verrou des lecteurs effacé : pas recréé, et la boîte répond sans recherche.
+        std::fs::remove_file(search.join(".tantivy-meta.lock")).unwrap();
+        let reader = reader(&root);
+        assert!(
+            !search.join(".tantivy-meta.lock").exists(),
+            "le lecteur a créé le verrou de tantivy"
+        );
+        assert_eq!(reader.search_state(), SearchState::Absent);
+        drop(reader);
+    }
+
+    /// Un index protégé en écriture — `attrib +R /S`, un montage `:ro` — se lit, recherche
+    /// comprise. tantivy ouvre le verrou des lecteurs en écriture : sur ce store, la boîte répondait
+    /// « aucun résultat » à tout, devant un index intact.
+    #[test]
+    fn a_reader_searches_an_index_it_cannot_write() {
+        let (_dir, root) = closed_indexed_store();
+        let search = root.join("search");
+        let files: Vec<camino::Utf8PathBuf> = search
+            .read_dir_utf8()
+            .unwrap()
+            .map(|entry| entry.unwrap().into_path())
+            .filter(|path| path.is_file())
+            .collect();
+        let lock = search.join(".tantivy-meta.lock");
+        assert!(files.contains(&lock), "précondition : le verrou existe");
+        let set_readonly = |readonly: bool| {
+            for file in &files {
+                let mut permissions = std::fs::metadata(file).unwrap().permissions();
+                permissions.set_readonly(readonly);
+                std::fs::set_permissions(file, permissions).unwrap();
+            }
+        };
+        set_readonly(true);
+        let writable = std::fs::OpenOptions::new().write(true).open(&lock).is_ok();
+        let (state, hits) = {
+            let reader = reader(&root);
+            (
+                reader.search_state(),
+                reader.search("facture", 10).map(|hits| hits.len()),
+            )
+        };
+        // Rendu inscriptible avant toute assertion : le répertoire temporaire doit pouvoir s'effacer.
+        set_readonly(false);
+
+        assert!(
+            !writable,
+            "précondition : le verrou est encore inscriptible — compte privilégié ?"
+        );
+        assert_eq!(
+            state,
+            SearchState::Ready,
+            "l'index protégé ne s'est pas ouvert"
+        );
+        assert_eq!(hits.unwrap(), 2);
     }
 
     /// Le texte d'un PDF rangé par l'enfant extracteur après l'indexation entre dans l'index à la

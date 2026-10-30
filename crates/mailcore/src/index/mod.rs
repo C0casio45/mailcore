@@ -14,5 +14,5 @@ pub mod writer;
 
 pub use coverage::Coverage;
 pub use schema::Fields;
-pub use searcher::{Hit, Searcher};
+pub use searcher::{Hit, Searcher, open_existing_in};
 pub use writer::{IndexStats, open_or_create, open_or_create_in, rebuild, update};

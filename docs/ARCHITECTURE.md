@@ -264,6 +264,32 @@ surface d'authentification est une surface qui ne peut pas divergrer. En stdio i
 choisir (`maild stdio --protocol mcp|api`) : il n'y a qu'un flux d'entrée, et rien dans un
 message ne dirait auquel des deux protocoles il appartient.
 
+**Le choix décide aussi de qui écrit — depuis le 2026-10-30.** Un store a un écrivain :
+l'application (le démon embarqué de la coquille), ou un démon complet, `maild http` ou
+`maild stdio --protocol api` — eux migrent le schéma, moissonnent, veillent en `IDLE`, vident la
+file d'envoi et font les passes de fond. `maild stdio --protocol mcp`, le défaut, est un
+**lecteur** : la boîte est ouverte par `Mailbox::open_reader`, et rien d'autre n'est monté. C'est le
+processus qu'un client comme Claude Code lance de lui-même, à côté de l'application qui tourne
+déjà ; jusque-là il montait tout le démon, et lancé sur le corpus de mesure, il l'a migré de façon
+irréversible et y a lancé moisson et passes de fond. Le lecteur :
+
+- **ne migre jamais** : un schéma plus ancien est refusé, avec ce qu'il faut faire — ouvrir le store
+  une fois avec l'application ou la commande `mail` ;
+- **ne crée rien** : ni la racine, ni `blobs/`, ni `tmp/`, ni `search/` ; un store absent est une
+  erreur qui le nomme, un index plein texte absent ou illisible laisse la boîte sans recherche —
+  jusqu'à ce que l'application le crée ou le répare : une recherche le rouvre si `search/` a
+  changé depuis l'essai précédent, sans quoi le lecteur répondrait « aucun résultat » pendant
+  toute la session de son client ;
+- **n'écrit rien**, et c'est tenu au point d'ouverture : SQLite en lecture seule au niveau du système,
+  `query_only`, pas de point de contrôle à la fermeture ; les blobs et les fichiers de verrou
+  refusent d'écrire ; l'index tantivy est ouvert par un répertoire qui refuse toute écriture et le
+  verrou de l'écrivain, et qui prend celui des lecteurs sur une ouverture en lecture — tantivy
+  l'ouvre en écriture, ce qui laissait sans recherche un store protégé en écriture.
+
+Ce qui bouge sur le disque est ce que SQLite écrit pour coordonner un lecteur WAL : `-shm`, et
+`-wal` créé vide s'il manquait. Rien d'autre — `crates/maild/tests/mcp_lecture.rs` le relit
+octet pour octet sur le vrai binaire.
+
 **Correction : la socket locale nommée n'existe pas.** Ce document décrivait le transport
 local comme un *named pipe* sur Windows et une socket Unix ailleurs. stdio couvre le même
 besoin sans code spécifique à la plateforme — le client démarre le démon en processus fils et
@@ -322,6 +348,10 @@ hors interface locale, refus de démarrer sinon.
 Outils exposés : `search_mail`, `get_thread`, `get_message`, `list_folders`,
 `get_contact_history`. En lecture seule au départ — l'écriture (répondre, envoyer)
 arrive en phase 3 et devra passer par une confirmation explicite de l'utilisateur.
+
+En stdio, **le processus aussi est en lecture seule**, pas seulement ses outils : voir
+« Transports et authentification ». En HTTP, les outils sont servis par le démon complet, qui
+écrit — c'est lui l'écrivain de ce store.
 
 Ce qui part vers un modèle est du **texte assaini** (`mailhtml`), jamais du HTML brut :
 un corps de message est du contenu écrit par un inconnu, et les injections de prompt

@@ -50,6 +50,69 @@ pub enum Error {
         supported: u32,
     },
 
+    /// Le schéma sur disque est **plus ancien** que celui de ce binaire, et le store a été ouvert
+    /// en lecture ([`crate::Store::open_reader`]) : un lecteur ne migre jamais.
+    ///
+    /// Une migration est irréversible, et c'est le premier geste d'un écrivain. Le serveur MCP
+    /// lancé par un client la faisait pourtant à l'ouverture, comme le reste du démon : le
+    /// 2026-10-30, il a migré du schéma 15 au schéma 17 le corpus de mesure, que personne n'avait
+    /// décidé de migrer. Le message dit donc qui le peut.
+    #[error(
+        "le store est au schéma {found}, ce binaire lit le schéma {expected}, et une ouverture \
+         en lecture ne migre jamais : ouvrez-le d'abord une fois avec l'application ou avec la \
+         commande `mail`, qui le migrent, puis relancez"
+    )]
+    SchemaBehind {
+        /// La version lue dans `user_version`.
+        found: u32,
+        /// La seule version que ce binaire sait lire.
+        expected: u32,
+    },
+
+    /// Aucun store à l'endroit désigné : `index.sqlite` n'y est pas.
+    ///
+    /// Seule l'ouverture en lecture rend cette erreur — l'autre crée le store. Un lecteur pointé
+    /// au mauvais endroit doit le dire, pas laisser derrière lui un store vide qu'on prendrait
+    /// ensuite pour le bon.
+    #[error(
+        "aucun store sous {root} : index.sqlite est absent, et une ouverture en lecture n'en \
+         crée pas"
+    )]
+    NoStore {
+        /// La racine désignée.
+        root: camino::Utf8PathBuf,
+    },
+
+    /// Une écriture de fichier demandée à un store ouvert en lecture : un blob, un verrou.
+    ///
+    /// SQLite refuse lui-même toute écriture sur une connexion de lecteur ; ce qui est à côté de
+    /// SQLite — les blobs, les fichiers de verrou — est refusé ici, avant de toucher au disque.
+    #[error("store ouvert en lecture : rien n'est écrit sous {path}")]
+    ReadOnly {
+        /// Ce qui aurait été écrit.
+        path: camino::Utf8PathBuf,
+    },
+
+    /// SQLite ne peut ni ouvrir ni créer le journal d'une base en mode WAL, et un lecteur en a
+    /// besoin.
+    ///
+    /// La documentation de SQLite (« Read-Only Databases », `wal.html`) : une base WAL ouverte en
+    /// lecture se lit si ses fichiers `-wal` et `-shm` existent déjà, **ou** si le répertoire
+    /// permet de les créer. Ni l'un ni l'autre — un support en lecture seule, un répertoire sans
+    /// droit d'écriture — et la première lecture échoue sur « unable to open database file », qui
+    /// ferait chercher la base elle-même.
+    #[error(
+        "le journal WAL de {path} ne peut être ni ouvert ni créé : une lecture a besoin des \
+         fichiers -wal et -shm à côté de la base, ou du droit de les y créer"
+    )]
+    WalUnavailable {
+        /// La base.
+        path: camino::Utf8PathBuf,
+        /// L'échec de SQLite.
+        #[source]
+        source: rusqlite::Error,
+    },
+
     /// `accounts.auth` porte une valeur que ce binaire ne connaît pas.
     ///
     /// Refusé plutôt que replié : se tromper de mécanisme d'authentification, c'est envoyer

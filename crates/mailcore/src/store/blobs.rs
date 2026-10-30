@@ -129,6 +129,9 @@ pub trait BlobStore: std::fmt::Debug + Send + Sync {
 pub struct FsBlobStore {
     blobs: Utf8PathBuf,
     tmp: Utf8PathBuf,
+    /// Faux pour un magasin ouvert par [`FsBlobStore::open_reader`] : toute écriture est refusée
+    /// avant de toucher au disque.
+    writable: bool,
 }
 
 impl FsBlobStore {
@@ -143,7 +146,37 @@ impl FsBlobStore {
         for dir in [&blobs, &tmp] {
             std::fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
         }
-        Ok(Self { blobs, tmp })
+        Ok(Self {
+            blobs,
+            tmp,
+            writable: true,
+        })
+    }
+
+    /// Ouvre le magasin de `root` **en lecture** : ne touche pas au disque, et n'y touchera pas.
+    ///
+    /// Aucun répertoire n'est créé — un magasin absent se lit comme un magasin vide, chaque blob
+    /// demandé étant [`Error::BlobNotFound`] — et `put`, `put_reader`, `put_writer` et `delete`
+    /// rendent [`Error::ReadOnly`] sans rien ouvrir : `put` aurait sinon déposé son temporaire
+    /// dans `tmp/`. Voir `Store::open_reader`.
+    #[must_use]
+    pub fn open_reader(root: &Utf8Path) -> Self {
+        Self {
+            blobs: root.join("blobs"),
+            tmp: root.join("tmp"),
+            writable: false,
+        }
+    }
+
+    /// [`Error::ReadOnly`] si le magasin a été ouvert en lecture.
+    fn refuse_if_reader(&self) -> Result<()> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(Error::ReadOnly {
+                path: self.blobs.clone(),
+            })
+        }
     }
 
     /// Le chemin absolu d'un blob.
@@ -155,6 +188,7 @@ impl FsBlobStore {
 
 impl BlobStore for FsBlobStore {
     fn put(&self, rfc822: &[u8]) -> Result<PutOutcome> {
+        self.refuse_if_reader()?;
         let hash = BlobHash::of(rfc822);
         let final_path = self.path_of(hash);
 
@@ -244,6 +278,7 @@ impl BlobStore for FsBlobStore {
     ///
     /// [`Error::Io`] si la lecture, la compression ou le renommage échoue.
     fn put_reader(&self, source: &mut dyn Read) -> Result<PutOutcome> {
+        self.refuse_if_reader()?;
         let mut tmp =
             tempfile::NamedTempFile::new_in(&self.tmp).map_err(|e| io_err(&self.tmp, e))?;
 
@@ -293,6 +328,7 @@ impl BlobStore for FsBlobStore {
     }
 
     fn put_writer(&self) -> Result<Box<dyn BlobSink>> {
+        self.refuse_if_reader()?;
         let tmp = tempfile::NamedTempFile::new_in(&self.tmp).map_err(|e| io_err(&self.tmp, e))?;
         let encoder = zstd::stream::write::Encoder::new(std::io::BufWriter::new(tmp), ZSTD_LEVEL)
             .map_err(|e| io_err(&self.tmp, e))?;
@@ -330,6 +366,7 @@ impl BlobStore for FsBlobStore {
     }
 
     fn delete(&self, hash: BlobHash) -> Result<bool> {
+        self.refuse_if_reader()?;
         let path = self.path_of(hash);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(true),

@@ -139,6 +139,8 @@ impl Store {
     /// [`crate::Error::Io`] si le fichier de verrou n'est pas ouvrable ou verrouillable.
     pub fn lock_delivery(&self) -> Result<DeliveryLock> {
         let path = self.root.join(DELIVERY_LOCK);
+        // Un lecteur ne remet rien, et ne crée pas le fichier de verrou.
+        self.refuse_if_reader(&path)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)

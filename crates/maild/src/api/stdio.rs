@@ -18,6 +18,10 @@
 //! dirait à quel protocole il appartient. Le choix se fait donc au démarrage, par
 //! `maild stdio --protocol`. En HTTP la question ne se pose pas — deux chemins d'URL
 //! suffisent, et le démon sert les deux en même temps.
+//!
+//! Et le choix décide aussi de ce qui tourne autour : [`serve`] reçoit, en stdio, un serveur
+//! monté sur une boîte ouverte **en lecture** (`Mailbox::open_reader`), sans le démon qui écrit ;
+//! [`serve_api`] reçoit l'API du démon complet. Voir l'en-tête de `main`.
 
 use anyhow::{Context, Result};
 use mailmcp::MailServer;

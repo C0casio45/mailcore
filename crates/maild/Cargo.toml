@@ -76,6 +76,12 @@ mailvec = { workspace = true, features = ["test-support"] }
 # Les PDF des tests de l'extracteur sont fabriqués par l'écriture de lopdf — déjà là, par `mailpdf`.
 lopdf.workspace = true
 
+# Un store d'un schéma plus ancien, que le lecteur MCP doit refuser sans y toucher : la base est
+# montée par `apply_up_to` de `mailcore` — `test-support` — sur une connexion ouverte ici, et relue
+# ensuite. `mailcore` ne laisse pas sortir la sienne, et c'est voulu.
+rusqlite.workspace = true
+mailcore = { workspace = true, features = ["test-support"] }
+
 
 [lints]
 workspace = true

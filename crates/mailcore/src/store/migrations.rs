@@ -881,56 +881,8 @@ pub fn apply(conn: &Connection) -> Result<()> {
             supported: SCHEMA_VERSION,
         });
     }
-    if current < 1 {
-        tx.execute_batch(SCHEMA_V1)?;
-    }
-    if current < 2 {
-        tx.execute_batch(SCHEMA_V2)?;
-    }
-    if current < 3 {
-        tx.execute_batch(SCHEMA_V3)?;
-    }
-    if current < 4 {
-        tx.execute_batch(SCHEMA_V4)?;
-    }
-    if current < 5 {
-        tx.execute_batch(SCHEMA_V5)?;
-    }
-    if current < 6 {
-        tx.execute_batch(SCHEMA_V6)?;
-    }
-    if current < 7 {
-        tx.execute_batch(SCHEMA_V7)?;
-    }
-    if current < 8 {
-        tx.execute_batch(SCHEMA_V8)?;
-    }
-    if current < 9 {
-        tx.execute_batch(SCHEMA_V9)?;
-    }
-    if current < 10 {
-        tx.execute_batch(SCHEMA_V10)?;
-    }
-    if current < 11 {
-        tx.execute_batch(SCHEMA_V11)?;
-    }
-    if current < 12 {
-        tx.execute_batch(SCHEMA_V12)?;
-    }
-    if current < 13 {
-        tx.execute_batch(SCHEMA_V13)?;
-    }
-    if current < 14 {
-        tx.execute_batch(SCHEMA_V14)?;
-    }
-    if current < 15 {
-        tx.execute_batch(SCHEMA_V15)?;
-    }
-    if current < 16 {
-        tx.execute_batch(SCHEMA_V16)?;
-    }
-    if current < 17 {
-        tx.execute_batch(SCHEMA_V17)?;
+    for step in STEPS.iter().skip(current as usize) {
+        tx.execute_batch(step)?;
     }
     // `PRAGMA` ne se paramètre pas ; la valeur interpolée est une constante de compilation.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -938,6 +890,79 @@ pub fn apply(conn: &Connection) -> Result<()> {
 
     tracing::info!(from = current, to = SCHEMA_VERSION, "schéma migré");
     Ok(())
+}
+
+/// Les pas de migration, dans l'ordre : `STEPS[n]` mène du schéma `n` au schéma `n + 1`.
+///
+/// **Sa longueur est `SCHEMA_VERSION`**, vérifiée à la compilation : un pas ajouté sans monter la
+/// version, ou l'inverse, ne compile pas. Et c'est la seule liste — [`apply`] la parcourt, et
+/// [`apply_up_to`] aussi, pour qu'un store « plus ancien » fabriqué par un test soit celui qu'un
+/// binaire d'avant aurait laissé, et le reste quand le schéma avance.
+const STEPS: [&str; SCHEMA_VERSION as usize] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15, SCHEMA_V16,
+    SCHEMA_V17,
+];
+
+/// Migre **jusqu'au schéma `target` seulement**, par les pas de [`apply`] : pour les tests, qui ont
+/// besoin d'un vrai store d'avant.
+///
+/// Un store « plus ancien » fabriqué en réécrivant `user_version` sur un store à jour ne peut pas
+/// être migré — le pas suivant recrée une table qui existe déjà, et la transaction est défaite. Un
+/// test qui vérifie qu'un lecteur **ne migre pas** n'y verrait donc jamais la migration qu'il
+/// cherche : un lecteur qui migrerait passerait. Ce store-ci, la migration y réussit.
+///
+/// # Errors
+///
+/// [`Error::UnsupportedSchema`] si `target` dépasse [`SCHEMA_VERSION`] ou si la base est déjà
+/// au-delà de `target`, [`Error::Sqlite`] si une instruction échoue.
+#[cfg(any(test, feature = "test-support"))]
+pub fn apply_up_to(conn: &Connection, target: u32) -> Result<()> {
+    let current = user_version(conn)?;
+    if target > SCHEMA_VERSION {
+        return Err(Error::UnsupportedSchema {
+            found: target,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    if current > target {
+        return Err(Error::UnsupportedSchema {
+            found: current,
+            supported: target,
+        });
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    for step in STEPS.iter().take(target as usize).skip(current as usize) {
+        tx.execute_batch(step)?;
+    }
+    tx.pragma_update(None, "user_version", target)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Vérifie que le store est **exactement** au schéma de ce binaire, sans rien migrer.
+///
+/// Le pendant de [`apply`] pour une ouverture en lecture : là où un écrivain met le store à jour,
+/// un lecteur refuse, et dit qui peut le faire. Plus récent est refusé pour la raison de toujours
+/// — on ne lit pas un schéma qu'on ne connaît pas.
+///
+/// # Errors
+///
+/// [`Error::SchemaBehind`] si le store est plus ancien, [`Error::UnsupportedSchema`] s'il est
+/// plus récent, [`Error::Sqlite`] si le pragma est illisible.
+pub fn require_current(conn: &Connection) -> Result<()> {
+    let found = user_version(conn)?;
+    match found.cmp(&SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Less => Err(Error::SchemaBehind {
+            found,
+            expected: SCHEMA_VERSION,
+        }),
+        std::cmp::Ordering::Greater => Err(Error::UnsupportedSchema {
+            found,
+            supported: SCHEMA_VERSION,
+        }),
+    }
 }
 
 /// La version de schéma inscrite dans le fichier.
@@ -1019,6 +1044,38 @@ mod tests {
             apply(&conn),
             Err(Error::UnsupportedSchema { found, supported })
                 if found == SCHEMA_VERSION + 7 && supported == SCHEMA_VERSION
+        ));
+    }
+
+    #[test]
+    fn a_reader_takes_the_current_schema_and_refuses_both_others_without_migrating() {
+        let current = migrated();
+        assert!(require_current(&current).is_ok());
+
+        // Plus ancien : refusé, et **pas migré** — c'est toute la différence avec `apply`.
+        let older = Connection::open_in_memory().unwrap();
+        older
+            .pragma_update(None, "user_version", SCHEMA_VERSION - 2)
+            .unwrap();
+        assert!(matches!(
+            require_current(&older),
+            Err(Error::SchemaBehind { found, expected })
+                if found == SCHEMA_VERSION - 2 && expected == SCHEMA_VERSION
+        ));
+        assert_eq!(user_version(&older).unwrap(), SCHEMA_VERSION - 2);
+        let tables: i64 = older
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tables, 0, "le refus a créé des tables");
+
+        // Plus récent : le refus de toujours.
+        let newer = Connection::open_in_memory().unwrap();
+        newer
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        assert!(matches!(
+            require_current(&newer),
+            Err(Error::UnsupportedSchema { .. })
         ));
     }
 
@@ -1711,15 +1768,29 @@ mod tests {
 
     /// Les migrations jusqu'à `upto` comprise, sur une base neuve.
     fn migrated_to(conn: &Connection, upto: u32) {
-        let steps = [
-            SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-            SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12, SCHEMA_V13, SCHEMA_V14, SCHEMA_V15,
-            SCHEMA_V16,
-        ];
-        for step in steps.iter().take(upto as usize) {
-            conn.execute_batch(step).unwrap();
-        }
-        conn.pragma_update(None, "user_version", upto).unwrap();
+        apply_up_to(conn, upto).unwrap();
+    }
+
+    /// `apply_up_to` laisse un vrai store d'avant : `apply` le migre ensuite, ce qu'un store dont
+    /// on a seulement réécrit la version ne permettrait pas.
+    #[test]
+    fn a_store_built_up_to_a_version_migrates_from_there() {
+        let older = Connection::open_in_memory().unwrap();
+        apply_up_to(&older, SCHEMA_VERSION - 1).unwrap();
+        assert_eq!(user_version(&older).unwrap(), SCHEMA_VERSION - 1);
+        apply(&older).unwrap();
+        assert_eq!(user_version(&older).unwrap(), SCHEMA_VERSION);
+
+        // Le contrôle inverse : la version seule réécrite, la migration échoue.
+        let faked = migrated();
+        faked
+            .pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        assert!(apply(&faked).is_err());
+
+        // Au-delà de ce binaire, ou en arrière : refusé.
+        assert!(apply_up_to(&Connection::open_in_memory().unwrap(), SCHEMA_VERSION + 1).is_err());
+        assert!(apply_up_to(&migrated(), SCHEMA_VERSION - 1).is_err());
     }
 
     /// Un store du quotidien, au schéma 16 : ses messages restent, chacun « à lire » et à la

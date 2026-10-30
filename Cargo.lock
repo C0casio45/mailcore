@@ -4573,6 +4573,7 @@ dependencies = [
  "mailsync",
  "mailvec",
  "rmcp",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",
